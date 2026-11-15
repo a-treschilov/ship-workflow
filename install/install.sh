@@ -30,7 +30,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 package_root="$(cd "$here/.." && pwd)"
 src=""
 tmpdir=""
-cleanup() { [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"; }
+cleanup() { if [[ -n "$tmpdir" ]]; then rm -rf "$tmpdir"; fi; return 0; }
 trap cleanup EXIT
 
 if [[ -n "${SHIP_SRC:-}" ]]; then

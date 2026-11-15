@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 HOOK = Path(__file__).resolve().parents[2] / "hooks/trusted-ship-helpers.py"
 CODEX_HOOK = Path(__file__).resolve().parents[2] / "hooks/codex_pre_tool_use.py"
+HERE = Path(__file__).resolve()
+INSTALLED = (HERE.parents[4] / ".agents/workflows/ship-fix/scripts").is_dir()
+WORKSPACE = HERE.parents[5] if INSTALLED else HERE.parents[4]
 spec = importlib.util.spec_from_file_location("trusted_helpers", HOOK)
 trusted = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(trusted)
@@ -268,8 +271,9 @@ class TrustedHelpersTests(unittest.TestCase):
             self.assertEqual(trusted.decide(payload), codex_trusted.decide(payload))
         self.assertEqual({}, codex_trusted.decide(self.payload("python3 -I -B malicious.py")))
 
+    @unittest.skipUnless(INSTALLED, "project installation only")
     def test_configured_codex_hook_resolves_shared_adapter_from_subrepo_cwd(self):
-        workspace = Path(__file__).resolve().parents[5]
+        workspace = WORKSPACE
         config = json.loads((workspace / ".codex/hooks.json").read_text())
         command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         cwd = workspace / "api"
@@ -281,8 +285,9 @@ class TrustedHelpersTests(unittest.TestCase):
         response = json.loads(result.stdout)
         self.assertEqual("allow", response["hookSpecificOutput"]["permissionDecision"])
 
+    @unittest.skipUnless(INSTALLED, "project installation only")
     def test_claude_worktree_adapters_resolve_the_shared_workspace_root(self):
-        workspace = Path(__file__).resolve().parents[5]
+        workspace = WORKSPACE
         create = subprocess.run([str(workspace / ".claude/hooks/worktree-create.sh")],
                                 input=json.dumps({"hook_event_name": "WorktreeCreate",
                                                   "cwd": str(workspace / "api"), "name": "agent"}),
