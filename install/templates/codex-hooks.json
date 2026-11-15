@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -B -c 'import pathlib,runpy,sys; p=pathlib.Path.cwd().resolve(); r=next((x for x in (p,*p.parents) if (x/\".agents/workflows/ship-fix/hooks/codex_pre_tool_use.py\").is_file()),None); sys.exit(\"Crumb workspace hook not found\") if r is None else runpy.run_path(str(r/\".agents/workflows/ship-fix/hooks/codex_pre_tool_use.py\"),run_name=\"__main__\")'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

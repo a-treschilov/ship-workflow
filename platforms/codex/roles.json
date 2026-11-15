@@ -1,0 +1,18 @@
+{
+  "crumb-implementer": {
+    "name": "crumb-implementer",
+    "description": "Implements one repo's approved scope or fix brief, proves targeted behavior, and repairs review or gate failures from a capsule handoff. Never independently reviews or releases."
+  },
+  "crumb-reviewer": {
+    "name": "crumb-reviewer",
+    "description": "Fresh-context scoped reviewer. Independently checks code, assertions, rubric passes and final-version finding closure; writes immutable findings, never code edits."
+  },
+  "crumb-plan-checker": {
+    "name": "crumb-plan-checker",
+    "description": "Independently checks approved-plan or complex fix acceptance against scoped final code and version-bound evidence. Read-only; no general code re-review."
+  },
+  "crumb-slicer": {
+    "name": "crumb-slicer",
+    "description": "Read-only. Proposes how to split one repo's approved plan scope into bounded, dependency-ordered implementation slices with explicit interfaces, scopes and proof. Never writes code or changes requirements; a human approves the result."
+  }
+}
