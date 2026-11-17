@@ -20,7 +20,7 @@ class OcxCatalogTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "agent-models.yaml"
         self.assignments = "models:\n" + "".join(
-            f'  {role}: "gpt-6.1-sol"\n' for role in ocx_models.agent_models.ROLES
+            f'  {role}: "gpt-6.2-sol"\n' for role in ocx_models.agent_models.ROLES
         )
         self.original = self.assignments + 'available_models:\n  - "old-model"\n'
         self.path.write_text(self.original)
@@ -45,9 +45,9 @@ class OcxCatalogTests(unittest.TestCase):
 
     @patch.object(ocx_models, "urlopen")
     def test_canonical_request_has_no_anthropic_header_and_aliases_keep_context(self, urlopen):
-        ids = ["gpt-6.1-sol", "zai/glm-5.3-flash", "anthropic/claude-opus-5-5"]
+        ids = ["gpt-6.2-sol", "zai/glm-5.3-flash", "anthropic/claude-opus-5-5"]
         urlopen.side_effect = [self.response(ids), self.response([
-            "ocx-claude-native--gpt-6.1-sol[1m]", "ocx-claude-native--gpt-6.1-sol",
+            "ocx-claude-native--gpt-6.2-sol[1m]", "ocx-claude-native--gpt-6.2-sol",
             "ocx-claude-zai--glm-5.3-flash[1m]", "claude-opus-5-5[1m]",
         ])]
         available, aliases = ocx_models.fetch_catalog()
@@ -57,13 +57,13 @@ class OcxCatalogTests(unittest.TestCase):
         self.assertIsNone(canonical_request.get_header("Anthropic-version"))
         self.assertEqual("2023-06-01", claude_request.get_header("Anthropic-version"))
         self.assertEqual(ids, available)
-        self.assertEqual("ocx-claude-native--gpt-6.1-sol[1m]", aliases["gpt-6.1-sol"])
+        self.assertEqual("ocx-claude-native--gpt-6.2-sol[1m]", aliases["gpt-6.2-sol"])
         self.assertEqual("ocx-claude-zai--glm-5.3-flash[1m]", aliases["zai/glm-5.3-flash"])
         self.assertEqual("claude-opus-5-5[1m]", aliases["anthropic/claude-opus-5-5"])
         ocx_models.update_catalog(self.path, available, aliases)
         models, stored_ids, stored_aliases = ocx_models.agent_models.parse_config(self.path)
         self.assertTrue(self.path.read_text().startswith(self.assignments))
-        self.assertEqual(set(models.values()), {"gpt-6.1-sol"})
+        self.assertEqual(set(models.values()), {"gpt-6.2-sol"})
         self.assertEqual((available, aliases), (stored_ids, stored_aliases))
         before = self.path.read_bytes()
         ocx_models.update_catalog(self.path, available, aliases)
@@ -79,7 +79,7 @@ class OcxCatalogTests(unittest.TestCase):
         for payload in (
             {"wrong": []}, {"data": []}, {"data": [{"id": ""}]},
             {"data": [{"id": "bad id"}]}, {"data": [{"id": "same"}, {"id": "same"}]},
-            {"data": [{"id": "gpt-6.1-sol"}], "has_more": True},
+            {"data": [{"id": "gpt-6.2-sol"}], "has_more": True},
         ):
             with self.subTest(payload=payload):
                 urlopen.return_value = self.response(payload=payload)
@@ -89,7 +89,7 @@ class OcxCatalogTests(unittest.TestCase):
 
     @patch.object(ocx_models, "urlopen")
     def test_failure_of_claude_catalog_leaves_both_catalogs_unchanged(self, urlopen):
-        urlopen.side_effect = [self.response(["gpt-6.1-sol"]), HTTPError("http://ocx", 503, "down", {}, None)]
+        urlopen.side_effect = [self.response(["gpt-6.2-sol"]), HTTPError("http://ocx", 503, "down", {}, None)]
         with patch.object(ocx_models, "CONFIG", self.path), patch("sys.argv", [str(SCRIPT)]):
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(2, ocx_models.main())
@@ -97,14 +97,14 @@ class OcxCatalogTests(unittest.TestCase):
 
     @patch.object(ocx_models, "urlopen")
     def test_unmatched_alias_catalog_is_rejected(self, urlopen):
-        urlopen.side_effect = [self.response(["gpt-6.1-sol"]), self.response(["claude-other-model"])]
+        urlopen.side_effect = [self.response(["gpt-6.2-sol"]), self.response(["claude-other-model"])]
         with self.assertRaisesRegex(ValueError, "no matching Claude aliases"):
             ocx_models.fetch_catalog()
 
     def test_failed_atomic_replacement_preserves_original_and_cleans_temporary(self):
         with patch.object(ocx_models.os, "replace", side_effect=OSError("write failed")):
             with self.assertRaisesRegex(OSError, "write failed"):
-                ocx_models.update_catalog(self.path, ["gpt-6.1-sol"], {"gpt-6.1-sol": "ocx-claude-native--gpt-6.1-sol"})
+                ocx_models.update_catalog(self.path, ["gpt-6.2-sol"], {"gpt-6.2-sol": "ocx-claude-native--gpt-6.2-sol"})
         self.assertEqual(self.original, self.path.read_text())
         self.assertEqual([self.path], list(self.path.parent.iterdir()))
 

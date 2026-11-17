@@ -48,7 +48,8 @@ Select a host with `--host claude`, `--host codex`, or `--host both`. When exact
 found it is selected automatically; otherwise an interactive install asks, and a non-interactive install
 requires `--host`. Upgrades retain the host in `.ship-version` unless `--host` explicitly changes it. Use `--models ocx`
 for the OCX example assignments on a new install; the default is `inherit`. Existing model configuration is
-preserved on upgrade.
+preserved on upgrade. The OCX example assigns `gpt-6.2-sol` to reviewer, plan-checker, and slicer; update existing
+configurations manually to use the new model and its provider alias.
 The legacy `--sync` flag is accepted for compatibility; sync and check run on every install.
 
 The installer creates `.agents/.ship-version`:

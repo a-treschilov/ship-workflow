@@ -22,11 +22,11 @@ class AgentModelConfigTests(unittest.TestCase):
         (self.root / ".claude/agents").mkdir(parents=True)
         (self.root / ".codex/agents").mkdir(parents=True)
         self.models = dict(zip(agent_models.ROLES, (
-            "zai/glm-5.3-flash", "gpt-6.1-sol", "gpt-6.1-sol", "anthropic/claude-opus-5-5",
+            "zai/glm-5.3-flash", "gpt-6.2-sol", "gpt-6.2-sol", "anthropic/claude-opus-5-5",
         )))
         self.aliases = {
             "zai/glm-5.3-flash": "ocx-claude-zai--glm-5.3-flash[1m]",
-            "gpt-6.1-sol": "ocx-claude-native--gpt-6.1-sol[1m]",
+            "gpt-6.2-sol": "ocx-claude-native--gpt-6.2-sol[1m]",
             "anthropic/claude-opus-5-5": "claude-opus-5-5[1m]",
         }
         self.claude_roles = {}
@@ -156,17 +156,17 @@ class AgentModelConfigTests(unittest.TestCase):
 
     def test_changed_role_assignment_updates_both_hosts(self):
         agent_models.sync(self.models, self.aliases, self.root)
-        self.models["implementer"] = "gpt-6.1-sol"
+        self.models["implementer"] = "gpt-6.2-sol"
         self.assertEqual(["implementer"], agent_models.check(self.models, self.aliases, self.root))
         self.assertEqual(["implementer"], agent_models.sync(self.models, self.aliases, self.root))
         claude = (self.root / ".claude/agents/implementer.md").read_text()
         codex = tomllib.loads((self.root / ".codex/agents/implementer.toml").read_text())
-        self.assertIn("model: ocx-claude-native--gpt-6.1-sol[1m]\n", claude)
-        self.assertEqual("gpt-6.1-sol", codex["model"])
+        self.assertIn("model: ocx-claude-native--gpt-6.2-sol[1m]\n", claude)
+        self.assertEqual("gpt-6.2-sol", codex["model"])
 
     def test_missing_alias_prevents_any_writes(self):
         aliases = dict(self.aliases)
-        del aliases["gpt-6.1-sol"]
+        del aliases["gpt-6.2-sol"]
         with self.assertRaisesRegex(ValueError, "missing or invalid"):
             agent_models.sync(self.models, aliases, self.root)
         self.assertEqual([], list((self.root / ".claude/agents").iterdir()))

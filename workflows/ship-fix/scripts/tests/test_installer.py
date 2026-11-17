@@ -149,6 +149,10 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         config = self.project / ".agents/agent-models.yaml"
         self.assertIn('implementer: "gpt-6-luna"', config.read_text())
+        for role in ("reviewer", "plan-checker", "slicer"):
+            self.assertIn(f'{role}: "gpt-6.2-sol"', config.read_text())
+            self.assertIn('model = "gpt-6.2-sol"', (self.project / f".codex/agents/{role}.toml").read_text())
+            self.assertIn('model: ocx-claude-native--gpt-6.2-sol[1m]', (self.project / f".claude/agents/{role}.md").read_text())
         legacy = config.read_text()
         for role in ("implementer", "reviewer", "plan-checker", "slicer"):
             legacy = legacy.replace(f"  {role}:", f"  prior-{role}:")

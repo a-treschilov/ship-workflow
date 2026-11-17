@@ -5,7 +5,7 @@ models:
   slicer: "inherit"
 available_models:
   - "gpt-6-astra"
-  - "gpt-6.1-sol"
+  - "gpt-6.2-sol"
   - "gpt-6.1-terra"
   - "gpt-6-luna"
   - "anthropic/claude-haiku-5-5"
@@ -16,7 +16,7 @@ available_models:
   - "zai/glm-5.3-flash"
 claude_aliases:
   gpt-6-astra: "ocx-claude-native--gpt-6-astra"
-  gpt-6.1-sol: "ocx-claude-native--gpt-6.1-sol[1m]"
+  gpt-6.2-sol: "ocx-claude-native--gpt-6.2-sol[1m]"
   gpt-6.1-terra: "ocx-claude-native--gpt-6.1-terra[1m]"
   gpt-6-luna: "ocx-claude-native--gpt-6-luna[1m]"
   anthropic/claude-haiku-5-5: "claude-haiku-5-5[1m]"

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+
+- Use `gpt-6.2-sol` for the OCX reviewer, plan-checker, and slicer example assignments and catalog.
+
 ## v1.1.0 - 2026-11-17
 
 ### New Features

@@ -238,7 +238,7 @@ if [[ "$model_mode" == ocx && ! -f "$txn/files/.agents/agent-models.yaml" ]]; th
 from pathlib import Path
 import sys
 p = Path(sys.argv[1]); text = p.read_text()
-for role, model in {"implementer": "gpt-6-luna", "reviewer": "gpt-6.1-sol", "plan-checker": "gpt-6.1-sol", "slicer": "gpt-6.1-sol"}.items():
+for role, model in {"implementer": "gpt-6-luna", "reviewer": "gpt-6.2-sol", "plan-checker": "gpt-6.2-sol", "slicer": "gpt-6.2-sol"}.items():
     text = text.replace(f'  {role}: "inherit"', f'  {role}: "{model}"')
 p.write_text(text)
 PY
