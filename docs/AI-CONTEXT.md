@@ -25,6 +25,7 @@ lifecycle helpers, host adapters for Claude Code and Codex, and an installer.
 | `workflows/ship-fix/PROTOCOL.md` | Canonical lifecycle, schemas, evidence and budget rules |
 | `workflows/ship-fix/HOST-ADAPTERS.md` | Operation-to-host mapping |
 | `workflows/ship-fix/scripts/` | Lifecycle helpers and tests |
+| `workflows/ship-fix/view/` | Read-only Run Explorer UI and project-root launcher |
 | `workflows/ship-fix/hooks/` | Trusted-command and worktree adapters |
 | `skills/ship/`, `skills/fix/`, `skills/ship-analyze/` | User-facing skills |
 | `roles/` | Implementer, reviewer, plan-checker and slicer behavior |

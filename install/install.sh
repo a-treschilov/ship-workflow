@@ -205,6 +205,26 @@ if [[ "$model_mode" == ocx && ! -e "$project_root/.agents/agent-models.yaml" ]] 
   exit 0
 fi
 
+if [[ -f "$src/workflows/ship-fix/view/ship-view" ]]; then
+  if [[ -e "$project_root/ship-view" || -L "$project_root/ship-view" ]]; then
+    python3 - "$project_root" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+launcher = root / 'ship-view'
+marker = root / '.agents/.ship-version'
+try:
+    expected = json.loads(marker.read_text()).get('managed_files', {}).get('ship-view')
+    actual = hashlib.sha256(launcher.read_bytes()).hexdigest() if launcher.is_file() and not launcher.is_symlink() else None
+except (OSError, ValueError):
+    expected = actual = None
+if not expected or expected != actual:
+    sys.exit('Conflicting existing ship-view; refusing to overwrite it.')
+PY
+  fi
+  managed+=(ship-view)
+fi
+
 txn="$(mktemp -d)"
 for item in "${managed[@]}"; do
   if [[ -e "$project_root/$item" || -L "$project_root/$item" ]]; then
@@ -230,6 +250,10 @@ fi
 copy() { mkdir -p "$(dirname "$2")"; rm -rf "$2"; cp -R "$1" "$2"; }
 
 copy "$src/workflows/ship-fix" "$project_root/.agents/workflows/ship-fix"
+if [[ -f "$src/workflows/ship-fix/view/ship-view" ]]; then
+  cp "$src/workflows/ship-fix/view/ship-view" "$project_root/ship-view"
+  chmod +x "$project_root/ship-view"
+fi
 mkdir -p "$project_root/.agents/skills"
 for skill in ship fix ship-analyze; do
   rm -rf "$project_root/.agents/skills/$skill"
@@ -339,6 +363,8 @@ for name in names:
 files = dict(old_version.get('managed_files', {}))
 relatives = [f'.agents/roles/{role.name}' for role in (Path(sys.argv[8]) / 'roles').glob('*.md')]
 relatives += ['.agents/platforms/claude/roles.json', '.agents/platforms/codex/roles.json']
+if (Path(sys.argv[8]) / 'workflows/ship-fix/view/ship-view').is_file():
+    relatives.append('ship-view')
 for relative in relatives:
     path = root / relative
     if path.is_file() and not path.is_symlink():

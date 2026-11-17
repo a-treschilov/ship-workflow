@@ -31,6 +31,16 @@ analyzer = load("analyze")
 
 
 class ReportTests(unittest.TestCase):
+    def test_exact_run_name_precedes_ambiguous_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'run').mkdir()
+            (root / 'run-other').mkdir()
+            with patch.object(analyzer, 'RUNS_DIR', root):
+                self.assertEqual('run', analyzer.resolve_run('run')[0].name)
+                with self.assertRaises(SystemExit):
+                    analyzer.resolve_run('ru')
+
     def test_explicit_workspace_reports_missing_run(self):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run([sys.executable, "-I", "-B", str(DIRECTORY / "analyze.py"),

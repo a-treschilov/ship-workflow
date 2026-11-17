@@ -1,5 +1,10 @@
 # Installation
 
+An installed project includes `./ship-view`, a read-only local browser for ship/fix runs. Run it from the
+project root; it opens the browser automatically and prints its loopback URL. `--no-open` suppresses browser
+launch and `--port PORT` selects a port. Ctrl+C stops the server. The installer refuses to overwrite an
+unowned launcher; uninstall removes the launcher only when its content matches the installed version.
+
 The package installs as a pinned snapshot. There is no package manager, workspace link, or runtime dependency
 on the source repository.
 

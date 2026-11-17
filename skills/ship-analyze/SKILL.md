@@ -14,7 +14,7 @@ python3 -I -B .agents/skills/ship-analyze/analyze.py --workflow fix --run latest
 
 Run commands from the project root, or use the absolute script path when working elsewhere. Use
 `--workspace /absolute/project/path` when using an analyzer installed in another project or the package source.
-Explicit run prefixes must identify exactly one run; missing and ambiguous prefixes are errors.
+Exact run names take precedence; other run prefixes must identify exactly one run. Missing and ambiguous prefixes are errors.
 Set `SHIP_ANALYZE_TRANSCRIPTS` to a directory of compatible session transcripts when they are stored outside
 the default Claude Code project directory; transcript accounting is optional when only run artifacts exist.
 --run accepts run-ID prefix/latest; --workflow ship/fix selects namespace; --session overrides transcript
@@ -27,7 +27,8 @@ the script streams them and emits compact metrics. Do not rewrite history to imp
 ## v2 runs
 
 Contract and append-only telemetry identify exact run, repo, phase, agent instance and start/end boundaries.
-Phases include resumed review-fix/gate-fix, gates and checkpoint waits. Script joins actual agent transcripts
+Phases include setup validation, resumed review-fix/gate-fix, gates and checkpoint waits. Setup success only
+validates run metadata and contract; it does not prove preflight or project checks passed. Script joins actual agent transcripts
 by agent_id/tool_use_id, deduplicates request/message chunks/replays and reads usage per phase, not cumulative
 agent totals. Actual model is per phase/instance; mixed phases expose a models list. Missing metrics are
 null, not zero. Reports without reliable correlation/completion are partial, not free work.
@@ -90,6 +91,8 @@ cannot be assigned by traversal order. Phase durations are dispatch-to-result en
 
 No request-level USD source is currently available through ocx. Keep cost unavailable rather than invent
 prices or time-join unrelated usage. Session-wide legacy USD is not certified cost of one run.
+When Codex provides a context window and input count for a correlated orchestrator session, its root entry
+includes the latest timestamped context snapshot in the observation window. This is not cumulative token usage.
 
 ## Legacy runs
 

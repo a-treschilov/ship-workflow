@@ -38,6 +38,25 @@ class InstallerTests(unittest.TestCase):
             text=True,
         )
 
+    def test_view_launcher_install_upgrade_and_uninstall(self):
+        result = self.install()
+        self.assertEqual(0, result.returncode, result.stderr)
+        launcher = self.project / 'ship-view'
+        self.assertTrue(os.access(launcher, os.X_OK))
+        result = subprocess.run([str(launcher), '--help'], cwd=self.project, capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(0, self.install().returncode)
+        result = subprocess.run(['python3', '-I', '-B', str(PACKAGE / 'install/uninstall.py'), str(self.project)], capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(launcher.exists())
+
+    def test_view_launcher_conflict_is_preserved(self):
+        launcher = self.project / 'ship-view'
+        launcher.write_text('user file')
+        result = self.install()
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual('user file', launcher.read_text())
+
     def test_installs_portable_roles_and_resolvable_links(self):
         result = self.install()
         self.assertEqual(0, result.returncode, result.stderr)

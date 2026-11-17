@@ -65,7 +65,13 @@ change production, or run destructive/external checks without separate authoriza
 
 ## 2. Run setup and immutable contract
 
-Create a unique RUN_DIR under `plans/.ship-runs/` or `.fix-runs/`. Do not reuse an active directory.
+Create a unique RUN_DIR under `plans/.ship-runs/` or `.fix-runs/` with the following standalone helper; it
+creates the directory exclusively and atomically publishes valid `run.json`. Do not write `run.json` by hand or
+reuse an existing directory. Repeat `--repo REPO` for each assigned repo, supply a real description and for ship
+pass `--plan-path` with the absolute approved plan path:
+
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py init-run --run-dir RUN_DIR --workflow fix --repo REPO --description DESCRIPTION`
+
 Keep run.json's legacy fields and add `schema_version: 2`, `workflow: ship|fix`. Record actual session_id
 (or empty string) for the first main session, started_at UTC, run_id, repos and plan_path/description.
 Every phase-start/phase-end event is the authoritative record of the session it ran in: it carries the
@@ -144,8 +150,12 @@ A reproduced bug records `before_evidence: {repo: absolute_evidence_path}` on th
 Before and after evidence share the exact `scenario` string. Before failure is historical evidence, not
 proof of final code; never invent it. Each criterion_id refers to an actual acceptance criterion.
 
-Validate before use, including every declared slice schedule:
-`python3 -I -B HELPER_PATH validate-contract --contract CONTRACT_PATH`.
+For each new run validate before use, including every declared slice schedule, with a unique attempt ID:
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py validate-run --contract CONTRACT_PATH --attempt-id ATTEMPT_ID`.
+This records a run-wide `setup` phase before contract validation and a passed or failed end after its real
+result. A crash or interruption leaves an open phase; never invent an end. A failed setup blocks preflight and
+implementation. Retrying uses a fresh attempt ID and never overwrites events. `validate-contract` remains a
+read-only validation command for existing runs and does not create setup telemetry.
 All commands below use actual absolute variables, not literal placeholders.
 
 For policy-enabled repo repairs, `phase-start` validates the current state path/hash, action, author and
@@ -668,8 +678,9 @@ RUN_DIR and the assigned repos (stage-05's certificate sealed the live `stage-05
 invalidated it). Contracts with `telemetry_policy.end_reason_required: true` (optional boolean) require end_reason on every
 non-passed phase end. Include actual agent_id,
 tool_use_id/message IDs, session_id, round/attempt when available; never guess. Start may precede knowing
-agent_id; put it on end. Start hash binds end. Phases: preflight, implement, pre-review, review, review-fix,
-gate-fix, checker, gates, checkpoint-wait. Capture phases for resumed agents too, not just fresh spawns. Tool-level wait calls (waiting for an agent result, status checks) are not phases and emit no phase-start/phase-end events; only the workflow stages listed above emit phase events.
+agent_id; put it on end. Start hash binds end. Phases: setup, preflight, implement, pre-review, review, review-fix,
+gate-fix, checker, gates, checkpoint-wait. The `setup` phase is written only by `validate-run` and does not
+prove preflight or any check passed. Capture phases for resumed agents too, not just fresh spawns. Tool-level wait calls (waiting for an agent result, status checks) are not phases and emit no phase-start/phase-end events; only the workflow stages listed above emit phase events.
 
 ### Resumed repairs: record the actual envelope
 

@@ -219,8 +219,8 @@ def contract(path):
     require(isinstance(read_excludes, dict) and set(read_excludes) <= set(repos), "Invalid read_excludes")
     for paths in read_excludes.values():
         require(isinstance(paths, list) and len(paths) == len(set(paths)), "Invalid read_excludes paths")
-        for path in paths:
-            state.relative_path(path)
+        for excluded_path in paths:
+            state.relative_path(excluded_path)
     continuity = value.get("budget_continuity", [])
     require(isinstance(continuity, list), "Invalid budget continuity")
     continuity_keys = []
@@ -246,9 +246,9 @@ def contract(path):
         unique_ids(entries, "deliverables")
         paths = []
         for entry in entries:
-            path = entry.get("path")
-            require(isinstance(path, str) and Path(path).is_absolute(), "Deliverable needs an absolute path")
-            paths.append(path)
+            deliverable_path = entry.get("path")
+            require(isinstance(deliverable_path, str) and Path(deliverable_path).is_absolute(), "Deliverable needs an absolute path")
+            paths.append(deliverable_path)
             criteria = entry.get("criterion_ids")
             require(isinstance(criteria, list) and criteria and len(criteria) == len(set(criteria)),
                     "Deliverable needs unique criterion IDs")

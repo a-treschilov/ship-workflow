@@ -35,6 +35,16 @@ project root from `SHIP_ROOT`, then from the nearest marker (`.agents/agent-mode
 
 ## Runtime components
 
+Run Explorer is an optional read-only local HTTP viewer. The project-root `./ship-view` launcher starts
+`ship_view.py`, which reads run artifacts and invokes the installed `ship-analyze` in the background for
+metrics and evidence. It binds loopback, serves bundled browser assets and does not write run history. A recorded
+open phase is an incomplete boundary, not proof that an agent is active. Artifact reads are confined to the run.
+When a JSON artifact cannot be read, the viewer identifies it as unavailable or labels its own last readable
+copy; unrelated artifacts continue to update. It never repairs or changes run files.
+The overview derives next steps from the latest recorded repository states and lists unclosed phase records
+separately. The activity view shows recorded durations and attributed usage, with raw artifacts on demand.
+Context usage, when available, is a timestamped Codex orchestrator input and window snapshot.
+
 | Component | Responsibility | Must not do |
 | --- | --- | --- |
 | `ship_state.py` | Capture source, baselines and deltas; validate contracts, findings, evidence, slices and history; apply transitions, phase telemetry, budgets and completion | Execute checks or dispatch agents |
@@ -59,7 +69,7 @@ reviewer to share the source being reviewed; a disposable worktree would break t
 `PROTOCOL.md` is the source of truth. The core path is:
 
 ```text
-contract -> preflight -> implementation -> pre-review -> fresh review
+run initialization -> contract setup -> preflight -> implementation -> pre-review -> fresh review
          -> gates -> acceptance assessment -> verified -> completion certificate
 ```
 
@@ -80,6 +90,10 @@ A run lives in a unique directory under `plans/.ship-runs/` or `plans/.fix-runs/
 - telemetry events, evidence records, review rounds, applied results and task files;
 - optional slice histories and approved slice schedules;
 - `completion.json` after every mandatory criterion is verified.
+
+For new runs, `init-run` exclusively creates the directory and atomically publishes valid metadata. `validate-run`
+records a run-wide setup phase around contract and slice-schedule validation, including failures; it does not
+assert that preflight or any project check passed. `validate-contract` remains read-only for historical runs.
 
 State transitions recapture source and verify earlier seals. Artifacts are write-once; a correction is a new
 artifact, not an edit to history. Source files are bound by the manifest recorded in the event, while logs,

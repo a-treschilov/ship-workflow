@@ -414,6 +414,7 @@ def build_codex_index(wall_start, wall_end):
             continue
         token_events = []
         turn_contexts = []
+        context_samples = []
         for record in records(path):
             if not isinstance(record, dict) or record.get("_invalid"):
                 continue
@@ -433,6 +434,11 @@ def build_codex_index(wall_start, wall_end):
                 if not isinstance(total, dict):
                     continue
                 last = info.get("last_token_usage")
+                window = info.get("model_context_window")
+                used = last.get("input_tokens") if isinstance(last, dict) else None
+                moment = at(record.get("timestamp"))
+                if moment and type(window) is int and window > 0 and type(used) is int and 0 <= used <= window:
+                    context_samples.append({"at": moment.isoformat(), "input_tokens": used, "window_tokens": window})
                 token_events.append((at(record.get("timestamp")),
                                      last if isinstance(last, dict) else None, total))
         threads.append({"path": path, "thread_id": thread_id, "session_id": meta.get("session_id"),
@@ -440,7 +446,7 @@ def build_codex_index(wall_start, wall_end):
                         "forked_from_id": meta.get("forked_from_id"),
                         "history_mode": meta.get("history_mode"), "agent_path": meta.get("agent_path"),
                         "cwd": meta.get("cwd"), "thread_source": meta.get("thread_source"), "start": start,
-                        "token_events": token_events, "turn_contexts": turn_contexts})
+                        "token_events": token_events, "turn_contexts": turn_contexts, "context_samples": context_samples})
     return threads
 
 
@@ -624,10 +630,10 @@ def codex_resolve_tool_call(path, tool_use_id):
     return None
 
 
-def codex_join(project, phases, wall_start, wall_end, meta, tool_use_by_phase=None):
+def codex_join(project, phases, wall_start, wall_end, meta, tool_use_by_phase=None, workspace=None):
     """Codex rollout join: exact thread attribution, per-request usage, fork baseline, window split."""
     here = Path(__file__).resolve()
-    workspace = here.parents[3] if (here.parents[3] / ".agents").is_dir() else here.parents[2]
+    workspace = workspace or (here.parents[3] if (here.parents[3] / ".agents").is_dir() else here.parents[2])
     tool_use_by_phase = tool_use_by_phase or {}
     declared = list(meta.get("session_ids") or ([meta.get("session_id")] if meta.get("session_id") else []))
     for phase in phases:
@@ -877,7 +883,10 @@ def codex_join(project, phases, wall_start, wall_end, meta, tool_use_by_phase=No
             "reasons": sorted({reason for item in per_root for reason in item[5]}),
             "roots": [{"thread_id": root["thread_id"], "session_id": root.get("session_id"),
                        **root_sums, "requests": root_count, "models": root_models,
-                       "complete": root_complete, "reasons": root_reasons}
+                       "complete": root_complete, "reasons": root_reasons,
+                       "context": next((sample for sample in reversed(root.get("context_samples", []))
+                                        if wall_start and at(sample["at"]) >= wall_start
+                                        and (not wall_end or at(sample["at"]) <= wall_end)), None)}
                       for root, root_sums, root_models, root_count, root_complete, root_reasons in per_root],
         }
     other_sessions = {}
@@ -949,7 +958,7 @@ def phase_inputs(path):
             isinstance(value.get("run_id"), str) and isinstance(value.get("workflow"), str))
 
 
-def analyze(run_dir, project, session_override=None):
+def analyze(run_dir, project, session_override=None, workspace=None):
     meta = read(run_dir / "run.json") or {}
     run_id = meta.get("run_id", run_dir.name)
     contract = read(run_dir / "contract.json") or {}
@@ -1064,8 +1073,8 @@ def analyze(run_dir, project, session_override=None):
     completion_valid = completion_audit["intact"] and completion.get("run_id") == run_id and completion.get("status") == "completed"
     if completion and not completion_valid:
         warnings.append("Completion certificate missing or altered artifacts")
-    if not sessions and not ocx_jobs:
-        ocx = codex_join(project, phases, wall_start, wall_end, meta, tool_use_by_phase)
+    if not ocx_jobs and not any((project / f"{session}.jsonl").is_file() for session in sessions):
+        ocx = codex_join(project, phases, wall_start, wall_end, meta, tool_use_by_phase, workspace)
     else:
         ocx = ocx_join(project, sessions, ocx_jobs, wall_start, wall_end)
     for phase in llm_phases:

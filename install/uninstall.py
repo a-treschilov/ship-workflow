@@ -98,7 +98,7 @@ for relative, expected in links.items():
 for relative, expected in version.get("managed_files", {}).items():
     path = root / relative
     allowed = (relative.startswith(".agents/roles/") and Path(relative).parent.as_posix() == ".agents/roles"
-               or relative in {".agents/platforms/claude/roles.json", ".agents/platforms/codex/roles.json"})
+               or relative in {".agents/platforms/claude/roles.json", ".agents/platforms/codex/roles.json", "ship-view"})
     if allowed and path.is_file() and not path.is_symlink() and hashlib.sha256(path.read_bytes()).hexdigest() == expected:
         path.unlink()
 for relative in (".agents/workflows/ship-fix", ".agents/skills/ship", ".agents/skills/fix",

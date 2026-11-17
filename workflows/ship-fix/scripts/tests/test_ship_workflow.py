@@ -18,6 +18,36 @@ state = workflow.state
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_ship_contract_with_exclusions_and_deliverables_keeps_contract_path(self):
+        plan = self.root / 'plan.md'
+        plan.write_text('approved requirement')
+        snapshot = self.run / 'approved-plan.md'
+        snapshot.write_bytes(plan.read_bytes())
+        self.c.update(workflow='ship', plan_path=str(plan), approved_snapshot=str(snapshot),
+                      plan_sha256=workflow.sha(plan), read_excludes={'api': ['private']},
+                      deliverables={'api': [{'id': 'document', 'path': str(self.root / 'output.md'),
+                                             'criterion_ids': ['fix.ac-1']}]})
+        self.save('contract.json', self.c)
+        self.assertEqual('ship', workflow.contract(self.contract)['workflow'])
+
+    def test_setup_validation_records_failure_then_pass_without_rewriting(self):
+        self.save('run.json', {'schema_version': 2, 'run_id': 'run-1', 'workflow': 'fix', 'repos': ['api']})
+        broken = copy.deepcopy(self.c)
+        broken['criteria'] = []
+        self.save('contract.json', broken)
+        with self.assertRaisesRegex(ValueError, 'criteria cannot be empty'):
+            state.validate_run(self.contract, 'one', workflow)
+        start = self.run / 'telemetry/setup-one-start.json'
+        end = self.run / 'telemetry/setup-one-end.json'
+        first = start.read_bytes(), end.read_bytes()
+        self.assertEqual('failed', state.load(end)['status'])
+        self.assertEqual(workflow.sha(start), state.load(end)['start_sha256'])
+        self.save('contract.json', self.c)
+        with self.assertRaises((FileExistsError, ValueError)):
+            state.validate_run(self.contract, 'one', workflow)
+        self.assertEqual(first, (start.read_bytes(), end.read_bytes()))
+        self.assertEqual('passed', state.validate_run(self.contract, 'two', workflow)['status'])
+
     def test_input_snapshot_rejects_symlink_into_excluded_tree(self):
         secret = self.repo / "secret"
         secret.mkdir()

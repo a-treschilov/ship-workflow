@@ -19,6 +19,14 @@ spec.loader.exec_module(telemetry)
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_setup_phase_is_reported_without_inventing_agent_usage(self):
+        self.phase('setup-one', 'setup', '2026-10-12T00:00:00Z', '2026-10-12T00:00:01Z', repo=None)
+        result = telemetry.analyze(self.run, self.project)
+        phase = next(item for item in result['phases'] if item['phase_id'] == 'setup-one')
+        self.assertTrue(phase['event_valid'])
+        self.assertEqual('passed', phase['status'])
+        self.assertIsNone(phase['usage']['input_tokens'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ["SHIP_TEST_TMPDIR"], prefix="telemetry-fixture-")
         self.addCleanup(self.temp.cleanup)
@@ -462,6 +470,21 @@ class CodexTelemetryTests(unittest.TestCase):
 
     def analyze(self):
         return telemetry.analyze(self.run, self.project)
+
+    def test_codex_context_snapshot_uses_window_and_request_input(self):
+        self.phase("i", "implement", "2026-10-12T00:00:00Z", "2026-10-12T00:01:00Z", agent="/root/author")
+        self.rollout("root-1", cwd=str(WORKSPACE), history_mode="paginated")
+        path = self.catalog / "rollout-root-1.jsonl"
+        with path.open("a") as handle:
+            handle.write(json.dumps({"timestamp": "2026-10-12T00:00:30Z", "type": "event_msg",
+                                     "payload": {"type": "token_count", "info": {
+                                         "last_token_usage": self.usage(20, 5, 0, 3, 23),
+                                         "total_token_usage": {"total_tokens": 23},
+                                         "model_context_window": 100}}}) + "\n")
+        self.rollout("child-1", agent_path="/root/author", parent="root-1")
+        root = self.analyze()["ocx"]["orchestrator"]["roots"][0]
+        self.assertEqual(20, root["context"]["input_tokens"])
+        self.assertEqual(100, root["context"]["window_tokens"])
 
     def test_codex_exact_agent_path_match(self):
         self.phase("i", "implement", "2026-10-12T00:00:00Z", "2026-10-12T00:01:00Z", agent="/root/author")

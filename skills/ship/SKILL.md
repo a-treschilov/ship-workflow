@@ -50,14 +50,14 @@ the contract. Print scope/order and author handoffs.
 Before creating a run, search existing `plans/.ship-runs/*/run.json` for the selected plan and item, inspect
 the latest related state and report open work and budget usage. Continue the matching run where possible;
 never reset its budget or treat a new directory as a fresh result.
-Create exclusive RUN_DIR under plans/.ship-runs and write run.json, immutable approved-plan snapshot,
+Create exclusive RUN_DIR and valid run.json with the protocol's `init-run` helper, then write the immutable approved-plan snapshot,
 per-repo excerpts and v2 contract.json per protocol. Excerpts include selected repo work plus cross-cutting
 constraints/verification; referenced cross-repo sections are accessible in the snapshot. Store actual
 session ID or empty string. repo_paths refer to existing assigned sibling repos; no new worktrees.
 New contracts include `telemetry_policy: {"repair_phase_required": true, "end_reason_required": true, "run_local_seals": true}` explicitly, and `"author_rotation": "capsule"` (omit only with `--no-rotation`, which writes `"resume"`).
 Declare empirical checks as `argv` lists where practical, and run each new pre-review/preflight command once
 before implementation. On any non-passed phase-end record `end_reason` (use `unknown` when not established).
-Validate contract with the helper. No approved requirement edits during execution. Approved plans tag repo
+Validate each new run with the protocol's `validate-run` helper so setup success or failure is recorded before preflight. No approved requirement edits during execution. Approved plans tag repo
 ownership via subsection headings under `## Changes` / `## Implementation` (e.g. `### 1. Backend
 (\`server/\`) — …`); grep heading lines for a repo name (backtick-quoted directory or plain prose) to build
 each repo's `PLAN_EXCERPT` = cross-cutting sections (Context, Architecture, Verification,

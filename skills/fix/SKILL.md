@@ -34,7 +34,7 @@ No external code search requirement. Order repositories so shared packages are b
 consumers; if a shared package changes, run its declared build and sync as separate commands before processing
 consumers (never version/tag/push — version edits stay uncommitted).
 
-Write exclusive RUN_DIR under plans/.fix-runs, run.json (description/session/start/repos) and v2 contract.
+Create exclusive RUN_DIR and valid run.json with the protocol's `init-run` helper, then write the v2 contract.
 New contracts explicitly include `telemetry_policy: {"repair_phase_required": true}` and `"author_rotation": "capsule"` (`--no-rotation` writes `"resume"`).
 There is no plan_path or archival. Extract a small acceptance brief, not a large plan:
 - original scenario and observable expected behavior;
@@ -48,7 +48,7 @@ source when possible and record failure before edits; otherwise document why bas
 Both before/after scenario evidence uses the original_scenario string; no fabricated red test.
 A new feature/improvement need not fail before implementation. Capture true observed results and logs.
 
-Before freezing scope, include impacted documentation and, for user-, consumer- or operator-visible changes, `CHANGELOG.md` (`## Unreleased`; skip repositories that do not track releases). Confirmed drift discovered outside authorized scope is a blocking gap: seek approval to expand scope rather than silently defer it. Validate contract, initialize source/scope/baselines and execute preflight before implementer. Confirm
+Before freezing scope, include impacted documentation and, for user-, consumer- or operator-visible changes, `CHANGELOG.md` (`## Unreleased`; skip repositories that do not track releases). Confirmed drift discovered outside authorized scope is a blocking gap: seek approval to expand scope rather than silently defer it. Validate each new run with the protocol's `validate-run` helper, initialize source/scope/baselines and execute preflight before implementer. Confirm
 actual runtime source/mount, safe test DB, dependencies and permissions. An unavailable mandatory check
 blocks before edits. Explicit user-authorized code-only work stays implemented/unverified, never success.
 Preserve unrelated dirty WIP; first-touch snapshots isolate same-file pre-existing edits.

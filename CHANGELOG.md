@@ -2,10 +2,22 @@
 
 ## Unreleased
 
+### New Features
+
+- Explore ship and fix runs in a live local browser with `./ship-view`.
+- Create run metadata safely and record contract-validation setup failures as telemetry.
+
 ### Improvements
 
 - Configure the OCX example assignments in the model template and validate the profile when applying it.
+- Show run progress, remaining steps, phase durations and available token usage in Run Explorer, including a token summary on the overview.
 - Use `gpt-6.2-sol` for the OCX reviewer, plan-checker, and slicer example assignments and catalog.
+- Resolve an exact run name before matching run ID prefixes in `ship-analyze`.
+
+### Bug Fixes
+
+- Keep run details updating when an individual artifact contains incomplete JSON and identify unavailable data accurately.
+- Validate ship contracts with read exclusions and declared deliverables without losing the contract path.
 
 ## v1.1.0 - 2026-11-17
 

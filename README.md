@@ -105,6 +105,22 @@ Run artifacts live under `plans/.ship-runs/` and `plans/.fix-runs/` by default. 
 helpers seal contracts, state records, evidence, reviews, and completion certificates by hash. Do not hand-edit
 or delete an active run.
 
+New runs are created with the workflow's `init-run` helper; `validate-run` records setup success or failure
+before preflight. An interrupted setup can remain open, and a failed setup does not count as a passed check.
+
+### Explore runs visually
+
+Run `./ship-view` from an installed project's root. It opens a local browser with repository progress, remaining
+steps, phase durations, available model and token usage, and searchable run artifacts. JSON opens on request.
+The token summary counts known input, output and cache tokens from recorded agent phases and marks partial usage.
+Use `--no-open` to print the URL without opening a browser, or `--port`
+to select a port. Stop the server with Ctrl+C. If the default port is busy, a free port is selected.
+
+The viewer is read-only and listens on loopback. An open phase only means its end has not been recorded; it
+does not prove the agent is active. Legacy or incomplete runs show the data available, with limitations. Metrics
+and certification use `ship-analyze`; unavailable usage is not zero and recorded completion is not a fresh
+certification of the current source.
+
 ## Configure models
 
 The installer creates `.agents/agent-models.yaml` once and never overwrites it on upgrade. It maps four roles to
@@ -168,6 +184,7 @@ Shared files, replaced on every install:
 | `skills/{ship,fix,ship-analyze}/` | `.agents/skills/` |
 | `roles/*.md` | `.agents/roles/` |
 | `platforms/{claude,codex}/roles.json` | `.agents/platforms/` |
+| `workflows/ship-fix/view/ship-view` | `ship-view` launcher at the project root |
 
 Per-project files, created once and preserved on upgrade:
 

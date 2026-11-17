@@ -191,7 +191,9 @@ def resolve_run(run_arg):
     if run_arg in (None, "latest"):
         run_dir = max(all_runs, key=_run_recency_key)
     else:
-        matches = [d for d in all_runs if d.name.startswith(run_arg)]
+        matches = [d for d in all_runs if d.name == run_arg]
+        if not matches:
+            matches = [d for d in all_runs if d.name.startswith(run_arg)]
         if not matches:
             sys.exit(f"error: no run directory matching {run_arg!r} in {RUNS_DIR}")
         if len(matches) > 1:
@@ -847,7 +849,7 @@ def main():
             project = session_path.parent
         else:
             project = PROJECT_DIR
-        telemetry = module.analyze(run_dir, project, session_path.stem if args.session else None)
+        telemetry = module.analyze(run_dir, project, session_path.stem if args.session else None, WORKSPACE)
         insight_spec = importlib.util.spec_from_file_location("run_insights", Path(__file__).with_name("insights.py"))
         insight_module = importlib.util.module_from_spec(insight_spec)
         insight_spec.loader.exec_module(insight_module)

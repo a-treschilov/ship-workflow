@@ -3,13 +3,16 @@
 
 import argparse
 import difflib
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import subprocess
 import sys
+import tempfile
 
 
 DEFAULT_EXCLUDES = (".claude/review-findings.json", ".claude/review-applied.json")
@@ -37,6 +40,82 @@ def write_once(path, value):
     with path.open("x", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, ensure_ascii=True)
         handle.write("\n")
+
+
+def init_run(run_dir, workflow, repos, description, plan_path, session_id):
+    root = Path(run_dir).resolve()
+    relative_path(root.name)
+    require(workflow in {"ship", "fix"}, "Invalid workflow")
+    require(root.parent == (Path.cwd() / "plans" / f".{workflow}-runs").resolve(),
+            "Run directory must be directly under the workflow run directory")
+    require(repos and len(repos) == len(set(repos)), "Expected unique repositories")
+    for repo in repos:
+        relative_path(repo)
+    text(description, "description")
+    require(workflow != "ship" or (plan_path and Path(plan_path).is_absolute() and Path(plan_path).is_file()),
+            "Ship needs an existing absolute plan path")
+    record = {"schema_version": 2, "workflow": workflow, "run_id": root.name,
+              "session_id": session_id or "", "started_at": datetime.now(timezone.utc).isoformat(),
+              "repos": repos, "description": description}
+    if plan_path:
+        record["plan_path"] = plan_path
+    payload = (json.dumps(record, indent=2, ensure_ascii=True) + "\n").encode()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=".run-", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+        os.link(temporary, root / "run.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return record
+
+
+def validate_run(contract_path, attempt_id, workflow):
+    contract_file = Path(contract_path).absolute()
+    root = contract_file.parent
+    relative_path(attempt_id)
+    require(re.fullmatch(r"[A-Za-z0-9_.-]+", attempt_id) is not None, "Invalid setup attempt ID")
+    meta = load(root / "run.json")
+    require(isinstance(meta, dict) and meta.get("schema_version") == 2
+            and meta.get("run_id") == root.name and meta.get("workflow") in {"ship", "fix"},
+            "Invalid run metadata")
+    identifier = "setup-" + attempt_id
+    session = os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session):
+        session = ""
+    start = {"schema_version": 2, "run_id": meta["run_id"], "workflow": meta["workflow"],
+             "repo": None, "phase_id": identifier, "phase": "setup", "event": "phase-start",
+             "at": datetime.now(timezone.utc).isoformat(), "session_id": session}
+    start_path = root / "telemetry" / (identifier + "-start.json")
+    end_path = root / "telemetry" / (identifier + "-end.json")
+    require(not end_path.exists() and not end_path.is_symlink(), "Setup attempt already exists")
+    write_once(start_path, start)
+    try:
+        value = workflow.contract(contract_path)
+        require(value["run_id"] == meta["run_id"] and value["workflow"] == meta["workflow"],
+                "Run metadata/contract identity mismatch")
+        require(value["repos"] == meta.get("repos"), "Run metadata/contract repositories mismatch")
+        if value["workflow"] == "ship":
+            require(value.get("plan_path") == meta.get("plan_path"), "Run metadata/contract plan mismatch")
+        schedules = value.get("slice_schedules", {})
+        require(isinstance(schedules, dict) and set(schedules) <= set(value["repos"]), "Invalid slice schedules")
+        for repo, declaration in schedules.items():
+            require(isinstance(declaration, dict), "Invalid slice schedule declaration")
+            workflow.slice_schedule(contract_path, repo, declaration.get("path"))
+    except Exception as error:
+        end = {**start, "event": "phase-end", "at": datetime.now(timezone.utc).isoformat(),
+               "status": "failed", "end_reason": "unknown", "error": str(error),
+               "start_sha256": hashlib.sha256(start_path.read_bytes()).hexdigest()}
+        write_once(end_path, end)
+        raise
+    end = {**start, "event": "phase-end", "at": datetime.now(timezone.utc).isoformat(),
+           "status": "passed", "start_sha256": hashlib.sha256(start_path.read_bytes()).hexdigest()}
+    write_once(end_path, end)
+    return end
 
 
 def relative_path(value):
@@ -354,6 +433,16 @@ def evidence(value, final):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    sub = commands.add_parser("init-run")
+    sub.add_argument("--run-dir", required=True)
+    sub.add_argument("--workflow", choices=("ship", "fix"), required=True)
+    sub.add_argument("--repo", action="append", required=True)
+    sub.add_argument("--description", required=True)
+    sub.add_argument("--plan-path")
+    sub.add_argument("--session-id", default=os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "")
+    sub = commands.add_parser("validate-run")
+    sub.add_argument("--contract", required=True)
+    sub.add_argument("--attempt-id", required=True)
     for name in ("capture", "delta"):
         sub = commands.add_parser(name)
         sub.add_argument("--repo", required=True)
@@ -475,6 +564,16 @@ def main():
     mode.add_argument("--all-repos", action="store_true")
     sub.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.command == "init-run":
+        print(json.dumps(init_run(args.run_dir, args.workflow, args.repo, args.description, args.plan_path, args.session_id)))
+        return
+    if args.command == "validate-run":
+        import importlib.util
+        module_spec = importlib.util.spec_from_file_location("ship_workflow", Path(__file__).with_name("ship_workflow.py"))
+        workflow = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(workflow)
+        print(json.dumps(validate_run(args.contract, args.attempt_id, workflow)))
+        return
     if args.command in {"slice-transition", "slice-gate", "batch-start", "batch-barrier"}:
         import importlib.util
         module_spec = importlib.util.spec_from_file_location(

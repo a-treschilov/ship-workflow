@@ -28,8 +28,13 @@ adapters.
 
 ## Change map
 
+The Run Explorer server and its bundled browser UI live under `workflows/ship-fix/`; the installer manages
+the project-root `ship-view` launcher. Viewer changes should test partial artifacts, read-only access, evidence
+semantics and installation/upgrade/uninstall behavior. Run `make test` and verify an installed project.
+
 | Change | Files to update |
 | --- | --- |
+| Run creation or setup validation | `ship_state.py`, `PROTOCOL.md`, both lifecycle skills, tests and analyzer docs |
 | Lifecycle, transition or artifact rule | `workflows/ship-fix/PROTOCOL.md`, `ship_state.py` or `ship_workflow.py`, tests, affected skill text |
 | New helper command or flag | `ship_state.py` or `ship_artifacts.py`, `PROTOCOL.md`, role or skill text that invokes it, tests |
 | Skill behavior | `skills/<name>/SKILL.md`, affected role text, `PROTOCOL.md` if the rule is shared, tests |

@@ -17,6 +17,7 @@ and keeps no run state.
 ## Repository map
 
 - `workflows/ship-fix/` — lifecycle protocol, host adapters, helper scripts, hooks and their tests.
+- `workflows/ship-fix/view/` — read-only Run Explorer assets and the installed `./ship-view` launcher.
 - `skills/` — `ship`, `fix` and `ship-analyze` skill instructions.
 - `roles/` — shared implementer, reviewer, plan-checker and slicer behavior.
 - `platforms/` — Claude Code and Codex role metadata.
