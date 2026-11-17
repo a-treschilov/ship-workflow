@@ -48,6 +48,66 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(first, (start.read_bytes(), end.read_bytes()))
         self.assertEqual('passed', state.validate_run(self.contract, 'two', workflow)['status'])
 
+    def test_recovery_reconciles_independent_histories_and_seals_decision(self):
+        sources, audits = [], {}
+        for number, used in enumerate((2, 1, 1), 1):
+            run = self.root / f"old-{number}"
+            run.mkdir()
+            contract = run / "contract.json"
+            contract.write_text(json.dumps({"run_id": run.name, "repos": ["api"],
+                                            "repo_paths": {"api": str(self.repo)}}))
+            history = run / "state.json"
+            history.write_text("{}")
+            source = {"run_id": run.name, "contract_path": str(contract),
+                      "contract_sha256": workflow.sha(contract), "state_path": str(history),
+                      "state_sha256": workflow.sha(history), "used_passes": used}
+            sources.append(source)
+            audits[str(contract)] = {"run_id": run.name, "state_path": str(history),
+                                     "state_sha256": workflow.sha(history), "review_fix_count": used,
+                                     "grants": [], "granted_additional_passes": 0}
+        item = {"repo": "api", "work_item": "work-1", "approved_by": "user",
+                "user_authorization": "4 used and +2", "approval_question": "Approve 4 and +2?",
+                "approved_at": "2026-01-01T00:00:00Z", "reason": "Reconcile histories",
+                "additional_passes": 2, "used_passes": 4, "effective_limit": 5,
+                "recovery_sources": sources}
+        decision = self.save("recovery.json", item)
+        item.update({"decision_path": decision, "decision_sha256": workflow.sha(decision)})
+        self.c["budget_continuity"] = [item]
+        with patch.object(workflow, "validate_history", side_effect=lambda path, repo, **kw: audits[str(path)]):
+            self.assertEqual(1, workflow.review_budget([], self.contract, self.c, "api")[0])
+            item["recovery_sources"] = [sources[0], sources[0]]
+            Path(decision).write_text(json.dumps({k: v for k, v in item.items()
+                                                  if k not in {"decision_path", "decision_sha256"}}))
+            item["decision_sha256"] = workflow.sha(decision)
+            with self.assertRaisesRegex(ValueError, "Duplicate or cyclic"):
+                workflow.review_budget([], self.contract, self.c, "api")
+            item["recovery_sources"] = sources
+            Path(decision).write_text(json.dumps({k: v for k, v in item.items()
+                                                  if k not in {"decision_path", "decision_sha256"}}))
+            item["decision_sha256"] = workflow.sha(decision)
+            item["used_passes"] = 3
+            with self.assertRaisesRegex(ValueError, "decision does not match"):
+                workflow.review_budget([], self.contract, self.c, "api")
+            item["used_passes"] = 4
+            Path(sources[0]["contract_path"]).write_text("{}")
+            with self.assertRaisesRegex(ValueError, "contract seal mismatch"):
+                workflow.review_budget([], self.contract, self.c, "api")
+
+    def test_identified_related_run_requires_continuity(self):
+        plans = self.root / "plans"
+        current = plans / ".fix-runs" / "current" / "contract.json"
+        current.parent.mkdir(parents=True)
+        other = plans / ".ship-runs" / "earlier" / "contract.json"
+        other.parent.mkdir(parents=True)
+        other.write_text(json.dumps({"budget_work_items": {"api": "work-1"},
+                                     "repo_paths": {"api": str(self.repo)}}))
+        value = {"budget_work_items": {"api": "work-1"}, "repo_paths": {"api": str(self.repo)}}
+        with self.assertRaisesRegex(ValueError, "missing from budget continuity"):
+            workflow.check_related_budgets(value, "api", current)
+        other.write_text(json.dumps({"budget_work_items": {"api": "other"},
+                                     "repo_paths": {"api": str(self.repo)}}))
+        workflow.check_related_budgets(value, "api", current)
+
     def test_input_snapshot_rejects_symlink_into_excluded_tree(self):
         secret = self.repo / "secret"
         secret.mkdir()

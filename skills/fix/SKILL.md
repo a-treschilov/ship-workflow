@@ -34,6 +34,11 @@ No external code search requirement. Order repositories so shared packages are b
 consumers; if a shared package changes, run its declared build and sync as separate commands before processing
 consumers (never version/tag/push — version edits stay uncommitted).
 
+Before creating a run, inspect both `plans/.fix-runs/` and `plans/.ship-runs/` for related work, including
+legacy descriptions. Resolve ambiguous matches with the user and continue an existing run where possible.
+Give each repo a stable `budget_work_items` identifier in the contract and reuse it for related ship/fix runs;
+follow the protocol for continuity and multi-history recovery before dispatch or completion.
+Write exclusive RUN_DIR under plans/.fix-runs, run.json (description/session/start/repos) and v2 contract.
 Create exclusive RUN_DIR and valid run.json with the protocol's `init-run` helper, then write the v2 contract.
 New contracts explicitly include `telemetry_policy: {"repair_phase_required": true}` and `"author_rotation": "capsule"` (`--no-rotation` writes `"resume"`).
 There is no plan_path or archival. Extract a small acceptance brief, not a large plan:

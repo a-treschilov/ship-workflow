@@ -281,6 +281,28 @@ check immediately before each subsequent repair, including after a grant is appl
 
 ### Explicit repo-level review-budget grants
 
+New contracts declare `budget_work_items` as a map from each repo to a stable, nonempty work-item identifier.
+Reuse the same identifier for the same approved work across ship and fix runs. Before creating a run, inspect
+both `plans/.ship-runs/` and `plans/.fix-runs/`, including legacy run metadata and descriptions, for related
+work. Resolve ambiguous legacy matches with the user; never assume that a missing identifier means unrelated.
+Continue the existing run when possible. For identified runs, transitions, budget checks and completion refuse
+an uncarried local related contract. This lookup cannot discover missing, moved, unidentified, or inaccessible
+histories and is not proof that the search is complete.
+
+If independent histories already omitted their carryover, reconcile them in a new successor, never by editing
+the old histories. A repo-level `budget_continuity` record may use `recovery_sources` instead of its single
+source. Each source contains `run_id`, absolute `contract_path` and `state_path`, their `contract_sha256` and
+`state_sha256`, and `used_passes`. Supply all related independent runs once. Each must pass `validate-history`
+and name its latest state and the same repository path. The record and its JSON decision contain the same
+`repo`, `work_item`, `approved_by: "user"`, `approval_question`, exact `user_authorization`, `approved_at`,
+`reason`, `additional_passes`, `used_passes`, `effective_limit`, and `recovery_sources`. The record additionally
+contains absolute `decision_path` and its `decision_sha256`. Obtain explicit approval of the actual cumulative
+usage and positive additional passes; the effective limit is 3 plus previously applied grants plus this decision's
+additional passes. The helper verifies both totals and all seals. Four used with +2 and no prior grants leaves
+one pass. Nested continuity and historical-source grants are refused rather than double-counted; stop and report
+those cases. This decision accounts for usage only: it does not validate past work, waive prerequisites, or
+retroactively authorize past repairs. Perform fresh review, gates and assessment before any new certificate.
+
 The default repo-level budget is always 3 unless a user explicitly approves one or more additions during the
 same run. It is distinct from gate-fix (2) and slice budgets. When capped or at needs-fix with no remaining
 passes, the orchestrator shows the repo, limit, used count, every open finding ID/severity/failure scenario

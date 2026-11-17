@@ -223,6 +223,10 @@ def contract(path):
             state.relative_path(excluded_path)
     continuity = value.get("budget_continuity", [])
     require(isinstance(continuity, list), "Invalid budget continuity")
+    work_items = value.get("budget_work_items", {})
+    require(isinstance(work_items, dict) and set(work_items) <= set(repos), "Invalid budget work items")
+    for work_item in work_items.values():
+        state.text(work_item, "budget work item")
     continuity_keys = []
     continuity_sources = []
     for item in continuity:
@@ -240,6 +244,9 @@ def contract(path):
     require(len(successor_keys) == len(set(successor_keys)), "Duplicate successor scope")
     continuity_work = {(item["repo"], item.get("slice_id"), item.get("work_item")) for item in continuity}
     require(set(successor_keys) == continuity_work, "Successor scope requires matching budget continuity")
+    for item in continuity:
+        if item.get("slice_id") is None and item["repo"] in work_items:
+            require(item.get("work_item") == work_items[item["repo"]], "Budget work item and continuity differ")
     deliverables = value.get("deliverables", {})
     require(isinstance(deliverables, dict) and set(deliverables) <= set(repos), "Invalid deliverables")
     for repo, entries in deliverables.items():
@@ -367,6 +374,8 @@ def contract(path):
     value["_contract_path"] = str(path)
     for item in continuity:
         budget_continuity(value, item["repo"], path, item.get("slice_id"))
+    for repo in work_items:
+        check_related_budgets(value, repo, path)
     return value
 
 
@@ -912,6 +921,8 @@ def budget_continuity(value, repo, contract_path, slice_id=None):
     if not matches:
         return None
     item = matches[0]
+    if "recovery_sources" in item:
+        return recovery_continuity(value, repo, contract_path, item, slice_id)
     require(item.get("approved_by") == "user", "Budget continuity requires user approval")
     for key in ("work_item", "user_authorization", "reason"):
         state.text(item.get(key), key)
@@ -1007,6 +1018,112 @@ def budget_continuity(value, repo, contract_path, slice_id=None):
     elif old.get("budget_continuity"):
         budget_continuity(old, repo, source, item.get("source_slice_id"))
     return item
+
+
+def recovery_continuity(value, repo, contract_path, item, slice_id):
+    """Reconcile independent, audited repo histories without rewriting their events."""
+    require(slice_id is None, "Budget recovery supports repository histories only")
+    require(item.get("approved_by") == "user", "Budget recovery requires user approval")
+    for key in ("work_item", "user_authorization", "approval_question", "reason"):
+        state.text(item.get(key), key)
+    timestamp(item.get("approved_at"))
+    extra = item.get("additional_passes")
+    require(type(extra) is int and extra > 0, "Budget recovery requires positive additional passes")
+    sources = item.get("recovery_sources")
+    require(isinstance(sources, list) and sources, "Budget recovery requires source histories")
+    root = value["repo_paths"][repo]
+    exclusions = value.get("read_excludes", {}).get(repo, [])
+    state.text(item.get("decision_path"), "budget recovery decision path")
+    decision = state.guard_excluded_path(item.get("decision_path"), root, exclusions)
+    decision = absolute_file(decision)
+    require(sha(decision) == item.get("decision_sha256"), "Budget recovery decision seal mismatch")
+    approved = state.load(decision)
+    for key in ("work_item", "repo", "approved_by", "user_authorization", "approval_question",
+                "approved_at", "reason", "additional_passes", "recovery_sources", "used_passes", "effective_limit"):
+        require(approved.get(key) == item.get(key), "Budget recovery decision does not match accounting")
+    seen, used, prior_extra = set(), 0, 0
+    for source in sources:
+        require(isinstance(source, dict), "Invalid budget recovery source")
+        state.text(source.get("contract_path"), "budget recovery source path")
+        source_path = absolute_file(state.guard_excluded_path(source.get("contract_path"), root, exclusions))
+        resolved = source_path.resolve()
+        require(resolved != Path(contract_path).resolve() and resolved not in seen,
+                "Duplicate or cyclic budget recovery source")
+        seen.add(resolved)
+        require(sha(source_path) == source.get("contract_sha256"), "Budget recovery contract seal mismatch")
+        old = state.load(source_path)
+        require(repo in old.get("repos", []) and Path(old.get("repo_paths", {}).get(repo, "")).resolve() == Path(root).resolve(),
+                "Budget recovery repository mismatch")
+        require(old.get("budget_work_items", {}).get(repo, item["work_item"]) == item["work_item"],
+                "Budget recovery work item mismatch")
+        # A previously carried allowance cannot be safely summed with independent histories.
+        require(not old.get("budget_continuity"), "Nested continuity requires separate accounting; recovery refused")
+        audited = validate_history(source_path, repo, read_excludes=exclusions)
+        require(audited["run_id"] == source.get("run_id")
+                and audited["state_path"] == source.get("state_path")
+                and audited["state_sha256"] == source.get("state_sha256")
+                and audited["review_fix_count"] == source.get("used_passes"),
+                "Budget recovery source differs from audited history")
+        require(not any(grant.get("historical_budget_sources") for grant in audited["grants"]),
+                "Nested historical grants require separate accounting; recovery refused")
+        used += audited["review_fix_count"]
+        prior_extra += audited["granted_additional_passes"]
+    limit = REVIEW_FIX_BUDGET + prior_extra + extra
+    require(item.get("used_passes") == used and item.get("effective_limit") == limit and used <= limit,
+            "Budget recovery totals do not match audited histories and approval")
+    return item
+
+
+def check_related_budgets(value, repo, contract_path):
+    """Fail closed when a locally identified related run has not been carried forward."""
+    work_item = value.get("budget_work_items", {}).get(repo)
+    if not work_item:
+        return
+    root = Path(contract_path).parent.parent.parent
+    current = Path(contract_path).resolve()
+    continuity = budget_continuity(value, repo, contract_path)
+    covered = set()
+    if continuity:
+        if "recovery_sources" in continuity:
+            covered.update(Path(source["contract_path"]).resolve() for source in continuity["recovery_sources"])
+        else:
+            pending = [Path(continuity["source_contract_path"]).resolve()]
+            while pending:
+                source = pending.pop()
+                require(source != current and source not in covered, "Budget continuity cycle")
+                covered.add(source)
+                prior = state.load(source)
+                for entry in prior.get("budget_continuity", []):
+                    if entry.get("repo") == repo and entry.get("slice_id") is None:
+                        if "recovery_sources" in entry:
+                            pending.extend(Path(item["contract_path"]).resolve() for item in entry["recovery_sources"])
+                        else:
+                            pending.append(Path(entry["source_contract_path"]).resolve())
+    for run_group in (root / ".ship-runs", root / ".fix-runs"):
+        state.guard_excluded_path(str(run_group.absolute()), value["repo_paths"][repo],
+                                  value.get("read_excludes", {}).get(repo, []))
+        if not run_group.exists():
+            continue
+        for directory in run_group.iterdir():
+            state.guard_excluded_path(str(directory.absolute()), value["repo_paths"][repo],
+                                      value.get("read_excludes", {}).get(repo, []))
+            if not directory.is_dir():
+                continue
+            candidate = directory / "contract.json"
+            state.guard_excluded_path(str(candidate.absolute()), value["repo_paths"][repo],
+                                      value.get("read_excludes", {}).get(repo, []))
+            if not candidate.exists():
+                continue
+            if candidate.resolve() == current:
+                continue
+            other = state.load(candidate)
+            related = any(identifier == work_item and
+                          Path(other.get("repo_paths", {}).get(name, "")).resolve()
+                          == Path(value["repo_paths"][repo]).resolve()
+                          for name, identifier in other.get("budget_work_items", {}).items())
+            if related:
+                require(candidate.resolve() in covered,
+                        f"Related run is missing from budget continuity: {candidate}")
 
 
 def review_budget(events, contract_path=None, value=None, repo=None, visited_contracts=None):
@@ -1478,6 +1595,7 @@ def author_identity_recovery(contract_path, value, repo, request, events, final)
 def transition(contract_path, repo, request_path, out):
     value = contract(contract_path)
     require(repo in value["repos"], "Unknown transition repo")
+    check_related_budgets(value, repo, contract_path)
     directory = Path(contract_path).parent / repo
     events = history(directory)
     previous = events[-1][2] if events else {}
@@ -2772,6 +2890,7 @@ def review_budget_status(contract_path, repo):
     contract_file = absolute_file(contract_path)
     value = contract(contract_file)
     require(repo in value["repos"], "Unknown review-budget repo")
+    check_related_budgets(value, repo, contract_file)
     events = history(contract_file.parent / repo)
     require(events, "No lifecycle history")
     inherited = {}
@@ -2824,6 +2943,7 @@ def complete(contract_path, out):
     for applied in value.get("_amendments", []):
         paths.append(applied["path"])
     for repo in value["repos"]:
+        check_related_budgets(value, repo, contract_path)
         events = history(root / repo)
         require(events and events[-1][2]["status"] == "verified", f"Repo not verified: {repo}")
         latest = events[-1][2]

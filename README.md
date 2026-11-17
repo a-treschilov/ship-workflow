@@ -1,5 +1,8 @@
 # ship-workflow
 
+Related ship and fix runs preserve review-fix budgets through stable work-item identifiers and explicit,
+audited continuity. The protocol describes recovery when independent run histories omitted that continuity.
+
 Contracts can declare read exclusions and versioned deliverables. The lifecycle helpers validate submitted
 evidence and compare declared published files with run-local snapshots before review and completion; see
 the [protocol](workflows/ship-fix/PROTOCOL.md) for commands and limitations.

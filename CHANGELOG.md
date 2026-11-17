@@ -12,6 +12,7 @@
 - Configure the OCX example assignments in the model template and validate the profile when applying it.
 - Show run progress, remaining steps, phase durations and available token usage in Run Explorer, including a token summary on the overview.
 - Use `gpt-6.2-sol` for the OCX reviewer, plan-checker, and slicer example assignments and catalog.
+- Identify related ship and fix runs and support user-approved recovery of independent review-budget histories.
 - Resolve an exact run name before matching run ID prefixes in `ship-analyze`.
 
 ### Bug Fixes

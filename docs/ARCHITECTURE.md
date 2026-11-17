@@ -133,6 +133,8 @@ when all current assignments inherit. Existing project configuration remains aut
 - A blocked, interrupted, capped or unverified state is reported as such. It is not converted into success by
   starting a replacement run.
 - Review and gate budgets never reset through a new directory. Successor runs carry historical usage explicitly.
+- Identified related repo runs are checked across both local run directories; recovery decisions reconcile
+  audited independent histories without rewriting them. Legacy and missing histories still require human discovery.
 - Requirements and non-goals cannot be changed during execution. Scope or requirement amendments require the
   documented user approval artifacts.
 - The final completion certificate must bind every assigned repository, mandatory criterion and dependency

@@ -50,6 +50,9 @@ the contract. Print scope/order and author handoffs.
 Before creating a run, search existing `plans/.ship-runs/*/run.json` for the selected plan and item, inspect
 the latest related state and report open work and budget usage. Continue the matching run where possible;
 never reset its budget or treat a new directory as a fresh result.
+Also search `plans/.fix-runs/` and inspect legacy descriptions for related work. Assign each repo a stable
+`budget_work_items` identifier in the contract, reuse it for related ship/fix runs, and resolve ambiguous legacy
+matches with the user. Follow the protocol for multi-history recovery before dispatch or completion.
 Create exclusive RUN_DIR and valid run.json with the protocol's `init-run` helper, then write the immutable approved-plan snapshot,
 per-repo excerpts and v2 contract.json per protocol. Excerpts include selected repo work plus cross-cutting
 constraints/verification; referenced cross-repo sections are accessible in the snapshot. Store actual
