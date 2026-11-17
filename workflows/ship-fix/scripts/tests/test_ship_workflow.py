@@ -18,6 +18,64 @@ state = workflow.state
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_input_snapshot_rejects_symlink_into_excluded_tree(self):
+        secret = self.repo / "secret"
+        secret.mkdir()
+        (secret / "input.txt").write_text("private")
+        alias = self.repo / "alias"
+        alias.symlink_to(secret, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            workflow.snapshot_inputs([str(alias / "input.txt")], self.run / "inputs", self.repo, ["secret"])
+        self.assertFalse((self.run / "inputs").exists())
+
+    def test_repo_review_budget_uses_continuity_allowance(self):
+        continuity = {"used_passes": 10, "effective_limit": 12}
+        with patch.object(workflow, "budget_continuity", return_value=continuity):
+            limit, grants = workflow.review_budget([], self.contract, self.c, "api")
+        self.assertEqual((2, []), (limit, grants))
+
+    def test_declared_successor_requires_budget_continuity(self):
+        self.c["successor_scopes"] = [{"repo": "api", "slice_id": "s2", "work_item": "work-1"}]
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "requires matching budget continuity"):
+            workflow.contract(self.contract)
+
+    def test_budget_continuity_preserves_human_decision_and_rejects_changed_source(self):
+        prior = self.root / "prior-run"
+        prior.mkdir()
+        contract = prior / "contract.json"
+        contract.write_text(json.dumps({"schema_version": 2, "workflow": "fix", "run_id": "prior-run",
+                                        "repos": ["api"], "repo_paths": {"api": str(self.repo)}}))
+        directory = prior / "api" / "slices" / "s2"
+        directory.mkdir(parents=True)
+        source = directory / "state-1.json"
+        source.write_text(json.dumps({"schema_version": 2, "run_id": "prior-run", "repo": "api",
+                                      "slice_id": "s2", "status": "implemented",
+                                      "review_fix_count": 0,
+                                      "artifact_hashes": {str(contract): workflow.sha(contract)}}))
+        decision = self.root / "decision.txt"
+        decision.write_text("User decision: 10 of 12")
+        item = {"repo": "api", "slice_id": "s2", "source_slice_id": "s2", "approved_by": "user",
+                "work_item": "work-1", "user_authorization": "10 of 12", "reason": "reconciled history",
+                "approved_at": "2026-01-01T00:00:00Z", "used_passes": 10, "effective_limit": 12,
+                "source_contract_path": str(contract), "source_contract_sha256": workflow.sha(contract),
+                "source_state_path": str(source), "source_state_sha256": workflow.sha(source),
+                "decision_path": str(decision), "decision_sha256": workflow.sha(decision)}
+        self.c["budget_continuity"] = [item]
+        self.c["successor_scopes"] = [{"repo": "api", "slice_id": "s2", "work_item": "work-1"}]
+        self.save("contract.json", self.c)
+        workflow.contract(self.contract)
+        self.assertEqual(2, item["effective_limit"] - workflow.budget_continuity(
+            self.c, "api", self.contract, "s2")["used_passes"])
+        original = source.read_bytes()
+        source.write_text("{}")
+        with self.assertRaisesRegex(ValueError, "state seal mismatch"):
+            workflow.budget_continuity(self.c, "api", self.contract, "s2")
+        source.write_bytes(original)
+        decision.write_text("modified")
+        with self.assertRaisesRegex(ValueError, "decision seal mismatch"):
+            workflow.budget_continuity(self.c, "api", self.contract, "s2")
+
     def test_validate_contract_rejects_foreign_slice_schedule(self):
         schedule = self.save("foreign-schedule.json", {"schema_version": 2, "run_id": "another-run", "repo": "api"})
         self.c["slice_schedules"] = {"api": {"path": schedule, "sha256": workflow.sha(schedule)}}
@@ -2164,6 +2222,35 @@ class SliceLifecycleTests(unittest.TestCase):
             failed=[{"id": "api-1", "reason": "Edited but unverified: pending"}], skipped=[]))
         with self.assertRaisesRegex(ValueError, "Slice review-fix budget exhausted"):
             self.move_slice("a", "edited-unverified", touched, action="review-fix", applied_path=applied)
+
+    def test_continuity_limits_successor_slice_to_two_repairs(self):
+        continuity = {"used_passes": 10, "effective_limit": 12}
+        with patch.object(workflow, "budget_continuity", side_effect=lambda value, repo, path, slice_id=None:
+                          continuity if slice_id == "a" else None):
+            self.accept("a", "a.txt")
+            touched = ["a.txt"]
+            self.move_slice("a", "edited-unverified", touched, action="integration-fix", author_agent_id="author-a")
+            self.move_slice("a", "pre-review-passed", touched,
+                            pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(touched))])
+            finding = {"id": "api-1", "file": "a.txt", "line": 1, "severity": "Warning", "status": "new",
+                       "category": "Logic", "description": "wrong", "recommendation": "fix",
+                       "failure_scenario": "x", "verification_expectation": "assert", "criterion_ids": [],
+                       "verification_kind": "static"}
+            for cycle in range(3):
+                finding["status"] = "new" if cycle == 0 else "recurring"
+                number = cycle + 2
+                self.move_slice("a", "needs-fix", touched, review_path=self.slice_review("a", touched, number, [finding]))
+                applied = self.save(f"continuity-applied-{cycle}.json", self.artifact(round=number, applied=[],
+                    failed=[{"id": "api-1", "reason": "unverified"}], skipped=[]))
+                if cycle == 2:
+                    with self.assertRaisesRegex(ValueError, "Slice review-fix budget exhausted"):
+                        self.move_slice("a", "edited-unverified", touched, action="review-fix", applied_path=applied)
+                else:
+                    result = self.move_slice("a", "edited-unverified", touched, action="review-fix", applied_path=applied)
+                    self.assertEqual((cycle + 1, 2, 10), (result["review_fix_count"], result["review_fix_limit"],
+                                                         result["historical_used_passes"]))
+                    self.move_slice("a", "pre-review-passed", touched,
+                                    pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(touched))])
 
     def test_slice_capsule_handoff_moves_repair_to_fresh_author_and_rejects_misuse(self):
         self.c["author_rotation"] = "capsule"

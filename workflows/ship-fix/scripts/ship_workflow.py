@@ -221,6 +221,25 @@ def contract(path):
         require(isinstance(paths, list) and len(paths) == len(set(paths)), "Invalid read_excludes paths")
         for path in paths:
             state.relative_path(path)
+    continuity = value.get("budget_continuity", [])
+    require(isinstance(continuity, list), "Invalid budget continuity")
+    continuity_keys = []
+    continuity_sources = []
+    for item in continuity:
+        require(isinstance(item, dict) and item.get("repo") in repos, "Invalid continuity repo")
+        if item.get("slice_id") is not None:
+            state.relative_path(item["slice_id"])
+        continuity_keys.append((item["repo"], item.get("slice_id")))
+        continuity_sources.append((item.get("source_contract_path"), item["repo"], item.get("source_slice_id")))
+    require(len(continuity_keys) == len(set(continuity_keys)), "Duplicate budget continuity scope")
+    require(len(continuity_sources) == len(set(continuity_sources)), "Duplicate budget continuity source")
+    successors = value.get("successor_scopes", [])
+    require(isinstance(successors, list) and all(isinstance(item, dict) for item in successors),
+            "Invalid successor scopes")
+    successor_keys = [(item.get("repo"), item.get("slice_id"), item.get("work_item")) for item in successors]
+    require(len(successor_keys) == len(set(successor_keys)), "Duplicate successor scope")
+    continuity_work = {(item["repo"], item.get("slice_id"), item.get("work_item")) for item in continuity}
+    require(set(successor_keys) == continuity_work, "Successor scope requires matching budget continuity")
     deliverables = value.get("deliverables", {})
     require(isinstance(deliverables, dict) and set(deliverables) <= set(repos), "Invalid deliverables")
     for repo, entries in deliverables.items():
@@ -346,6 +365,8 @@ def contract(path):
         if value["_amendments"]:
             value["_amendment"] = value["_amendments"][-1]
     value["_contract_path"] = str(path)
+    for item in continuity:
+        budget_continuity(value, item["repo"], path, item.get("slice_id"))
     return value
 
 
@@ -396,6 +417,8 @@ def snapshot_deliverables(contract_path, repo, out_dir, criterion_ids=None):
     require(not output.exists(), "Snapshot directory already exists")
     payload = []
     for entry in entries:
+        state.guard_excluded_path(entry["path"], value["repo_paths"][repo],
+                                  value.get("read_excludes", {}).get(repo, []))
         source = absolute_file(entry["path"])
         require(not source.is_symlink(), "Deliverable cannot be a symlink")
         try:
@@ -429,6 +452,7 @@ def snapshot_inputs(paths, out_dir, repo_root, read_excludes):
     require(not output.exists(), "Input snapshot directory already exists")
     payload = []
     for item in paths:
+        state.guard_excluded_path(item, repo_root, read_excludes)
         source = absolute_file(item)
         require(not source.is_symlink(), "Input cannot be a symlink")
         try:
@@ -482,6 +506,8 @@ def validate_deliverables(value, repo, path, criterion_ids=None):
         snapshot = absolute_file(row.get("snapshot"))
         require(snapshot.resolve().is_relative_to(root), "Deliverable snapshot must be run-local")
         require(sha(snapshot) == row.get("sha256"), "Deliverable snapshot changed")
+        state.guard_excluded_path(entry["path"], value["repo_paths"][repo],
+                                  value.get("read_excludes", {}).get(repo, []))
         actual = absolute_file(entry["path"])
         try:
             relative = actual.resolve().relative_to(Path(value["repo_paths"][repo]).resolve()).as_posix()
@@ -515,10 +541,14 @@ def check_event_seals(value, repo, event, inherited_seals=None):
     """Keep proof files immutable while source snapshots advance through authorized edits."""
     seals = event.get("artifact_hashes", {})
     source_manifest_path = event.get("source_manifest")
+    for path in seals:
+        state.guard_excluded_path(path, value["repo_paths"][repo], value.get("read_excludes", {}).get(repo, []))
     if not source_manifest_path:
         check_seals(seals)
         return list(seals)
 
+    state.guard_excluded_path(source_manifest_path, value["repo_paths"][repo],
+                              value.get("read_excludes", {}).get(repo, []))
     historical = manifest(value, repo, source_manifest_path)
     repo_root = Path(value["repo_paths"][repo]).resolve()
     inherited_seals = inherited_seals or {}
@@ -872,9 +902,118 @@ def historical_budget_used(grants):
     return max((item.get("historical_used_passes", 0) for item in grants), default=0)
 
 
+def budget_continuity(value, repo, contract_path, slice_id=None):
+    """Validate an explicitly approved carryover without changing historical counters."""
+    entries = value.get("budget_continuity", [])
+    require(isinstance(entries, list), "Invalid budget continuity")
+    keys = [(item.get("repo"), item.get("slice_id")) for item in entries if isinstance(item, dict)]
+    require(len(keys) == len(entries) and len(set(keys)) == len(keys), "Duplicate budget continuity scope")
+    matches = [item for item in entries if item.get("repo") == repo and item.get("slice_id") == slice_id]
+    if not matches:
+        return None
+    item = matches[0]
+    require(item.get("approved_by") == "user", "Budget continuity requires user approval")
+    for key in ("work_item", "user_authorization", "reason"):
+        state.text(item.get(key), key)
+    timestamp(item.get("approved_at"))
+    used, limit = item.get("used_passes"), item.get("effective_limit")
+    require(type(used) is int and type(limit) is int and 0 <= used <= limit,
+            "Invalid continuity usage or limit")
+    root = value["repo_paths"][repo]
+    exclusions = value.get("read_excludes", {}).get(repo, [])
+    state.guard_excluded_path(item.get("source_contract_path"), root, exclusions)
+    source = absolute_file(item.get("source_contract_path"))
+    require(source.resolve() != Path(contract_path).resolve(), "Continuity cannot reference current run")
+    require(sha(source) == item.get("source_contract_sha256"), "Continuity contract seal mismatch")
+    old = state.load(source)
+    require(old.get("workflow") == value["workflow"] and repo in old.get("repos", [])
+            and source.parent.name == old.get("run_id"), "Continuity source run mismatch")
+    old = dict(old)
+    old_excludes = dict(old.get("read_excludes", {}))
+    old_excludes[repo] = sorted(set(old_excludes.get(repo, [])) |
+                                set(value.get("read_excludes", {}).get(repo, [])))
+    old["read_excludes"] = old_excludes
+    source_slice = item.get("source_slice_id")
+    require((slice_id is None) == (source_slice is None), "Continuity scope kind mismatch")
+    if source_slice is not None:
+        state.relative_path(source_slice)
+    directory = source.parent / repo
+    if source_slice is not None:
+        directory = directory / "slices" / source_slice
+    events = history(directory)
+    require(events, "Continuity source history missing")
+    state.guard_excluded_path(item.get("source_state_path"), root, exclusions)
+    source_state = absolute_file(item.get("source_state_path"))
+    require(source_state.resolve() == events[-1][1].resolve()
+            and sha(source_state) == item.get("source_state_sha256"), "Continuity state seal mismatch")
+    inherited = {}
+    prior_count = 0
+    prior_status = None
+    for _, _, event in events:
+        bound(old, repo, event)
+        require(event.get("artifact_hashes", {}).get(str(source)) == item["source_contract_sha256"],
+                "Continuity history does not seal its contract")
+        if source_slice is not None:
+            require(event.get("slice_id") == source_slice, "Continuity slice mismatch")
+            status = event.get("status")
+            require((prior_status is None and status == "implemented") or
+                    (prior_status is not None and (status in SLICE_TRANSITIONS.get(prior_status, set())
+                                                   or status in {"blocked", "capped"}
+                                                   or (prior_status == "capped" and status == "needs-fix"
+                                                       and event.get("is_continuation") is True))),
+                    "Invalid continuity slice transition")
+            prior_status = status
+            if event.get("status") == "edited-unverified" and event.get("action") == "review-fix":
+                prior_count += 1
+            require(event.get("review_fix_count", 0) == prior_count,
+                    "Continuity slice counter is inconsistent with events")
+        check_event_seals(old, repo, event, inherited)
+        inherited = event.get("artifact_hashes", {})
+    state.guard_excluded_path(item.get("decision_path"), root, exclusions)
+    decision = absolute_file(item.get("decision_path"))
+    require(sha(decision) == item.get("decision_sha256"), "Continuity decision seal mismatch")
+    require(used >= events[-1][2].get("review_fix_count", 0), "Continuity cannot reduce recorded usage")
+    # Reject cycles and repeated sources, including through earlier continuity declarations.
+    seen = {Path(contract_path).resolve()}
+    current = source
+    while True:
+        require(current.resolve() not in seen, "Budget continuity cycle")
+        seen.add(current.resolve())
+        prior = state.load(current).get("budget_continuity", [])
+        require(isinstance(prior, list), "Invalid prior continuity")
+        scoped = [entry for entry in prior if entry.get("repo") == repo
+                  and entry.get("slice_id") == source_slice]
+        require(len(scoped) <= 1, "Duplicate prior continuity")
+        if not scoped:
+            break
+        previous = scoped[0]
+        require(previous.get("work_item") == item["work_item"], "Continuity work item mismatch")
+        require(used >= previous.get("used_passes", 0) + events[-1][2].get("review_fix_count", 0),
+                "Continuity cannot reduce cumulative usage")
+        state.guard_excluded_path(previous.get("source_contract_path"), root, exclusions)
+        current = absolute_file(previous.get("source_contract_path"))
+        require(sha(current) == previous.get("source_contract_sha256"), "Continuity ancestor seal mismatch")
+        source_slice = previous.get("source_slice_id")
+        ancestor_directory = current.parent / repo
+        if source_slice is not None:
+            state.relative_path(source_slice)
+            ancestor_directory = ancestor_directory / "slices" / source_slice
+        events = history(ancestor_directory)
+        require(events and str(events[-1][1]) == previous.get("source_state_path")
+                and sha(events[-1][1]) == previous.get("source_state_sha256"),
+                "Continuity ancestor state seal mismatch")
+    if item.get("source_slice_id") is None:
+        validate_history(source, repo, read_excludes=old_excludes[repo])
+    elif old.get("budget_continuity"):
+        budget_continuity(old, repo, source, item.get("source_slice_id"))
+    return item
+
+
 def review_budget(events, contract_path=None, value=None, repo=None, visited_contracts=None):
     """Derive repo-level review budget only from grants applied in immutable states."""
     grants, seen_paths, predecessors = [], set(), set()
+    continuity = budget_continuity(value, repo, contract_path) if value is not None and contract_path else None
+    base_limit = (continuity["effective_limit"] - continuity["used_passes"]) if continuity else REVIEW_FIX_BUDGET
     carried_over, carried_sources = 0, []
     active_contracts = set(visited_contracts or ())
     if contract_path:
@@ -952,6 +1091,7 @@ def review_budget(events, contract_path=None, value=None, repo=None, visited_con
             require(type(extra) is int and extra > 0, "Invalid applied review-budget grant")
             historical_sources = data.get("historical_budget_sources", [])
             if historical_sources:
+                require(continuity is None, "Cannot combine continuity and legacy historical sources")
                 historical_used, validated_sources = historical_budget_sources(
                     historical_sources, repo,
                     value["workflow"] if value is not None else data["workflow"], contract_path,
@@ -979,14 +1119,14 @@ def review_budget(events, contract_path=None, value=None, repo=None, visited_con
                 summary.update({"historical_used_passes": carried_over,
                                 "historical_budget_sources": carried_sources})
             grants.append(summary)
-        expected_limit = max(0, REVIEW_FIX_BUDGET + sum(item["additional_passes"] for item in grants)
+        expected_limit = max(0, base_limit + sum(item["additional_passes"] for item in grants)
                              - carried_over)
         if "review_fix_limit" in event:
             require(event["review_fix_limit"] == expected_limit, "Review-fix limit disagrees with applied grants")
         if "review_fix_grants" in event:
             require(event["review_fix_grants"] == grants,
                     "Review-fix grant history disagrees with applied grants")
-    return max(0, REVIEW_FIX_BUDGET + sum(item["additional_passes"] for item in grants)
+    return max(0, base_limit + sum(item["additional_passes"] for item in grants)
                - carried_over), grants
 
 
@@ -1020,6 +1160,8 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
     require(timestamp(previous["at"]) <= approved <= datetime.now(timezone.utc),
             "Grant approval timestamp is stale or in the future")
     current_limit, prior_grants = review_budget(events, contract_path, value, repo)
+    continuity = budget_continuity(value, repo, contract_path)
+    require(not (continuity and historical_sources), "Cannot combine continuity and legacy historical sources")
     prior_historical = historical_budget_used(prior_grants)
     if historical_sources:
         require(requested_historical >= prior_historical, "Historical budget carryover cannot shrink")
@@ -1030,8 +1172,8 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
         validated_sources = next(item["historical_budget_sources"] for item in reversed(prior_grants)
                                  if item.get("historical_used_passes", 0))
     prior_grants_used = sum(item["additional_passes"] for item in prior_grants)
-    require(previous.get("review_fix_count", 0) + historical_used
-            >= REVIEW_FIX_BUDGET + prior_grants_used,
+    require((previous.get("review_fix_count", 0) >= current_limit if continuity else
+             previous.get("review_fix_count", 0) + historical_used >= REVIEW_FIX_BUDGET + prior_grants_used),
             "Cumulative review-fix budget is not exhausted")
     require(all(item.get("previous_state_path") != str(prior_path) for item in prior_grants),
             "A grant was already issued for this state")
@@ -1517,7 +1659,9 @@ def transition(contract_path, repo, request_path, out):
     if is_grant_transition:
         target, grant_summary = apply_budget_grant(contract_path, value, repo, request, events, previous, data)
         require(status == target, "Grant transition status changed during validation")
-        budget_limit = max(0, REVIEW_FIX_BUDGET
+        continuity = budget_continuity(value, repo, contract_path)
+        base_limit = (continuity["effective_limit"] - continuity["used_passes"]) if continuity else REVIEW_FIX_BUDGET
+        budget_limit = max(0, base_limit
                            + sum(item["additional_passes"] for item in applied_grants)
                            + grant_summary["additional_passes"]
                            - grant_summary.get("historical_used_passes", 0))
@@ -2008,6 +2152,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     plan = slice_schedule(contract_path, repo, schedule_path)
     items = {i["id"]: i for i in state.load(absolute_file(schedule_path))["slices"]}
     require(slice_id in items, "Unknown slice")
+    continuity = budget_continuity(value, repo, contract_path, slice_id)
     item = items[slice_id]
     directory = Path(contract_path).parent / repo / "slices" / slice_id
     events = history(directory) if directory.is_dir() else []
@@ -2023,7 +2168,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     require(isinstance(request, dict), "Slice request must be an object")
     protected = {"review_fingerprint", "artifact_hashes", "accepted_files", "dependency_states", "schema_version",
                  "run_id", "repo", "slice_id", "sequence", "at", "schedule_sha256", "review_fix_count",
-                 "latest_review_round", "review_fix_limit", "is_continuation"}
+                 "latest_review_round", "review_fix_limit", "is_continuation", "historical_used_passes"}
     status = request.get("status")
     require(not protected & set(request), "Request overrides certified slice fields")
     if "deliverable_manifest_path" in request:
@@ -2127,6 +2272,9 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
             "source_fingerprint": final["fingerprint"]}
     for key in ("review_fix_count", "latest_review_round"):
         data[key] = previous.get(key, 0)
+    if not events and continuity:
+        data["review_fix_limit"] = continuity["effective_limit"] - continuity["used_passes"]
+        data["historical_used_passes"] = continuity["used_passes"]
     data["is_continuation"] = continuation_limit is not None
     if continuation_limit is not None:
         data["review_fix_limit"] = continuation_limit
@@ -2545,7 +2693,7 @@ def slice_schedule(contract_path, repo, schedule_path):
     return {"groups": groups, "cross_slice_criteria": sorted(cross), "schedule_sha256": sha(path)}
 
 
-def validate_history(contract_path, repo, visited_contracts=None):
+def validate_history(contract_path, repo, visited_contracts=None, read_excludes=()):
     """Audit immutable lifecycle state and grant chains without recapturing today's source."""
     contract_file = absolute_file(contract_path)
     visited = set(visited_contracts or ())
@@ -2553,6 +2701,11 @@ def validate_history(contract_path, repo, visited_contracts=None):
             "Historical budget reference cycle/current-run ancestry detected")
     visited.add(contract_file.resolve())
     value = state.load(contract_file)
+    if read_excludes:
+        value = dict(value)
+        exclusions = dict(value.get("read_excludes", {}))
+        exclusions[repo] = sorted(set(exclusions.get(repo, [])) | set(read_excludes))
+        value["read_excludes"] = exclusions
     require(isinstance(value, dict) and value.get("schema_version") == VERSION
             and value.get("workflow") in {"ship", "fix"}, "Invalid historical workflow contract")
     require(contract_file.parent.name == value.get("run_id"), "Contract/run directory mismatch")
@@ -2650,6 +2803,12 @@ def review_budget_status(contract_path, repo):
             "exhausted": used >= limit, "open_finding_ids": findings,
             "source_matches_state": not changed, "changed_source_paths": changed,
             "grants": grants, "status": "valid"}
+    continuity = budget_continuity(value, repo, contract_file)
+    if continuity:
+        result.update({"historical_used_passes": continuity["used_passes"],
+                       "historical_effective_limit": continuity["effective_limit"],
+                       "cumulative_used_passes": continuity["used_passes"] + used,
+                       "continuity": continuity})
     if historical_used:
         result.update({"historical_used_passes": historical_used,
                        "cumulative_used_passes": historical_used + used})
@@ -2684,7 +2843,8 @@ def complete(contract_path, out):
         paths += validate_deliverables(value, repo, latest.get("deliverable_manifest_path"))
         used = latest.get("review_fix_count", 0)
         grants_total = sum(item["additional_passes"] for item in grants)
-        carried_over = historical_budget_used(grants)
+        continuity = budget_continuity(value, repo, contract_path)
+        carried_over = continuity["used_passes"] if continuity else historical_budget_used(grants)
         budget_summary = {"standard_limit": REVIEW_FIX_BUDGET,
                           "granted_additional_passes": grants_total,
                           "effective_limit": effective_limit, "used_passes": used,
@@ -2693,6 +2853,9 @@ def complete(contract_path, out):
         if carried_over:
             budget_summary.update({"historical_used_passes": carried_over,
                                    "cumulative_used_passes": carried_over + used})
+        if continuity:
+            budget_summary.update({"historical_effective_limit": continuity["effective_limit"],
+                                   "continuity": continuity})
         repos[repo] = {"source_fingerprint": final["fingerprint"], "state_path": str(events[-1][1]),
                        "review_budget": budget_summary}
         paths += [str(events[-1][1]), *latest["artifact_hashes"]]
@@ -3010,12 +3173,15 @@ def digest(contract_path, repo, verbose=False):
     try:
         limit, grants = review_budget(events, contract_path, value, repo)
         used = latest.get("review_fix_count", 0) if latest else 0
-        carried_over = historical_budget_used(grants)
+        continuity = budget_continuity(value, repo, contract_path)
+        carried_over = continuity["used_passes"] if continuity else historical_budget_used(grants)
         budget_summary = {"limit": limit, "used": used,
                           "remaining": max(0, limit - used), "grants": len(grants)}
         if carried_over:
             budget_summary.update({"historical_used": carried_over,
                                    "cumulative_used": carried_over + used})
+        if continuity:
+            budget_summary["continuity"] = continuity
         summary["review_budget"] = budget_summary
         if verbose:
             summary["review_budget"]["grant_details"] = grants

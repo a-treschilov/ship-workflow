@@ -88,6 +88,8 @@ proof and closed-finding dispositions. Review Suggestions too. Budgets and revie
 
 Before any review-fix/plan-gap repair preparation, run the standalone read-only precheck from the project
 root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`.
+For an explicitly identified successor, declare and validate matching `successor_scopes` and
+`budget_continuity` in the contract before dispatch; follow the protocol's source and decision rules.
 Do this before repair telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, or author dispatch;
 show the reported limit, used passes, and open finding IDs. If source does not match the latest state, stop and
 resolve that drift. Repeat the check before every repair. After an exhausted-budget approval, apply the grant

@@ -102,6 +102,11 @@ docs are current.
 
 ## Release notes
 
+Choose release versions using semantic versioning: increment PATCH for backward-compatible bug fixes and small
+corrections, MINOR for backward-compatible features, and MAJOR for incompatible changes. Reset the lower
+components when incrementing a higher component. A release number must reflect the actual compatibility impact;
+do not relabel an incompatible change or new feature as a patch solely to fit a planned version.
+
 Write commit subjects as `type(scope): description`, with the scope optional. Use `feat` for a new capability,
 `fix` for a correction, `perf` for performance, `refactor` for restructuring, `docs` for documentation, `test`
 for tests, `build` for build or dependency changes, `ci` for CI, `style` for formatting and `chore` for other

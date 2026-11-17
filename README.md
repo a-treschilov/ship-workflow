@@ -220,7 +220,9 @@ host adapter.
 ## Versioning
 
 Releases are annotated semver tags (`vX.Y.Z`). Install a tag, not a moving branch, when you need a stable
-project snapshot. User-visible changes are recorded in [`CHANGELOG.md`](CHANGELOG.md) before tagging.
+snapshot. PATCH releases contain backward-compatible fixes and small corrections; MINOR releases add backward-
+compatible features; MAJOR releases contain incompatible changes. User-visible changes are recorded in
+[`CHANGELOG.md`](CHANGELOG.md) before tagging. See [Development](docs/DEVELOPMENT.md) for the release procedure.
 
 ## License
 

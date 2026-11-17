@@ -64,9 +64,13 @@ def checks_module():
 
 def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop_on_fail):
     repo_path = contract["repo_paths"][repo]
+    workflow = workflow_module()
+    workflow.state.guard_excluded_path(Path(out_dir).absolute(), repo_path,
+                                       contract.get("read_excludes", {}).get(repo, []))
+    workflow.state.guard_excluded_path(Path(scope).absolute(), repo_path,
+                                       contract.get("read_excludes", {}).get(repo, []))
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    workflow = workflow_module()
     sanitize = checks_module().sanitize
     dependencies, exclusions = workflow.capture_policy(contract_path, repo)
     effective_scope = out_dir / "capture-scope.json"

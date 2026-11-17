@@ -129,6 +129,8 @@ fresh review and final gates again; counters never reset. Do not skip Suggestion
 
 Before preparing or dispatching every review-fix/plan-gap repair, run the standalone read-only budget check
 from the project root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`.
+For an explicitly identified successor, declare and validate `successor_scopes` and `budget_continuity` in the contract before any
+dispatch, including per-slice decisions; follow the source, decision and accounting requirements in the protocol.
 It must precede repair telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation and author dispatch;
 use its current repo/state result to show the limit, used passes and open finding IDs. If source differs from
 the latest state, stop and resolve that drift. Repeat the check before each repair; after exhaustion, apply any

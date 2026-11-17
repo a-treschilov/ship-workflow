@@ -57,6 +57,43 @@ def safe_path(root, value):
     return path
 
 
+def guard_excluded_path(path, root, read_excludes):
+    """Resolve symlinks one component at a time without probing an excluded path."""
+    if not read_excludes:
+        return Path(path)
+    root = Path(root).resolve()
+    path = Path(path)
+    require(path.is_absolute(), "Expected an absolute path")
+    pending = list(path.parts[1:])
+    current = Path(path.anchor)
+    links = 0
+    while pending:
+        part = pending.pop(0)
+        if part == ".":
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        try:
+            relative = current.relative_to(root).as_posix()
+        except ValueError:
+            relative = None
+        require(relative is None or not any(relative == p or relative.startswith(p + "/")
+                                           for p in read_excludes), "Path intersects read_excludes")
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            links += 1
+            require(links <= 40, "Too many symlinks")
+            target = Path(os.readlink(current))
+            current = Path(target.anchor) if target.is_absolute() else current.parent
+            pending = list(target.parts[1:] if target.is_absolute() else target.parts) + pending
+    return current
+
+
 def scope_paths(path):
     values = load(path)
     require(isinstance(values, list), "Scope must be a JSON array")
@@ -86,21 +123,42 @@ def capture_once(root, scope, excludes, read_excludes=()):
     require(root.is_dir(), f"Missing repo directory: {root}")
     # Do not mistake a directory inside a different checkout for an independent repo.
     is_git = (root / ".git").exists()
-    tracked, others, head = set(), set(), None
-    if is_git:
-        tracked = {os.fsdecode(p) for p in git(root, "ls-files", "-z", "--cached").split(b"\0") if p}
-        others = {os.fsdecode(p) for p in git(root, "ls-files", "-z", "--others",
-                                             "--exclude-standard").split(b"\0") if p}
-        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        head = result.stdout.decode().strip() if result.returncode == 0 else None
-    else:
-        require(bool(scope), "Non-git capture requires explicit source/dependency scope")
     explicit = {relative_path(p) for p in scope}
     forbidden = [relative_path(p) for p in read_excludes]
     def forbidden_path(path):
         return any(path == item or path.startswith(item + "/") or item.startswith(path + "/") for item in forbidden)
     require(not any(forbidden_path(p) for p in explicit), "Source scope intersects read_excludes")
+    tracked, others, head = set(), set(), None
+    if is_git:
+        pathspec = [":(top)"] + [":(top,exclude,literal)" + p for p in forbidden]
+        tracked = {os.fsdecode(p) for p in git(root, "ls-files", "-z", "--cached", "--", *pathspec).split(b"\0") if p}
+        if forbidden:
+            # Avoid asking Git to traverse excluded directories during untracked discovery.
+            def walk(directory, prefix=""):
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        name = prefix + entry.name
+                        if entry.name == ".git" or any(name == p or name.startswith(p + "/") for p in forbidden):
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            walk(entry.path, name + "/")
+                        else:
+                            others.add(name)
+            walk(root)
+            if others:
+                result = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-z", "--stdin"],
+                                        input=b"\0".join(os.fsencode(p) for p in others) + b"\0",
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                require(result.returncode in (0, 1), "git check-ignore failed")
+                others -= {os.fsdecode(p) for p in result.stdout.split(b"\0") if p}
+        else:
+            others = {os.fsdecode(p) for p in git(root, "ls-files", "-z", "--others",
+                                                 "--exclude-standard").split(b"\0") if p}
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        head = result.stdout.decode().strip() if result.returncode == 0 else None
+    else:
+        require(bool(scope), "Non-git capture requires explicit source/dependency scope")
     exclusions = [relative_path(p) for p in (*DEFAULT_EXCLUDES, *excludes)]
 
     def excluded(path):
@@ -556,6 +614,8 @@ def main():
         else:
             raise AssertionError(args.command)
     elif args.command == "capture":
+        guard_excluded_path(Path(args.scope).absolute(), args.repo, args.read_exclude)
+        guard_excluded_path(Path(args.out).absolute(), args.repo, args.read_exclude)
         write_once(args.out, capture(args.repo, scope_paths(args.scope), args.exclude, args.read_exclude))
     elif args.command == "project-ignored-dependencies":
         write_once(args.out, project_ignored_dependencies(args.manifest, args.dependencies))

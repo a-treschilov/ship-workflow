@@ -98,11 +98,21 @@ def describe(contract_path, repo, group, check_id, scope_path, attempt,
     if relative != ".":
         state.relative_path(relative)
     root = Path(value["repo_paths"][repo]).resolve()
+    state.guard_excluded_path(root / relative, root, value.get("read_excludes", {}).get(repo, []))
     cwd = (root / relative).resolve(strict=True)
     state.require(cwd.is_dir() and cwd.is_relative_to(root), "cwd escapes repository")
     search_path = os.pathsep.join(str(cwd / p) for p in os.environ.get("PATH", os.defpath).split(os.pathsep))
+    if "/" not in argv[0]:
+        for directory in search_path.split(os.pathsep):
+            state.guard_excluded_path(Path(os.path.abspath(directory)) / argv[0], root,
+                                      value.get("read_excludes", {}).get(repo, []))
+    else:
+        state.guard_excluded_path(Path(os.path.abspath(cwd / argv[0])), root,
+                                  value.get("read_excludes", {}).get(repo, []))
     executable = shutil.which(argv[0], path=search_path) if "/" not in argv[0] else str(cwd / argv[0])
     state.require(executable is not None, "Executable unavailable")
+    state.guard_excluded_path(Path(os.path.abspath(executable)), root,
+                              value.get("read_excludes", {}).get(repo, []))
     # Preserve the invocation path: resolving a venv's Python symlink changes its environment.
     executable = Path(os.path.abspath(executable))
     state.require(executable.is_file() and os.access(executable, os.X_OK), "Executable is not executable")
@@ -114,6 +124,7 @@ def describe(contract_path, repo, group, check_id, scope_path, attempt,
                   "Run artifacts must be outside assigned source repositories")
     output = run / "checks" / repo / attempt
     state.require(output.resolve().is_relative_to(run), "Output escapes run directory")
+    state.guard_excluded_path(Path(scope_path).absolute(), root, value.get("read_excludes", {}).get(repo, []))
     scope = state.scope_paths(scope_path)
     excludes = sorted({state.relative_path(x) for x in excludes})
     for field, supplied in (("environment", environment), ("data_scope", data_scope)):
@@ -132,6 +143,7 @@ def describe(contract_path, repo, group, check_id, scope_path, attempt,
         "termination_grace_seconds": GRACE, "phase_id": f"check-{repo}-{attempt}",
         "output_dir": str(output), "output_policy": output_policy, "stream_limit_bytes": LIMIT,
         "scope_path": str(Path(scope_path).resolve()), "scope": scope, "excludes": excludes,
+        "read_excludes": value.get("read_excludes", {}).get(repo, []),
         "environment": environment, "data_scope": data_scope, "verification": check["verification"],
         "environment_policy": "inherited, not recorded; no overrides", "permission_notice": NOTICE,
         "cancellation_limit": "Local process group only; no Docker/remote/daemon cancellation guarantee",
@@ -284,14 +296,14 @@ def run(spec, expected_digest):
     code, evidence_path = 3, None
     phase_status, end_reason = "blocked", "unknown"
     try:
-        before = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"])
+        before = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"])
         state.write_once(output / "before.json", before)
         actual, streams = execute(spec)
         result.update(actual)
         result["process_outcome"] = actual["outcome"]
         for name, stream in streams.items():
             state.write_once(output / f"{name}.json", stream)
-        after = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"])
+        after = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"])
         state.write_once(output / "after.json", after)
         result["source_unchanged"] = before == after
         if before != after:

@@ -412,11 +412,11 @@ def git_changes(root):
 
 
 def scope_check(task):
-    changed = git_changes(task["repo_path"])
-    if changed is None:
+    if not (Path(task["repo_path"]) / ".git").exists():
         print("scope-check skipped: non-git source root")
         return
     events = workflow.history(Path(task["contract"]).resolve().parent / task["repo"])
+    changed = None
     if events:
         initial_path = events[0][2].get("initial_manifest")
         require(initial_path, "Initialized state lacks initial manifest")
@@ -428,6 +428,9 @@ def scope_check(task):
         changed = {p for p in set(initial["files"]) | set(current["files"])
                    if initial["files"].get(p, {"kind": "missing"}) !=
                    current["files"].get(p, {"kind": "missing"})}
+    else:
+        require(not task.get("read_excludes"), "scope-check requires initialized history with read_excludes")
+        changed = git_changes(task["repo_path"])
     touched = set(task["touched_list"])
     outside = sorted(p for p in changed if not workflow.in_scope(p, task["write_scope"]))
     unowned = sorted(changed - touched)

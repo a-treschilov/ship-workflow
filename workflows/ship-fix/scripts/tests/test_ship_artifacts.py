@@ -5,10 +5,12 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 SCRIPT = SCRIPTS / "ship_artifacts.py"
@@ -141,6 +143,69 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn("secret/private.txt", result["files"])
         with self.assertRaisesRegex(ValueError, "read_excludes"):
             artifacts.state.capture(self.repo, ["secret/private.txt"], read_excludes=["secret"])
+
+    def test_capture_does_not_open_excluded_directory(self):
+        secret = self.repo / "secret"
+        secret.mkdir()
+        (secret / "untracked.txt").write_text("private")
+        scan = os.scandir
+
+        def guarded(path):
+            self.assertFalse(Path(path) == secret or secret in Path(path).parents,
+                             "capture traversed excluded directory")
+            return scan(path)
+
+        with patch.object(artifacts.state.os, "scandir", side_effect=guarded):
+            manifest = artifacts.state.capture(self.repo, ["src/a.txt"], read_excludes=["secret"])
+        self.assertNotIn("secret/untracked.txt", manifest["files"])
+        self.assertIn("secret/untracked.txt", artifacts.state.capture(self.repo, ["src/a.txt"])["files"])
+
+    def test_capture_exclusion_is_literal_and_respects_gitignore(self):
+        (self.repo / "private[1]").mkdir()
+        (self.repo / "private[1]" / "tracked.txt").write_text("private")
+        (self.repo / "private1").mkdir()
+        (self.repo / "private1" / "visible.txt").write_text("visible")
+        (self.repo / ".gitignore").write_text("ignored/\n")
+        (self.repo / "ignored").mkdir()
+        (self.repo / "ignored" / "hidden.txt").write_text("ignored")
+        subprocess.run(["git", "-C", str(self.repo), "add", ":(literal)private[1]/tracked.txt"], check=True)
+        result = artifacts.state.capture(self.repo, ["src/a.txt"], read_excludes=["private[1]"])
+        self.assertNotIn("private[1]/tracked.txt", result["files"])
+        self.assertIn("private1/visible.txt", result["files"])
+        self.assertNotIn("ignored/hidden.txt", result["files"])
+
+    def test_exclusion_guard_stops_symlink_before_forbidden_target(self):
+        secret = self.repo / "secret"
+        secret.mkdir()
+        (secret / "private.txt").write_text("private")
+        (self.repo / "alias").symlink_to(secret, target_is_directory=True)
+        original = Path.lstat
+
+        def guarded(path, *args, **kwargs):
+            self.assertFalse(path == secret or secret in path.parents, "probed forbidden target")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "lstat", guarded):
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                artifacts.state.guard_excluded_path(self.repo / "alias/private.txt", self.repo, ["secret"])
+
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("sandbox-exec"), "macOS sandbox required")
+    def test_capture_with_excluded_directory_denied_to_process_tree(self):
+        secret = self.repo / "secret"
+        secret.mkdir()
+        (secret / "private.txt").write_text("private")
+        subprocess.run(["git", "-C", str(self.repo), "add", "secret/private.txt"], check=True)
+        (secret / "untracked.txt").write_text("private")
+        profile = '(version 1)(allow default)(deny file-read* (subpath ' + json.dumps(str(secret.resolve())) + '))'
+        code = ("import importlib.util,sys; s=importlib.util.spec_from_file_location('state',sys.argv[1]); "
+                "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                "m.capture(sys.argv[2], ['src/a.txt'], read_excludes=['secret'] if sys.argv[3]=='yes' else [])")
+        command = ["sandbox-exec", "-p", profile, sys.executable, "-I", "-B", "-c", code,
+                   str(SCRIPTS / "ship_state.py"), str(self.repo)]
+        good = subprocess.run([*command, "yes"], capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        bad = subprocess.run([*command, "no"], capture_output=True, text=True)
+        self.assertNotEqual(bad.returncode, 0, "negative control unexpectedly read forbidden directory")
 
     def test_matrix_repair_preserves_unmodified_rows(self):
         task = artifacts.task_file(self.task)

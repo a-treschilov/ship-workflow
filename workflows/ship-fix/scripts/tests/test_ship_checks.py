@@ -99,6 +99,17 @@ class CheckTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             workflow.proof(self.contract, "api", result["evidence_path"], self.load(spec, "after.json"), "gate.tests")
 
+    def test_read_exclusions_are_bound_and_apply_to_both_captures(self):
+        self.contract["read_excludes"] = {"api": ["secret"]}
+        self.persist()
+        (self.repo / "secret").mkdir()
+        (self.repo / "secret" / "private.txt").write_text("private")
+        spec, (code, _) = self.run_check()
+        self.assertEqual(code, 0)
+        self.assertEqual(spec["read_excludes"], ["secret"])
+        for name in ("before.json", "after.json"):
+            self.assertNotIn("secret/private.txt", self.load(spec, name)["files"])
+
     def test_failed_child_is_not_cli_exit_code(self):
         self.setup_code("import sys; sys.exit(17)")
         spec, (code, result) = self.run_check()

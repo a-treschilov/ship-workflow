@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.0 - 2026-11-17
+
+### New Features
+
+- Carry user-approved review-budget decisions into a successor repo or slice while preserving historical states.
+
+### Bug Fixes
+
+- Avoid traversing excluded paths during untracked source capture and initialized scope checks.
+- Apply read exclusions to opt-in check captures, execution specifications and declared input snapshots.
+
 ## v1.0.0
 
 ### New Features

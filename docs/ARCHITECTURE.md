@@ -91,7 +91,8 @@ prerequisites and cross-repo bindings. Evidence records name a producer, kind, s
 environment, data scope, before/after manifests and bounded artifact paths. Hash freshness is not semantic
 proof; a matching manifest only shows that the evidence was captured against the current source.
 
-Optional contract read exclusions prevent helper captures from reading matching file contents. Declared
+Optional contract read exclusions prune matching paths from helper capture and reject intersecting input snapshots.
+Successor budget continuity records bind prior states and explicit user decisions without rewriting history. Declared
 deliverables use run-local snapshots, checked against the live published paths before review and completion.
 Declared check inputs can be snapshotted at execution; these bindings do not independently establish the
 semantic correctness of a claim or authenticate a process identity.

@@ -288,6 +288,18 @@ Assessment and completion reports distinguish carried-over usage, current-run us
 and remaining effective allowance. A grant cannot reduce historical usage, reference its own run, or cite a
 modified/invalid historical state. When no historical source is supplied, legacy per-run behavior is unchanged.
 
+A successor can instead declare `budget_continuity` in its contract as an array of scope records, one per repo
+or slice, and a matching `successor_scopes` array of `{repo, slice_id, work_item}` records (omit `slice_id` for
+a repo). Each continuity record contains `repo`, optional `slice_id`, `source_slice_id` for a slice, `work_item`,
+`source_contract_path`/`source_contract_sha256`, `source_state_path`/`source_state_sha256`, `used_passes`,
+`effective_limit`, `approved_by: "user"`, `user_authorization`, `reason`, `approved_at`, and
+`decision_path`/`decision_sha256`. Paths are absolute; the source state must be the latest state in its
+original run. The decision is a user-approved accounting decision, not proof that missing lifecycle events
+occurred. For example, 10 used out of 12 leaves two new-run repairs. The new run's repair counter starts at zero;
+reports show historical and new usage separately. Keep the source history and decision immutable. Do not mix
+this mechanism with legacy historical sources in a grant. A later exhaustion needs a normal explicit grant.
+The same source cannot be imported twice, and cycles and reduction of recorded usage are refused.
+
 After a yes, write a unique JSON under `RUN_DIR/budget-grants/` with schema_version, run_id, workflow, repo,
 contract_sha256, additional_passes (positive int, bool is invalid), purpose (`review-fix` or `plan-gap`), reason,
 `approved_by: "user"`, exact approval_question and user_authorization response, approved_at UTC,
@@ -496,10 +508,12 @@ is validated against the effective amended scope and retains the amendment hash 
 preserved; new or modified changes outside the assigned scope remain violations.
 
 Contracts may declare `read_excludes` as a repo-to-relative-path-list map. Captures must pass every path
-as `--read-exclude`; helpers use the contract automatically. These paths are omitted before any file content
-is read, including tracked files. A touched or dependency scope intersecting an exclusion is refused. This
-controls helper capture, not arbitrary shell commands or external programs: do not dispatch a command that
-would read a forbidden path. Existing `excludes` retains its untracked-file meaning.
+as `--read-exclude`; helpers use the contract automatically. Captures prune excluded paths before untracked
+directory traversal and omit tracked and untracked excluded file contents. A touched or dependency scope
+intersecting an exclusion is refused. This controls helper capture, not arbitrary shell commands or external programs: do not dispatch a command that
+would read a forbidden path. `ship_checks.py` binds these exclusions in its execution specification and applies
+them to both captures. An uninitialized scope-check refuses read exclusions rather than running an unrestricted
+Git status scan. Existing `excludes` retains its untracked-file meaning.
 
 When a task produces deliverable files, declare `deliverables` in the contract as a repo-to-list map; each
 entry has a unique `id`, absolute `path`, and nonempty `criterion_ids`. Once the files exist, snapshot them:
