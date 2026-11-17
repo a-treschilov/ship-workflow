@@ -3,6 +3,11 @@ models:
   reviewer: "inherit"
   plan-checker: "inherit"
   slicer: "inherit"
+ocx_models:
+  implementer: "gpt-6-luna"
+  reviewer: "gpt-6.2-sol"
+  plan-checker: "gpt-6.2-sol"
+  slicer: "gpt-6.2-sol"
 available_models:
   - "gpt-6-astra"
   - "gpt-6.2-sol"

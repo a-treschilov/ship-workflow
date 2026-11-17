@@ -93,6 +93,45 @@ class AgentModelConfigTests(unittest.TestCase):
             with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
                 agent_models.parse_config(config)
 
+    def test_initialize_profile_preserves_comments_and_other_sections(self):
+        config = self.root / "models.yaml"
+        self.models = {role: "inherit" for role in agent_models.ROLES}
+        profile = {role: "example-model" for role in agent_models.ROLES}
+        text = self.config_text(["example-model"])
+        text = text.replace('  reviewer: "inherit"', '  reviewer: "inherit" # keep comment')
+        text += 'ocx_models:\n' + ''.join(f'  {role}: "{model}"\n' for role, model in profile.items())
+        text += 'claude_aliases:\n  example-model: "example-alias"\n'
+        config.write_text(text)
+        agent_models.initialize_profile(config, "ocx", "both")
+        self.assertEqual(profile, agent_models.parse_config(config)[0])
+        self.assertIn('  reviewer: "example-model" # keep comment', config.read_text())
+        self.assertIn('ocx_models:\n', config.read_text())
+        before = config.read_bytes()
+        with self.assertRaisesRegex(ValueError, "requires inherited"):
+            agent_models.initialize_profile(config, "ocx", "both")
+        self.assertEqual(before, config.read_bytes())
+
+    def test_invalid_profile_never_changes_config(self):
+        config = self.root / "models.yaml"
+        self.models = {role: "inherit" for role in agent_models.ROLES}
+        base = self.config_text(["example-model"])
+        valid = ''.join(f'  {role}: "example-model"\n' for role in agent_models.ROLES)
+        cases = (
+            (base, "missing ocx_models"),
+            (base + 'ocx_models:\n  implementer: "example-model"\n', "every role"),
+            (base + 'ocx_models:\n' + valid + '  reviewer: "example-model"\n', "duplicate"),
+            (base + 'ocx_models:\n' + valid.replace('example-model', 'missing-model'), "absent from catalog"),
+            (base + 'ocx_models:\n' + valid, "missing Claude alias"),
+        )
+        for text, error in cases:
+            with self.subTest(error=error):
+                config.write_text(text)
+                with self.assertRaisesRegex(ValueError, error):
+                    agent_models.initialize_profile(config, "ocx", "both")
+                self.assertEqual(text, config.read_text())
+        agent_models.initialize_profile(config, "ocx", "codex")
+        self.assertEqual({"example-model"}, set(agent_models.parse_config(config)[0].values()))
+
     def test_sync_generates_both_native_formats_and_check_detects_drift(self):
         drift = agent_models.check(self.models, self.aliases, self.root)
         self.assertEqual(sorted(agent_models.ROLES), drift)

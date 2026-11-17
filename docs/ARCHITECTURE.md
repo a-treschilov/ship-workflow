@@ -43,7 +43,7 @@ project root from `SHIP_ROOT`, then from the nearest marker (`.agents/agent-mode
 | `ship_checks.py` | Opt-in single declared check execution with an explicit execution spec and digest | Become the default `/ship` executor |
 | `ship_workflow.py` | Versioned lifecycle validation and transition rules | Launch agents or execute project code |
 | `roundtrip_audit.py` | Read-only transcript audit for batching and tool-call patterns | Rewrite transcripts or run state |
-| `agent_models.py` | Parse role assignments and generate native Claude and Codex role files; detect drift | Guess an unavailable model or alias |
+| `agent_models.py` | Validate and initialize model profiles, generate native Claude and Codex role files, and detect drift | Guess an unavailable model or alias |
 | `ocx_models.py` | Refresh the optional OCX model catalog and Claude aliases | Change role assignments |
 | `trusted_policy.py` | Conservative auto-approval for a simple helper or repository-bound test/lint command | Approve shell composition, expansion, redirection or unknown commands |
 
@@ -108,6 +108,8 @@ semantic correctness of a claim or authenticate a process identity.
 
 Native role files are generated from `roles/`, `platforms/` and `.agents/agent-models.yaml`. The shared role text
 is the behavior source; host files only carry native syntax, tools, permissions and model selection.
+The template's `ocx_models` section defines the optional OCX profile; initialization copies it to `models` only
+when all current assignments inherit. Existing project configuration remains authoritative on upgrade.
 
 ## Invariants
 

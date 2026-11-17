@@ -34,7 +34,7 @@ adapters.
 | New helper command or flag | `ship_state.py` or `ship_artifacts.py`, `PROTOCOL.md`, role or skill text that invokes it, tests |
 | Skill behavior | `skills/<name>/SKILL.md`, affected role text, `PROTOCOL.md` if the rule is shared, tests |
 | Role behavior | `roles/<role>.md`, `platforms/claude/roles.json`, `platforms/codex/roles.json`, tests, docs |
-| Model assignment or catalog | `install/templates/agent-models.yaml`, `agent_models.py` tests, installation docs |
+| Model assignment or catalog | `install/templates/agent-models.yaml` (including `ocx_models`), `agent_models.py` tests, installation docs |
 | Host capability or tool name | `workflows/ship-fix/HOST-ADAPTERS.md`, host adapter, install template, tests |
 | Install or upgrade behavior | `install/install.sh`, `Makefile`, `README.md`, `docs/INSTALLATION.md` |
 | Repository layout or contributor workflow | `AGENTS.md`, `docs/`, `README.md`, `CHANGELOG.md` |
@@ -46,7 +46,7 @@ Roles are declared in four places that must agree:
 1. Add or rename the role file in `roles/<role>.md`.
 2. Update `ROLES` in `workflows/ship-fix/scripts/agent_models.py`.
 3. Update `platforms/claude/roles.json` and `platforms/codex/roles.json` with the same key and `name`.
-4. Add the role to `install/templates/agent-models.yaml` under `models` and to the tests and docs that enumerate
+4. Add the role to `install/templates/agent-models.yaml` under `models` and `ocx_models` and to the tests and docs that enumerate
    roles.
 
 Then run `make test`. The generated native files are produced by `agent_models.py sync` in an installed project;

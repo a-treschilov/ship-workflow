@@ -189,6 +189,22 @@ if [[ -z "${SHIP_REMOTE:-}" || -n "${SHIP_SRC:-}" ]]; then
   fi
 fi
 
+if [[ "$model_mode" == ocx && ! -e "$project_root/.agents/agent-models.yaml" ]] &&
+   ! grep -q '^ocx_models:' "$src/install/templates/agent-models.yaml" &&
+   ! grep -q -- '--profile' "$src/workflows/ship-fix/scripts/agent_models.py"; then
+  # Older snapshots own their original OCX defaults and do not support profile initialization.
+  legacy_env=(env)
+  if [[ -n "${SHIP_SRC:-}" ]]; then
+    legacy_env+=("SHIP_SRC=$SHIP_SRC")
+  elif [[ -z "${SHIP_REMOTE:-}" ]]; then
+    legacy_env+=("SHIP_SRC=$package_root")
+  fi
+  legacy_args=("$ref" --host "$host" --models ocx)
+  [[ "$dev" -eq 1 ]] && legacy_args+=(--dev)
+  "${legacy_env[@]}" "$src/install/install.sh" "${legacy_args[@]}"
+  exit 0
+fi
+
 txn="$(mktemp -d)"
 for item in "${managed[@]}"; do
   if [[ -e "$project_root/$item" || -L "$project_root/$item" ]]; then
@@ -233,16 +249,6 @@ install_template() {
   fi
 }
 install_template "$src/install/templates/agent-models.yaml" "$project_root/.agents/agent-models.yaml"
-if [[ "$model_mode" == ocx && ! -f "$txn/files/.agents/agent-models.yaml" ]]; then
-  python3 - "$project_root/.agents/agent-models.yaml" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1]); text = p.read_text()
-for role, model in {"implementer": "gpt-6-luna", "reviewer": "gpt-6.2-sol", "plan-checker": "gpt-6.2-sol", "slicer": "gpt-6.2-sol"}.items():
-    text = text.replace(f'  {role}: "inherit"', f'  {role}: "{model}"')
-p.write_text(text)
-PY
-fi
 if [[ "$host" == claude || "$host" == both ]]; then
   python3 "$package_root/install/merge_settings.py" "$src/install/templates/claude-settings.json" "$project_root/.claude/settings.json" claude
 fi
@@ -279,6 +285,9 @@ link "../../.agents/workflows/ship-fix/PROTOCOL.md" "$project_root/.claude/refer
 fi
 
 cd "$project_root"
+if [[ "$model_mode" == ocx && ! -f "$txn/files/.agents/agent-models.yaml" ]]; then
+  python3 -I -B .agents/workflows/ship-fix/scripts/agent_models.py init --profile ocx --host "$host"
+fi
 host_args=()
 if grep -q -- '--host' .agents/workflows/ship-fix/scripts/agent_models.py; then
   host_args=(--host "$host")

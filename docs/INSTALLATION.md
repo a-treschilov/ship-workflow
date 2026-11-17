@@ -48,8 +48,9 @@ Select a host with `--host claude`, `--host codex`, or `--host both`. When exact
 found it is selected automatically; otherwise an interactive install asks, and a non-interactive install
 requires `--host`. Upgrades retain the host in `.ship-version` unless `--host` explicitly changes it. Use `--models ocx`
 for the OCX example assignments on a new install; the default is `inherit`. Existing model configuration is
-preserved on upgrade. The OCX example assigns `gpt-6.2-sol` to reviewer, plan-checker, and slicer; update existing
-configurations manually to use the new model and its provider alias.
+preserved on upgrade. The OCX example assignments are defined in the template's `ocx_models` profile; update
+existing configurations explicitly when changing models.
+For an older pinned snapshot without profiles, its original installer supplies the snapshot's OCX defaults.
 The legacy `--sync` flag is accepted for compatibility; sync and check run on every install.
 
 The installer creates `.agents/.ship-version`:
@@ -109,6 +110,17 @@ returns a nonzero exit code and restores the managed files from a temporary back
 `.agents/agent-models.yaml` maps the four shared roles to model IDs and contains the catalog used by the
 checker. The template uses `inherit`, which uses the host's model configuration. To pin OCX models, replace
 the role values with IDs your provider exposes.
+On a new install, `--models ocx` applies the template's `ocx_models` profile. To apply this profile explicitly
+to a configuration whose role assignments are all `inherit`, run:
+
+```bash
+python3 -I -B .agents/workflows/ship-fix/scripts/agent_models.py init --profile ocx
+```
+
+Initialization validates the profile against the catalog and selected host, preserves host-specific overrides,
+and refuses to overwrite pinned assignments. Older configurations without `ocx_models` remain valid; add a
+complete profile before using `init`, or edit their assignments directly. After initialization, run `sync` and
+`check` as described below.
 Existing configurations with a single common prefix on all four role names are accepted without changing
 their model assignments. Ambiguous or incomplete mappings are rejected.
 Optional `claude_models` and `codex_models` mappings override individual roles for that host. A Claude override

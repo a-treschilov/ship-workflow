@@ -74,6 +74,15 @@ class OcxCatalogTests(unittest.TestCase):
             "ocx-claude2-openrouter--anthropic~sclaude-opus[1m]"))
         self.assertEqual("zai/glm-5-turbo", ocx_models.canonical_claude_id("ocx-claude-zai--glm-5-turbo"))
 
+    def test_catalog_refresh_preserves_profile(self):
+        profile = "ocx_models:\n" + "".join(
+            f'  {role}: "old-model"\n' for role in ocx_models.agent_models.ROLES
+        )
+        self.path.write_text(self.original + profile)
+        ocx_models.update_catalog(self.path, ["new-model"], {"new-model": "new-alias"})
+        self.assertIn(profile, self.path.read_text())
+        self.assertTrue(self.path.read_text().startswith(self.assignments))
+
     @patch.object(ocx_models, "urlopen")
     def test_invalid_catalogs_do_not_change_file(self, urlopen):
         for payload in (

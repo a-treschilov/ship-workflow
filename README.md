@@ -76,7 +76,7 @@ regardless of the current checkout. For development, pass `--dev` with the check
 changes; the version record identifies the result as a worktree snapshot.
 Choose `--host claude`, `--host codex`, or `--host both`; a single installed host is detected automatically.
 Use `--models ocx` on a new install to select OCX example assignments; otherwise roles inherit the host model.
-The OCX example assigns `gpt-6.2-sol` to reviewer, plan-checker, and slicer. Existing model configurations are preserved on upgrade.
+The OCX assignments come from the template's `ocx_models` profile. Existing model configurations are preserved on upgrade.
 
 Each install writes `.agents/.ship-version`:
 
@@ -118,7 +118,9 @@ models:
   slicer: "your-slicer-model"
 ```
 
-The template uses `inherit` for every role, using the host's model configuration. To pin OCX models, use IDs and aliases that your
+The template uses `inherit` for every role, using the host's model configuration. For a new configuration,
+`init --profile ocx` copies the template's `ocx_models` profile into `models` after validating the catalog and
+aliases required by the selected host; it refuses to replace existing pinned assignments. To pin other models, use IDs and aliases that your
 provider exposes. `available_models` is the catalog the checker accepts; `claude_aliases` maps canonical IDs
 to Claude Code aliases. Then regenerate the native role files:
 

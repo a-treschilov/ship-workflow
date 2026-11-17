@@ -134,7 +134,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         config = self.project / ".agents/agent-models.yaml"
         original = config.read_bytes()
-        result = self.install(host="codex")
+        result = self.install(host="codex", models="ocx")
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(original, config.read_bytes())
         self.assertFalse((self.project / ".claude/agents/implementer.md").exists())
@@ -153,9 +153,10 @@ class InstallerTests(unittest.TestCase):
             self.assertIn(f'{role}: "gpt-6.2-sol"', config.read_text())
             self.assertIn('model = "gpt-6.2-sol"', (self.project / f".codex/agents/{role}.toml").read_text())
             self.assertIn('model: ocx-claude-native--gpt-6.2-sol[1m]', (self.project / f".claude/agents/{role}.md").read_text())
-        legacy = config.read_text()
+        assignments, remaining = config.read_text().split("ocx_models:\n", 1)
         for role in ("implementer", "reviewer", "plan-checker", "slicer"):
-            legacy = legacy.replace(f"  {role}:", f"  prior-{role}:")
+            assignments = assignments.replace(f"  {role}:", f"  prior-{role}:")
+        legacy = assignments + "ocx_models:\n" + remaining
         config.write_text(legacy)
         result = self.install(host="both")
         self.assertEqual(0, result.returncode, result.stderr)
@@ -260,6 +261,19 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         version = json.loads((self.project / ".agents/.ship-version").read_text())
         self.assertEqual(revision, version["commit"])
+
+    def test_legacy_pinned_ref_uses_its_own_ocx_profile(self):
+        if subprocess.run(["git", "-C", str(PACKAGE), "rev-parse", "--verify", "v1.1.0^{commit}"],
+                          capture_output=True).returncode:
+            self.skipTest("v1.1.0 is not present in this checkout")
+        env = os.environ.copy()
+        env["SHIP_SRC"] = str(PACKAGE)
+        result = subprocess.run([str(INSTALLER), "v1.1.0", "--host", "both", "--models", "ocx"],
+                                cwd=self.project, env=env, capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        config = (self.project / ".agents/agent-models.yaml").read_text()
+        self.assertNotIn('reviewer: "inherit"', config)
+        self.assertTrue((self.project / ".codex/agents/reviewer.toml").is_file())
 
     def test_rejects_a_local_checkout_at_another_ref(self):
         result = self.install("HEAD~1")

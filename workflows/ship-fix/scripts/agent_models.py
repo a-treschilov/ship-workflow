@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 
 
 def resolve_root() -> Path:
@@ -62,8 +63,7 @@ def _scalar(value: str, path: Path, number: int) -> str:
     return result
 
 
-def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], list[str], dict[str, str]]:
-    """Parse the limited YAML subset used here; reject unrecognized structure."""
+def _sections(text: str, path: Path) -> dict[str, list[tuple[int, str]]]:
     sections: dict[str, list[tuple[int, str]]] = {}
     active: str | None = None
     for number, line in enumerate(text.splitlines(), start=1):
@@ -74,7 +74,7 @@ def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], l
             if not match:
                 raise ValueError(f"{path}:{number}: unsupported YAML syntax")
             active = match.group(1)
-            if active not in ("models", "available_models", "claude_aliases", "claude_models", "codex_models"):
+            if active not in ("models", "ocx_models", "available_models", "claude_aliases", "claude_models", "codex_models"):
                 raise ValueError(f"{path}:{number}: unknown section {active!r}")
             if active in sections:
                 raise ValueError(f"{path}:{number}: duplicate section {active!r}")
@@ -84,6 +84,12 @@ def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], l
         else:
             sections[active].append((number, line))
 
+    return sections
+
+
+def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], list[str], dict[str, str]]:
+    """Parse the limited YAML subset used here; reject unrecognized structure."""
+    sections = _sections(text, path)
     if not {"models", "available_models"}.issubset(sections):
         missing = {"models", "available_models"} - sections.keys()
         raise ValueError(f"missing section(s): {', '.join(sorted(missing))}")
@@ -134,7 +140,7 @@ def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], l
         if model_id in aliases:
             raise ValueError(f"{path}:{number}: duplicate Claude alias for {model_id!r}")
         aliases[model_id] = _scalar(raw_alias.split(" #", 1)[0], path, number)
-    for section in ("claude_models", "codex_models"):
+    for section in ("claude_models", "codex_models", "ocx_models"):
         seen = set()
         for number, line in sections.get(section, []):
             match = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*(.+?)\s*", line)
@@ -142,7 +148,59 @@ def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], l
                 raise ValueError(f"{path}:{number}: invalid or duplicate {section} role")
             seen.add(match.group(1))
             _scalar(match.group(2).split(" #", 1)[0], path, number)
+        if section == "ocx_models" and section in sections and seen != set(ROLES):
+            raise ValueError(f"{path}: ocx_models must include every role exactly once")
     return models, available, aliases
+
+
+def initialize_profile(path: Path, profile: str, host: str) -> None:
+    """Apply a validated profile only to an inherited, non-symlinked configuration."""
+    if profile != "ocx":
+        raise ValueError(f"unknown model profile: {profile}")
+    if path.is_symlink():
+        raise ValueError(f"refusing to overwrite symlinked model configuration: {path}")
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        original = stream.read()
+    models, available, aliases = parse_config_text(original, path)
+    if any(model != "inherit" for model in models.values()):
+        raise ValueError("profile initialization requires inherited model assignments")
+    sections = _sections(original, path)
+    if "ocx_models" not in sections:
+        raise ValueError(f"{path}: missing ocx_models profile")
+    profile_models = {}
+    for number, line in sections["ocx_models"]:
+        match = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*(.+?)\s*", line)
+        profile_models[match.group(1)] = _scalar(match.group(2).split(" #", 1)[0], path, number)
+    missing = set(profile_models.values()) - set(available) - {"inherit"}
+    if missing:
+        raise ValueError(f"profile models absent from catalog: {', '.join(sorted(missing))}")
+    overrides = host_overrides(original, path)
+    for role, model in profile_models.items():
+        if host != "codex" and role not in overrides["claude"] and model != "inherit" and model not in aliases:
+            raise ValueError(f"missing Claude alias for profile model: {model}")
+    lines = original.splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines) if re.fullmatch(r"models:\s*", line))
+    end = next((i for i in range(start + 1, len(lines)) if re.fullmatch(r"[a-z_]+:\s*", lines[i])), len(lines))
+    for i in range(start + 1, end):
+        if not lines[i].strip() or lines[i].lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r'  ([A-Za-z0-9_-]+):\s*([^\r\n]*?)(\s+#.*)?(\r?\n)?', lines[i])
+        name, _, comment, newline = match.groups()
+        role = next(role for role in ROLES if name == role or name.endswith("-" + role))
+        lines[i] = f'  {name}: "{profile_models[role]}"{comment or ""}{newline or ""}'
+    updated = "".join(lines)
+    parse_config_text(updated, path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, path.stat().st_mode)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def host_overrides(text: str, path: Path = CONFIG) -> dict[str, dict[str, str]]:
@@ -261,15 +319,22 @@ def sync(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT, hos
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "sync"))
+    parser.add_argument("command", choices=("check", "sync", "init"))
     parser.add_argument("--host", choices=("claude", "codex", "both"))
+    parser.add_argument("--profile", choices=("ocx",))
     args = parser.parse_args()
+    if (args.command == "init") != (args.profile is not None):
+        parser.error("--profile is required for init and is not accepted for check or sync")
     try:
         if not args.host:
             marker = ROOT / ".agents/.ship-version"
             args.host = json.loads(marker.read_text()).get("host", "both") if marker.is_file() else "both"
             if args.host not in {"claude", "codex", "both"}:
                 raise ValueError("invalid installed host in .ship-version")
+        if args.command == "init":
+            initialize_profile(CONFIG, args.profile, args.host)
+            print(f"Initialized model assignments from the {args.profile} profile.")
+            return 0
         models, available, aliases = parse_config()
         overrides = host_overrides(CONFIG.read_text(), CONFIG)
         missing = set(models.values()) - set(available) - {"inherit"}

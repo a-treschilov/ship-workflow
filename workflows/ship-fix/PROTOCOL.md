@@ -55,7 +55,8 @@ Implementers/checkpoints stay sequential: the safe worktree hook shares source. 
 parallel implementers are introduced here. Claude frontmatter and Codex role files are generated from
 the shared role assignments in `.agents/agent-models.yaml` by the explicit `agent_models.py sync` command; `inherit`
 uses the host model configuration, while explicit IDs select pinned models. Do this outside an active run,
-then restart configured agent host. `ocx_models.py` refreshes the canonical OCX catalog and Claude discovery aliases
+then restart configured agent host. Outside a run, `agent_models.py init --profile ocx` can initialize inherited
+assignments from a complete OCX profile; it does not replace pinned assignments. `ocx_models.py` refreshes the canonical OCX catalog and Claude discovery aliases
 without changing role assignments. Codex uses the canonical ID; Claude uses its advertised alias (including `[1m]`
 when offered). `/ship` and `/fix` only check for drift and stop rather than syncing a
 model change into an already-loaded session. Keep agent model settings unchanged during a run; no model override or
