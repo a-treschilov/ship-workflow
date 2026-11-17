@@ -96,6 +96,16 @@ class InsightsTests(unittest.TestCase):
         self.assertEqual([], result['findings'][0]['dispositions'])
         self.assertEqual([], result['observations'])
 
+    def test_open_findings_include_repo_and_slice_independently(self):
+        for directory in ('api', 'api/slices/part'):
+            review = self.write(f'{directory}/round-1-findings.json', {'run_id': 'run1', 'repo': 'api',
+                'round': 1, 'findings': [{'id': 'api-1', 'severity': 'Warning'}]})
+            self.write(f'{directory}/state-1.json', {'review_path': str(review),
+                'review_acceptance_path': 'accepted.json' if directory == 'api' else None})
+        findings = insights.analyze(self.run, {})['open_findings']
+        self.assertEqual([('repo', True), ('slice/part', False)],
+                         [(f['scope'], f['accepted_by_user']) for f in findings])
+
     def test_foreign_run_and_invalid_contract(self):
         self.write('api/rounds-1/round-1-findings.json', {'run_id': 'other', 'repo': 'api', 'round': 1, 'findings': []})
         result = insights.analyze(self.run, {})

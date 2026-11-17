@@ -116,7 +116,10 @@ Missing gates/outcomes aren't passing gates. ship_run=false means no executed sh
 4. Never recommend severity-based early exit, skipped Suggestions, weaker assertions or fewer independent
    checks. Model/budget changes require evidence and user approval; this skill never edits workflow files.
 
-For v2, inspect `insights` for reviewer claims, explicit finding-ID dispositions and applied records,
+For v2, `insights.open_findings` lists the latest open review findings by repo and slice, including recorded
+user acceptance. The compact report lists those findings and counts by severity.
+
+Inspect `insights` for reviewer claims, explicit finding-ID dispositions and applied records,
 separated by repo/slice. The compact output summarizes repo findings; JSON carries slice details. Each
 artifact's seal label is independent: an unsealed statement or matching hash with an unverified
 certificate is not certified evidence. Duplicate IDs in a scope are ambiguous and never automatically

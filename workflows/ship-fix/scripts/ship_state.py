@@ -510,6 +510,8 @@ def main():
             sub.add_argument("--repo", required=True)
         if name == "transition":
             sub.add_argument("--file", required=True)
+        if name == "review-budget":
+            sub.add_argument("--slice")
         if name == "packet":
             sub.add_argument("--scope", required=True)
             sub.add_argument("--baseline", required=True)
@@ -650,7 +652,7 @@ def main():
         elif args.command == "validate-history":
             print(json.dumps(workflow.validate_history(args.contract, args.repo), indent=2))
         elif args.command == "review-budget":
-            print(json.dumps(workflow.review_budget_status(args.contract, args.repo), indent=2))
+            print(json.dumps(workflow.review_budget_status(args.contract, args.repo, args.slice), indent=2))
         elif args.command == "transition":
             workflow.transition(args.contract, args.repo, args.file, args.out)
         elif args.command == "complete":

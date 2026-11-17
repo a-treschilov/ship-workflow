@@ -1094,6 +1094,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual((3, 3, 0, True), (status["limit"], status["used_passes"],
                                            status["remaining_passes"], status["exhausted"]))
         self.assertEqual(["api-1"], status["open_finding_ids"])
+        self.assertEqual([finding], status["open_findings"])
+        self.assertEqual({"Critical": 0, "Warning": 1, "Suggestion": 0}, status["findings_by_severity"])
         self.assertTrue(status["source_matches_state"])
         with self.assertRaisesRegex(ValueError, "Review-fix budget exhausted"):
             self.move("edited-unverified", action="review-fix")
@@ -1103,6 +1105,53 @@ class LifecycleTests(unittest.TestCase):
         capped = workflow.review_budget_status(self.contract, "api")
         self.assertEqual(("capped", ["api-1"]),
                          (capped["latest_status"], capped["open_finding_ids"]))
+        from datetime import datetime, timezone
+        previous = workflow.history(self.run / "api")[-1]
+        decision = self.artifact(workflow="fix", approved_by="user", approval_question="Accept findings?",
+                                 user_authorization="Accept", approved_at=datetime.now(timezone.utc).isoformat(),
+                                 contract_sha256=workflow.sha(self.contract), previous_state_path=str(previous[1]),
+                                 previous_state_sha256=workflow.sha(previous[1]), review_path=latest_review,
+                                 review_sha256=workflow.sha(latest_review), review_round=4,
+                                 finding_ids=["api-1"], source_fingerprint=previous[2]["source_fingerprint"])
+        invalid = self.save("invalid-acceptance.json", {**decision, "finding_ids": []})
+        with self.assertRaisesRegex(ValueError, "finding scope"):
+            self.move("reviewed-with-findings", review_acceptance_path=invalid)
+        for index, changes in enumerate(({"approved_by": "reviewer"}, {"previous_state_sha256": "bad"},
+                                         {"review_sha256": "bad"}, {"repo": "other"})):
+            invalid = self.save(f"invalid-acceptance-{index}.json", {**decision, **changes})
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.move("reviewed-with-findings", review_acceptance_path=invalid)
+        accepted = self.save("acceptance.json", decision)
+        original_source = self.source.read_text()
+        self.source.write_text("unapproved change")
+        with self.assertRaisesRegex(ValueError, "source changed"):
+            self.move("reviewed-with-findings", review_acceptance_path=accepted)
+        self.source.write_text(original_source)
+        result = self.move("reviewed-with-findings", review_acceptance_path=accepted)
+        self.assertEqual(accepted, result["review_acceptance_path"])
+        self.assertEqual(4, result["latest_review_round"])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        failed_gate = self.evidence("gate.tests", status="failed")
+        with self.assertRaisesRegex(ValueError, "did not pass"):
+            self.move("gates-passed", gate_evidence_paths=[failed_gate])
+        with self.assertRaisesRegex(ValueError, "Repo not verified"):
+            workflow.complete(self.contract, str(self.run / "completion.json"))
+        self.move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests")])
+        failed_assessment = self.save("failed-assessment.json", self.artifact(producer="orchestrator", requirements_match=True,
+            criteria=[{"criterion_id": "fix.ac-1", "implementation": "partial", "verification": "unverified",
+                       "reason": "original scenario remains unverified", "evidence_paths": []}]))
+        with self.assertRaises(ValueError):
+            self.move("verified", assessment_path=failed_assessment)
+        with self.assertRaisesRegex(ValueError, "Repo not verified"):
+            workflow.complete(self.contract, str(self.run / "completion.json"))
+        assessment = self.save("accepted-assessment.json", self.artifact(producer="orchestrator", requirements_match=True,
+            criteria=[{"criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                       "reason": "original scenario verified", "evidence_paths": [self.evidence("fix.ac-1")]}]))
+        self.move("verified", assessment_path=assessment)
+        workflow.complete(self.contract, str(self.run / "completion.json"))
+        recorded = state.load(self.run / "completion.json")["repos"]["api"]["open_findings"]
+        self.assertEqual(["api-1"], [item["id"] for item in recorded])
+        self.assertEqual(accepted, recorded[0]["review_acceptance_path"])
 
     def test_review_fix_grant_binds_unchanged_source_and_precedes_repair(self):
         from datetime import datetime, timezone
@@ -1150,6 +1199,80 @@ class LifecycleTests(unittest.TestCase):
             "verification_kind": "static", "evidence_paths": [proof_path]}], failed=[], skipped=[]))
         repaired = self.move("edited-unverified", action="review-fix", applied_path=applied_path)
         self.assertEqual((4, 5), (repaired["review_fix_count"], repaired["review_fix_limit"]))
+
+    def test_extra_review_pass_then_accept_remaining_findings(self):
+        from datetime import datetime, timezone
+        self.ready()
+        self.implement()
+        for number in range(3):
+            self.move("reviewed", review_path=self.review())
+            self.source.write_text(f"plan-gap-{number}\n")
+            self.move("edited-unverified", action="plan-gap")
+            self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Warning",
+                   "status": "new", "category": "Logic", "description": "wrong output",
+                   "recommendation": "fix result", "failure_scenario": "null returns wrong result",
+                   "verification_expectation": "assert null output", "criterion_ids": ["fix.ac-1"],
+                   "verification_kind": "static"}
+        review = self.review([finding])
+        self.move("needs-fix", review_path=review)
+        self.move("capped", reason="budget exhausted")
+        previous = workflow.history(self.run / "api")[-1]
+        grant = self.save("budget-grants/extra.json", self.artifact(
+            workflow=self.c["workflow"], contract_sha256=workflow.sha(self.contract), additional_passes=1,
+            purpose="review-fix", reason="One more attempt", approved_by="user",
+            user_authorization="Grant one pass", approval_question="Grant one pass?",
+            approved_at=datetime.now(timezone.utc).isoformat(), previous_state_path=str(previous[1]),
+            previous_state_sha256=workflow.sha(previous[1]), review_path=review,
+            review_sha256=workflow.sha(review), review_round=4, finding_ids=["api-1"], criterion_ids=[]))
+        granted = self.move("needs-fix", budget_grant_path=grant)
+        self.assertEqual((3, 4), (granted["review_fix_count"], granted["review_fix_limit"]))
+        applied = self.save("extra-applied.json", self.artifact(round=4, applied=[],
+            failed=[{"id": "api-1", "reason": "Repair did not resolve the finding"}], skipped=[]))
+        self.source.write_text("attempted review repair\n")
+        self.move("edited-unverified", action="review-fix", applied_path=applied)
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        new_finding = {**finding, "id": "api-2", "severity": "Critical", "status": "new",
+                       "description": "second issue", "failure_scenario": "another input fails"}
+        review = self.review([{**finding, "status": "recurring"}, new_finding])
+        self.move("needs-fix", review_path=review)
+        budget = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual((4, 4, True), (budget["used_passes"], budget["limit"], budget["exhausted"]))
+        self.assertEqual({"Critical": 1, "Warning": 1, "Suggestion": 0}, budget["findings_by_severity"])
+        self.move("capped", reason="additional pass exhausted")
+        previous = workflow.history(self.run / "api")[-1]
+        decision = self.save("extra-acceptance.json", self.artifact(
+            workflow=self.c["workflow"], approved_by="user", approval_question="Accept remaining finding?",
+            user_authorization="Accept", approved_at=datetime.now(timezone.utc).isoformat(),
+            contract_sha256=workflow.sha(self.contract), previous_state_path=str(previous[1]),
+            previous_state_sha256=workflow.sha(previous[1]), review_path=review,
+            review_sha256=workflow.sha(review), review_round=5, finding_ids=["api-1", "api-2"],
+            source_fingerprint=previous[2]["source_fingerprint"]))
+        accepted = self.move("reviewed-with-findings", review_acceptance_path=decision)
+        self.assertEqual((4, 4, 5), (accepted["review_fix_count"], accepted["review_fix_limit"],
+                                     accepted["latest_review_round"]))
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        self.move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests")])
+        assessment = self.save("extra-assessment.json", self.artifact(producer="checker", requirements_match=True,
+            criteria=[{"criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                       "reason": "original scenario verified", "evidence_paths": [self.evidence("fix.ac-1")]}]))
+        self.move("verified", assessment_path=assessment)
+        workflow.complete(self.contract, str(self.run / "completion.json"))
+        repo = state.load(self.run / "completion.json")["repos"]["api"]
+        self.assertEqual((1, 4, 4), (repo["review_budget"]["granted_additional_passes"],
+                                    repo["review_budget"]["used_passes"], repo["review_budget"]["effective_limit"]))
+        self.assertEqual([("api-1", decision), ("api-2", decision)], [
+            (item["id"], item["review_acceptance_path"]) for item in repo["open_findings"]])
+
+    def test_ship_extra_review_pass_then_accept_remaining_findings(self):
+        plan = self.root / "plan.md"
+        plan.write_text("approved requirement")
+        snapshot = self.run / "approved-plan.md"
+        snapshot.write_bytes(plan.read_bytes())
+        self.c.update(workflow="ship", plan_path=str(plan), approved_snapshot=str(snapshot),
+                      plan_sha256=workflow.sha(plan))
+        self.save("contract.json", self.c)
+        self.test_extra_review_pass_then_accept_remaining_findings()
 
     def test_budget_grant_carries_validated_usage_from_prior_runs(self):
         from datetime import datetime, timezone
@@ -2412,6 +2535,105 @@ class SliceLifecycleTests(unittest.TestCase):
         self.assertEqual(4, repaired["review_fix_count"])
         self.assertFalse(repaired["is_continuation"])
         self.assertEqual(capped, state.load(path))
+
+    def test_accept_slice_findings_after_budget_exhaustion(self):
+        from datetime import datetime, timezone
+        self.test_repair_goes_to_the_slice_author_and_review_budget_is_per_slice()
+        self.move_slice("a", "capped", ["a.txt"], reason="budget exhausted")
+        events = workflow.history(self.run / "api/slices/a")
+        path, capped = events[-1][1:]
+        review_path = capped["review_path"]
+        auth = self.artifact(workflow="fix", slice_id="a", approved_by="user",
+            approval_question="Accept findings?", user_authorization="Accept",
+            approved_at=datetime.now(timezone.utc).isoformat(), contract_sha256=workflow.sha(self.contract),
+            previous_state_path=str(path), previous_state_sha256=workflow.sha(path),
+            review_path=review_path, review_sha256=workflow.sha(review_path),
+            review_round=capped["latest_review_round"], finding_ids=["api-1"],
+            source_fingerprint=capped["source_fingerprint"])
+        budget = workflow.review_budget_status(self.contract, "api", "a")
+        self.assertEqual(["api-1"], budget["open_finding_ids"])
+        self.assertEqual(1, budget["findings_by_severity"]["Warning"])
+        approval = self.save("slice-acceptance.json", auth)
+        result = self.move_slice("a", "reviewed-with-findings", ["a.txt"], review_acceptance_path=approval)
+        self.assertEqual(approval, result["review_acceptance_path"])
+        result = self.move_slice("a", "accepted", ["a.txt"])
+        self.assertEqual("accepted", result["status"])
+
+    def test_slice_extra_pass_acceptance_survives_repository_completion(self):
+        from datetime import datetime, timezone
+
+        def repo_move(status, **kwargs):
+            events = workflow.history(self.run / "api")
+            self.counter += 1
+            request = self.save(f"whole-repo-request-{self.counter}.json", {
+                "status": status, "source_manifest": self.cap(["a.txt", "b.txt"]),
+                "scope_path": self.repo_scope, "baseline_dir": str(self.base), **kwargs})
+            return workflow.transition(self.contract, "api", request,
+                                       str(self.run / "api" / f"state-{len(events) + 1}.json"))
+
+        repo_move("initialized")
+        proof = self.evidence("env.runtime", "static", source=self.cap(["a.txt", "b.txt"]))
+        preflight = self.save("whole-repo-preflight.json", self.artifact(status="passed", evidence_paths=[proof]))
+        repo_move("ready", preflight_path=preflight)
+
+        self.test_human_continuation_preserves_counters_and_grants_one_pass()
+        self.move_slice("a", "pre-review-passed", ["a.txt"],
+                        pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(["a.txt"]))])
+        finding = {"id": "api-1", "file": "a.txt", "line": 1, "severity": "Warning", "status": "recurring",
+                   "category": "Logic", "description": "wrong", "recommendation": "fix",
+                   "failure_scenario": "x", "verification_expectation": "assert", "criterion_ids": [],
+                   "verification_kind": "static"}
+        latest = workflow.history(self.run / "api/slices/a")[-1][2]
+        review = self.slice_review("a", ["a.txt"], latest["latest_review_round"] + 1, [finding])
+        self.move_slice("a", "needs-fix", ["a.txt"], review_path=review)
+        budget = workflow.review_budget_status(self.contract, "api", "a")
+        self.assertEqual((4, 4, True), (budget["used_passes"], budget["limit"], budget["exhausted"]))
+        self.move_slice("a", "capped", ["a.txt"], reason="additional pass exhausted")
+        previous = workflow.history(self.run / "api/slices/a")[-1]
+        decision = self.save("slice-extra-acceptance.json", self.artifact(
+            workflow="fix", slice_id="a", approved_by="user", approval_question="Accept remaining finding?",
+            user_authorization="Accept", approved_at=datetime.now(timezone.utc).isoformat(),
+            contract_sha256=workflow.sha(self.contract), previous_state_path=str(previous[1]),
+            previous_state_sha256=workflow.sha(previous[1]), review_path=review,
+            review_sha256=workflow.sha(review), review_round=previous[2]["latest_review_round"],
+            finding_ids=["api-1"], source_fingerprint=previous[2]["source_fingerprint"]))
+        decision_record = state.load(decision)
+        for index, changes in enumerate(({"slice_id": "b"}, {"finding_ids": []},
+                                         {"approved_by": "reviewer"}, {"review_sha256": "wrong"})):
+            bad = self.save(f"slice-extra-invalid-{index}.json", {**decision_record, **changes})
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.move_slice("a", "reviewed-with-findings", ["a.txt"], review_acceptance_path=bad)
+        accepted = self.move_slice("a", "reviewed-with-findings", ["a.txt"], review_acceptance_path=decision)
+        self.assertEqual((4, 4), (accepted["review_fix_count"], accepted["review_fix_limit"]))
+        self.move_slice("a", "accepted", ["a.txt"])
+        self.accept("b", "b.txt")
+        gate = self.gate("whole-repo-slice-gate.json")
+        matrix = self.save("whole-repo-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "slices a+b", "assertion": "whole criterion",
+            "status": "unverified", "reason": "independent acceptance pending", "evidence_paths": []}]))
+        repo_move("implemented", matrix_path=matrix, slice_gate_path=gate,
+                  slice_authors={"a": "author-a", "b": "author-b"})
+        repo_move("pre-review-passed", matrix_path=matrix, slice_gate_path=gate,
+                  pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(["a.txt", "b.txt"]))])
+        repo_move("reviewed", review_path=self.slice_review("a", ["a.txt", "b.txt"], 1))
+        repo_move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests", source=self.cap(["a.txt", "b.txt"]))])
+        assessment = self.save("whole-repo-assessment.json", self.artifact(producer="orchestrator", requirements_match=True,
+            criteria=[{"criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                       "reason": "original scenario checked", "evidence_paths": [
+                           self.evidence("fix.ac-1", source=self.cap(["a.txt", "b.txt"]))]}]))
+        repo_move("verified", assessment_path=assessment)
+        workflow.complete(self.contract, str(self.run / "completion.json"))
+        certificate = state.load(self.run / "completion.json")
+        findings = certificate["repos"]["api"]["open_findings"]
+        self.assertEqual([("slice/a", "api-1", decision)], [
+            (item["scope"], item["id"], item["review_acceptance_path"]) for item in findings])
+        self.assertIn(decision, certificate["artifact_hashes"])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        decision_bytes = Path(decision).read_bytes()
+        Path(decision).write_bytes(decision_bytes + b" ")
+        with self.assertRaisesRegex(ValueError, "Immutable artifact changed"):
+            workflow.complete(self.contract, str(self.run / "completion.json"))
+        Path(decision).write_bytes(decision_bytes)
 
     def test_slice_review_fix_allows_source_artifact_to_advance(self):
         touched = ["a.txt"]

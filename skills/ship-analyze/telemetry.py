@@ -1065,10 +1065,10 @@ def analyze(run_dir, project, session_override=None, workspace=None):
         intact = audit["intact"]
         repo_status[repo] = {"status": latest.get("status"), "recorded_status": latest.get("status"),
                             "recorded_goals_verified": latest.get("status") == "verified",
-                            "recorded_review_clean": latest.get("status") in {"reviewed", "gates-passed", "verified"},
+                            "recorded_review_clean": latest.get("status") in {"reviewed", "gates-passed", "verified"} and not latest.get("review_acceptance_path"),
                             "artifacts_intact": intact, "seal_audit": audit,
                             "goals_verified": intact and latest.get("status") == "verified",
-                            "review_clean": intact and latest.get("status") in {"reviewed", "gates-passed", "verified"}}
+                            "review_clean": intact and latest.get("status") in {"reviewed", "gates-passed", "verified"} and not latest.get("review_acceptance_path")}
     completion_audit = seal_audit(completion.get("artifact_hashes"))
     completion_valid = completion_audit["intact"] and completion.get("run_id") == run_id and completion.get("status") == "completed"
     if completion and not completion_valid:

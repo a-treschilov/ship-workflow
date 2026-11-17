@@ -31,7 +31,7 @@ def analyze(run_dir, telemetry):
     contract = contract if isinstance(contract, dict) else {}
     completion = completion if isinstance(completion, dict) else {}
     run_id = contract.get('run_id')
-    result = {'findings': [], 'observations': [], 'handoffs': [], 'limitations': []}
+    result = {'findings': [], 'open_findings': [], 'observations': [], 'handoffs': [], 'limitations': []}
     if not isinstance(run_id, str) or run_id != run_dir.name:
         result['limitations'].append('Contract run identity missing or mismatched; qualitative evidence unavailable.')
         return result
@@ -131,6 +131,35 @@ def analyze(run_dir, telemetry):
             result['limitations'].append('Invalid repository identity in contract.')
             continue
         base = run_dir / repo
+        directories = [base] + sorted(p for p in (base / 'slices').glob('*') if p.is_dir())
+        for directory in directories:
+            states = []
+            for state_path in directory.glob('state-*.json'):
+                suffix = state_path.stem.removeprefix('state-')
+                if suffix.isdigit():
+                    states.append((int(suffix), state_path))
+            if not states:
+                continue
+            current = read(max(states)[1]) or {}
+            if not isinstance(current, dict):
+                continue
+            review_path = current.get('review_path')
+            if not isinstance(review_path, str):
+                continue
+            try:
+                target = Path(review_path).resolve()
+                target.relative_to(run_dir)
+                review = read(target) or {}
+            except (OSError, ValueError):
+                continue
+            if not isinstance(review, dict) or not isinstance(review.get('findings'), list):
+                continue
+            scope = 'repo' if directory == base else 'slice/' + directory.name
+            for item in review['findings']:
+                if isinstance(item, dict):
+                    result['open_findings'].append({**item, 'repo': repo, 'scope': scope,
+                        'accepted_by_user': bool(current.get('review_acceptance_path')),
+                        'source': str(target), 'seal': evidence(target)})
         completion_repos = completion.get('repos') if isinstance(completion.get('repos'), dict) else {}
         final_record = completion_repos.get(repo) if isinstance(completion_repos.get(repo), dict) else {}
         final_fingerprint = final_record.get('source_fingerprint')

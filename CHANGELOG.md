@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+
+- Show full open review findings and severity counts in repository review-budget checks.
+- Allow users to accept open review findings after exhausting the repair budget.
+
 ## v1.2.0 - 2026-11-18
 
 ### New Features

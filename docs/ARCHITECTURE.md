@@ -77,6 +77,10 @@ A review repair inserts `needs-fix` and `edited-unverified`, then requires a fre
 gates. A gate repair follows the same rule. The orchestrator owns independent pre-review checks and final gates;
 the implementer owns targeted checks and its completion matrix. The checker owns the requirement assessment.
 
+At review-budget exhaustion, a user may accept the current open findings for a repo or slice. The immutable
+decision binds the exact review and source. Findings remain open in reports and the completion certificate.
+Required gates and acceptance evidence still apply.
+
 The orchestrator may split a large repository scope into approved slices. Slices have independent state
 histories and budgets, but the final repository review still reads the whole scoped diff and may reopen an
 accepted slice when a later edit invalidates it.

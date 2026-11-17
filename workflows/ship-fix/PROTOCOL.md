@@ -49,7 +49,8 @@ This protocol supplies scope, baselines, history and output. Read applicable rep
 Unchanged consumers broken by the new delta are reviewable: anchor the changed cause and name affected
 sites. Unrelated pre-existing Boy Scout issues do not expand writable scope. Extract helpers only when
 semantics are genuinely shared and abstraction lowers maintenance cost, not merely because two snippets
-look alike. Do not waive substantive Suggestions for speed.
+look alike. Address substantive Suggestions during available repair passes and present remaining findings for
+the user's explicit decision at exhaustion.
 
 Implementers/checkpoints stay sequential: the safe worktree hook shares source. No real worktrees or
 parallel implementers are introduced here. Claude frontmatter and Codex role files are generated from
@@ -257,8 +258,9 @@ files; each event saves their values. Generated outputs belong outside source or
 | implemented | matrix_path; code-only from blocked additionally code_only_authorization |
 | pre-review-passed | matrix_path and pre_review_evidence_paths |
 | needs-fix / reviewed | review_path, stable accepted fingerprint, complete coverage and dispositions |
+| reviewed-with-findings | user decision bound to the exhausted review and unchanged source |
 | edited-unverified | action review-fix/gate-fix/plan-gap; fix artifacts below |
-| gates-passed | full independent gate_evidence_paths, current clean review |
+| gates-passed | full independent gate_evidence_paths, current clean or user-accepted review |
 | verified | assessment_path and all mandatory current acceptance proof |
 | blocked / capped / handoff | concrete reason, never offer Proceed |
 
@@ -266,7 +268,7 @@ Run cheap checks and targeted tests at explicit pre-review stage before expensiv
 Gate failures return through original implementer, pre-review, fresh review, full final gates; previously
 green affected gates rerun. No reset of counters. At most 3 review-fix passes (plan-gap repairs share this
 budget), plus final independent review; gate-fix has at most 2 attempts per repo across the run. After the
-last available fix, review findings of any severity mean capped, not converged. Source edits invalidate
+last available fix, review findings of any severity mean capped until the user decides. Source edits invalidate
 review/evidence; final independent review is required after every repair, including repairs beyond pass 3.
 Interrupted edits stay unverified.
 
@@ -275,9 +277,10 @@ Before any repo-level review-fix or plan-gap repair preparation, the orchestrato
 as one standalone read-only command from the project root. This check is first: it precedes repair-phase
 telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, and author dispatch. It verifies the
 immutable history and reports the exact latest state path/hash, current limit, used/remaining passes,
-open finding IDs, and whether current scoped source still matches that state. Never prepare a repair when
+open finding IDs, full finding records, counts by severity, and whether current scoped source still matches that state. Never prepare a repair when
 `source_matches_state` is false; resolve the unexpected edit through the existing lifecycle first. Repeat the
 check immediately before each subsequent repair, including after a grant is applied.
+For a slice add `--slice SLICE` to inspect its independent budget and findings.
 
 ### Explicit repo-level review-budget grants
 
@@ -306,8 +309,19 @@ retroactively authorize past repairs. Perform fresh review, gates and assessment
 The default repo-level budget is always 3 unless a user explicitly approves one or more additions during the
 same run. It is distinct from gate-fix (2) and slice budgets. When capped or at needs-fix with no remaining
 passes, the orchestrator shows the repo, limit, used count, every open finding ID/severity/failure scenario
-(or plan-gap criterion and remaining work), then asks using host's user-input capability for a positive number N or stop.
+(or plan-gap criterion and remaining work), then asks using host's user-input capability for a positive number N,
+accept all open review findings, or stop. Acceptance applies only to review findings, not plan-gap or failed gates.
 No automatic renewal. An approval to implement this mechanism is not approval for any particular run.
+
+To accept findings, first record `capped` after `needs-fix`. Show every finding's ID, severity, category, file,
+line, description and failure scenario and the count by severity. Save a unique run-local JSON containing
+schema_version, run_id, workflow, repo, optional slice_id, contract_sha256, approved_by `user`, approval_question,
+user_authorization, approved_at UTC, previous_state_path and previous_state_sha256, review_path and review_sha256,
+review_round, source_fingerprint and sorted finding_ids. Use `transition` or `slice-transition` with status
+`reviewed-with-findings` and `review_acceptance_path`. The helper binds the decision to the current review and
+source. Continue to slice acceptance or required gates and acceptance assessment. Every edit requires fresh
+review and a new decision if findings remain at exhaustion. Report all remaining findings by repo and slice,
+with severity, location, scenario and whether the user accepted them.
 
 For an explicitly identified successor run on the same approved work item, do not treat a new run directory as
 a budget reset. Before repair dispatch, validate each relevant prior run with `validate-history` and carry its
@@ -366,7 +380,7 @@ Empirical proof must exercise behavior; structural proof can be concrete inspect
 belongs in failed with explanation. For gate-fix: action=gate-fix and gate_failure_path of actual failed
 independent check; original implementer writes unique gate-attempt result, no fake findings round.
 For plan-gap: action=plan-gap, original implementer fixes the goal gap, then repeat review/gates/assessment.
-No budget reset. Exhausted run stops; do not create a new run to disguise exhausted counters.
+No budget reset. At exhaustion, obtain the user decision above; do not create a new run to disguise exhausted counters.
 
 `--from-review`: no contextless fixer; hand findings/gate failures back to original author session. Use
 verified pre-implementation revision or true first-touch baseline, never snapshot finished code as base.
@@ -396,11 +410,12 @@ group when max_parallel is 1 run one writer at a time.
 Each slice has its own immutable history `RUN_DIR/REPO/slices/SLICE/state-N.json`, driven by
 `slice-transition --contract --repo --slice --schedule --file --out`:
 `implemented → pre-review-passed → (needs-fix → edited-unverified → pre-review-passed)* → reviewed → accepted`.
+At an exhausted review, `needs-fix → capped → reviewed-with-findings → accepted` records the user's decision.
 Requests carry `source_manifest`, `base_manifest` (captured before the slice started; never refreshed), the
 cumulative `touched` list, and per status: `implemented` (author_agent_id, slice matrix with one row per
 contribution), `pre-review-passed` (the repo's `pre_review_checks` evidence), `needs-fix`/`reviewed` (a fresh
 review of the slice's touched files, round +1, all rubric passes), `edited-unverified` (`review-fix` with
-applied_path, or `integration-fix` for an already reviewed/accepted slice), `accepted` (clean review on the
+applied_path, or `integration-fix` for an already reviewed/accepted slice), `accepted` (clean or user-accepted review on the
 current fingerprint). Enforced: touched files lie inside the slice write_scope; every change since base is a
 declared touched file; predecessors must be accepted first; repairs go to the slice author (replacement needs a
 human-approved handoff); at most 3 review-fix passes per slice; `blocked`/`capped` need a reason and end the
@@ -632,7 +647,8 @@ Invoke `complete --contract ... --out RUN_DIR/completion.json` only after every 
 recaptures all repos and revalidates gates/acceptance/dependency versions after later changes. Each repo's
 `review_budget` in the certificate records standard_limit, granted_additional_passes, effective_limit,
 used_passes, extra_passes_used and sealed grant summaries (amount, reason, approval role/time and review
-context); granted and consumed passes are distinct. Only this certificate permits scoped success; clean review
+context); granted and consumed passes are distinct. The certificate records open findings and their acceptance
+decision for each repo and slice. Only this certificate permits scoped success; clean review
 alone is not completed verification. Don't offer Proceed past a blocker. Multi-repo checkpoint requires human
 Proceed; single-repo skips pause but prints status.
 Archive only fully completed whole plans. A selected item's certificate does not verify other items.

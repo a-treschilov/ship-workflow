@@ -205,6 +205,10 @@ lets installed skills, protocol text, and hooks work without rewriting paths per
 
 ## How a run works
 
+When the review-fix budget is exhausted, the user can grant more passes, accept the displayed open review
+findings, or stop. Accepted findings remain visible in the completion record and final report. Independent
+checks and requirement verification remain required for completion.
+
 At a high level, each repository moves through:
 
 ```text

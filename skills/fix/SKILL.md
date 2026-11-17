@@ -98,17 +98,21 @@ Do this before repair telemetry, `ship_artifacts.py init-task`, capsule/handoff 
 show the reported limit, used passes, and open finding IDs. If source does not match the latest state, stop and
 resolve that drift. Repeat the check before every repair. After an exhausted-budget approval, apply the grant
 against the exact prior state before any repair preparation, then recheck the budget before continuing.
+For a slice review cap, pass `--slice SLICE` to `review-budget` and use the slice transition and decision
+procedure in the protocol.
 
 When the repo exhausts its standard 3 review-fix/plan-gap passes, do not start a replacement run and never
 use gate-fix to repair review findings. Before dispatching more repair work, show the user the repo, used/limit,
 all open findings (IDs, severity, concise failure scenarios) or plan-gap criteria, and bounded work remaining.
-Ask the user through the host's user-input capability: grant an explicit positive N additional passes or stop; no automatic extension or
+For review findings record `capped` before asking. Ask the user through the host's user-input capability: grant an explicit positive N additional passes, accept
+all shown review findings, or stop. For acceptance follow the protocol's `reviewed-with-findings` transition
+and retain every open finding in the final report. No automatic extension or
 assumed consent. If approved, write a unique run-local grant JSON recording the exact question/answer, reason,
 UTC time, `approved_by: "user"`, repo/run/workflow, purpose, count, exact preceding immutable state path/hash,
 contract hash, and current review path/hash/round/finding IDs (or plan-gap criterion IDs). Apply it using a
 separate no-source-change `transition` request with `budget_grant_path` before repair preparation or telemetry.
 The helper validates and seals the grant. Ask again at each later exhaustion; grants accumulate (e.g. +1 then +1)
-and each is bound to the immediately preceding state. Declining leaves the run stopped/capped. A grant is not a
+and each is bound to the immediately preceding state. Choosing stop leaves the run stopped/capped. A grant is not a
 repair or a review round: normal author routing, proof, pre-review, fresh review, gates and acceptance all remain
 required. Gate-fix remains limited to 2 attempts.
 
@@ -145,3 +149,5 @@ not solely mutable status documents; never overwrite snapshots or revise old run
 Final summary: affected files, findings applied/rounds, independent gates, original scenario proof,
 completion/blockers and accounting completeness. No plan archival. Never git add/commit/push, version bump,
 release, production/external/destructive action without separate approval. Leave changes uncommitted.
+List every open repo and slice finding with severity, location, scenario and acceptance status. Label a completed
+run with open findings as completed with open findings.

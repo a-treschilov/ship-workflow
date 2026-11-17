@@ -31,6 +31,18 @@ analyzer = load("analyze")
 
 
 class ReportTests(unittest.TestCase):
+    def test_completed_report_includes_open_findings(self):
+        data = self.sample()
+        data["telemetry"]["run_completed"] = True
+        data["insights"] = {"open_findings": [{"repo": "api", "scope": "slice/a", "id": "api-1",
+            "severity": "Warning", "category": "Logic", "file": "a.py", "line": 12,
+            "description": "Wrong output", "failure_scenario": "Empty input fails", "accepted_by_user": True}]}
+        text = report.compact(data)
+        self.assertIn("завершено с открытыми замечаниями", text)
+        self.assertIn("Warning: 1", text)
+        self.assertIn("slice/a / api-1", text)
+        self.assertIn("Empty input fails", text)
+
     def test_exact_run_name_precedes_ambiguous_prefix(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

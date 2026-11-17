@@ -73,6 +73,8 @@ PLAN_PATH, CONTRACT_PATH, PROTOCOL_PATH, RUN_DIR) before edits, show its table a
 decision with host's user-input capability. Only an approved schedule is used (protocol "Slice schedule"); never
 slice without that approval. Then drive each slice (dependency order; a computed multi-member group runs as one parallel batch per protocol "Parallel batches", otherwise one at a time) through `slice-transition` — implement, pre-review, fresh slice review, fixes by that slice's author, accepted — then run `slice-gate`, and only then the normal repo lifecycle over the whole diff with a fresh final review (protocol "Slice lifecycle and final integration review"). Use a fresh `implementer` per slice,
 passing the slice's write_scope, interfaces and predecessors' checkpoints, not the whole excerpt history.
+At a slice review cap, use `review-budget --slice SLICE`, present every finding and offer the same three decisions
+as for repo review. Record acceptance through `slice-transition` as described in the protocol.
 
 Before freezing each repo's scope, include impacted documentation and, for user-, consumer- or operator-visible changes, `CHANGELOG.md` (`## Unreleased`; skip repositories that do not track releases). Confirmed drift discovered outside authorized scope is a blocking gap: seek approval to expand scope rather than silently defer it. Initialize each repo's source/baseline/touched scope before first edits. For --from-review verify the true
 pre-implementation base; do not baseline already-written code as its own starting state. Preserve WIP.
@@ -142,14 +144,16 @@ When a repo reaches the standard review-fix cap (3), do not start a replacement 
 findings through gate-fix.
 Before dispatching any more repair work, show the user the repo, passes used/limit,
 open findings (IDs, severity and concise failure scenarios) or the plan-gap criteria, plus the bounded work
-remaining. Ask the user through the host's user-input capability whether to grant a specific positive number of additional review-fix passes
-or stop; no automatic extension or assumed yes. On approval, write a unique run-local budget grant JSON with
+remaining. For review findings record `capped` before asking. Ask the user through the host's user-input capability whether to grant a specific positive number of additional review-fix passes
+or accept all shown review findings or stop; no automatic extension or assumed yes. For acceptance, follow the
+protocol's `reviewed-with-findings` transition and retain every open finding in the final report. On approval of
+additional passes, write a unique run-local budget grant JSON with
 `approved_by: "user"`, the exact answer/question, reason, UTC timestamp, repo/run/workflow, purpose, additional
 passes, exact preceding state path/SHA-256, contract SHA-256 and current review path/hash/round/findings (or
 plan-gap criterion IDs). Apply it with one `transition` carrying `budget_grant_path`, without source edits,
 changing scope/author/review evidence, or starting a repair telemetry phase. The helper validates and seals it
 before any author dispatch. Ask again after each new exhaustion; grants accumulate (for example +1, then +1)
-and each binds to the immediately preceding state. If declined, stop at capped. A grant is not a review round;
+and each binds to the immediately preceding state. If the user chooses stop, remain capped. A grant is not a review round;
 continue through normal repair proof, pre-review, fresh review, gates and acceptance. Gate-fix stays at 2.
 
 The completion certificate and final report must state standard limit, every granted amount and reason, effective
@@ -224,3 +228,5 @@ placeholder. Update actual referring indexes only. Never commit archival or code
 Final summary: per-repo code scope, review rounds/fixes, independent gates, acceptance/evidence/blockers,
 completion certificate and archive status. Report telemetry completeness; don't promise measured savings
 from missing or synthetic usage data. Leave reviewed uncommitted diffs for user inspection.
+List every open repo and slice finding with severity, location, scenario and acceptance status. Label a completed
+run with open findings as completed with open findings.

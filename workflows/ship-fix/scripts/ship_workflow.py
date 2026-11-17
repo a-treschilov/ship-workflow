@@ -27,6 +27,7 @@ TRANSITIONS = {
     "edited-unverified": {"pre-review-passed"},
     "pre-review-passed": {"needs-fix", "reviewed"},
     "needs-fix": {"edited-unverified", "reviewed"},
+    "reviewed-with-findings": {"gates-passed", "edited-unverified"},
     "reviewed": {"gates-passed", "edited-unverified"},
     "gates-passed": {"verified", "edited-unverified"},
     "verified": {"edited-unverified", "verified"},
@@ -1307,7 +1308,7 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
         target = "needs-fix"
         require(grant.get("purpose") == "review-fix", "needs-fix continuation requires review-fix grant")
         context = previous
-    elif before in {"reviewed", "gates-passed", "verified"}:
+    elif before in {"reviewed", "reviewed-with-findings", "gates-passed", "verified"}:
         target = before
         require(grant.get("purpose") == "plan-gap", "Plan-gap continuation needs a plan-gap grant")
         context = previous
@@ -1315,7 +1316,7 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
         require(len(events) >= 2, "Capped state has no resumable context")
         context = events[-2][2]
         target = context.get("status")
-        require(target in {"needs-fix", "reviewed", "gates-passed", "verified"},
+        require(target in {"needs-fix", "reviewed", "reviewed-with-findings", "gates-passed", "verified"},
                 "Capped state has no resumable review or plan-gap context")
         require(grant.get("purpose") == ("review-fix" if target == "needs-fix" else "plan-gap"),
                 "Grant purpose does not match capped state")
@@ -1592,6 +1593,37 @@ def author_identity_recovery(contract_path, value, repo, request, events, final)
                                                              str(result_manifest), *(str(p) for p in (root / "telemetry").glob(f"{phase_id}*.json"))]
 
 
+def accept_review_findings(contract_path, value, repo, events, request, final, slice_id=None):
+    require(len(events) >= 2 and events[-1][2].get("status") == "capped"
+            and events[-2][2].get("status") == "needs-fix", "Acceptance requires capped review findings")
+    previous, reviewed = events[-1][2], events[-2][2]
+    require(previous.get("review_fix_count", 0) >= previous.get("review_fix_limit", 3),
+            "Review budget is not exhausted")
+    path = absolute_file(request.get("review_acceptance_path"))
+    require(path.resolve().is_relative_to(Path(contract_path).parent.resolve()), "Acceptance must be run-local")
+    decision = state.load(path)
+    bound(value, repo, decision)
+    require(decision.get("workflow") == value["workflow"] and decision.get("slice_id") == slice_id,
+            "Wrong acceptance scope")
+    require(decision.get("contract_sha256") == sha(contract_path) and decision.get("approved_by") == "user",
+            "Acceptance requires user approval and current contract")
+    state.text(decision.get("approval_question"), "approval question")
+    state.text(decision.get("user_authorization"), "user authorization")
+    require(timestamp(previous["at"]) <= timestamp(decision.get("approved_at")) <= datetime.now(timezone.utc),
+            "Invalid acceptance time")
+    require(decision.get("previous_state_path") == str(events[-1][1])
+            and decision.get("previous_state_sha256") == sha(events[-1][1]), "Wrong acceptance state")
+    review_path = absolute_file(reviewed.get("review_path"))
+    require(decision.get("review_path") == str(review_path) and decision.get("review_sha256") == sha(review_path)
+            and decision.get("review_round") == reviewed.get("latest_review_round"), "Wrong acceptance review")
+    findings = state.load(review_path)["findings"]
+    require(findings and decision.get("finding_ids") == sorted(f["id"] for f in findings),
+            "Acceptance finding scope differs")
+    require(final["fingerprint"] == previous["source_fingerprint"] == reviewed["review_fingerprint"]
+            and decision.get("source_fingerprint") == final["fingerprint"], "Acceptance source changed")
+    return str(path)
+
+
 def transition(contract_path, repo, request_path, out):
     value = contract(contract_path)
     require(repo in value["repos"], "Unknown transition repo")
@@ -1663,7 +1695,7 @@ def transition(contract_path, repo, request_path, out):
     identity_correction = request.get("author_identity_recovery_path") is not None
     is_grant_transition = grant_path is not None
     valid_grant_transition = (is_grant_transition and (
-        (before in {"needs-fix", "reviewed", "gates-passed", "verified"} and status == before) or
+        (before in {"needs-fix", "reviewed", "reviewed-with-findings", "gates-passed", "verified"} and status == before) or
         (before == "capped" and len(events) >= 2 and status == events[-2][2].get("status"))))
     gate_correction = before == "gates-passed" and status == "gates-passed" and not is_grant_transition
     if gate_correction:
@@ -1675,7 +1707,9 @@ def transition(contract_path, repo, request_path, out):
                 "Gate correction cannot replace other evidence")
     else:
         require("gate_correction_reason" not in request, "Gate correction reason requires gate correction")
-    require(gate_correction or valid_grant_transition or is_requirement_amendment or identity_correction
+    accepting = before == "capped" and status == "reviewed-with-findings"
+    require("review_acceptance_path" not in request or accepting, "Unexpected acceptance path")
+    require(gate_correction or valid_grant_transition or accepting or is_requirement_amendment or identity_correction
             or status in TERMINAL
             or status in TRANSITIONS.get(before, set()),
             f"Illegal transition: {before} -> {status}")
@@ -1683,7 +1717,7 @@ def transition(contract_path, repo, request_path, out):
             and request.get("action") == "review-fix"
             and not {"review_path", "capsule_handoff", "gate_evidence_paths", "assessment_path"} & set(request),
             "Author-identity recovery cannot modify review, source, or grant context")
-    require(before != "capped" or valid_grant_transition,
+    require(before != "capped" or valid_grant_transition or accepting,
             "Exhausted run needs an explicit user-approved budget grant")
     require(not is_grant_transition or status not in TERMINAL,
             "Grant application must resume a concrete review/plan-gap state")
@@ -1700,6 +1734,12 @@ def transition(contract_path, repo, request_path, out):
     dependency_scope = state.scope_paths(absolute_file(dependency_scope_path))
     require(set(previous.get("scope", [])) <= set(scope), "Touched scope must not shrink")
     final = fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
+    if accepting:
+        require(set(request) <= {"status", "source_manifest", "scope_path", "baseline_dir", "review_acceptance_path"},
+                "Acceptance cannot change lifecycle context")
+        require(scope == previous["scope"] and request.get("baseline_dir", previous.get("baseline_dir")) == previous.get("baseline_dir"),
+                "Acceptance cannot change scope or baseline")
+        acceptance_path = accept_review_findings(contract_path, value, repo, events, request, final)
     initial_path = previous.get("initial_manifest", source_path)
     initial = manifest(value, repo, initial_path)
     if previous.get("scope_amendment_path"):
@@ -1754,6 +1794,8 @@ def transition(contract_path, repo, request_path, out):
                     "Source changed without recorded repair; record edited-unverified with repair_phase_id "
                     "(or explicit from-review author_handoff)")
     sealed = [contract_path, source_path, request_path, *amendment_seals]
+    if accepting:
+        sealed.append(acceptance_path)
     for applied in value.get("_amendments", []):
         sealed.append(applied["path"])
     if policy and events:
@@ -1839,6 +1881,7 @@ def transition(contract_path, repo, request_path, out):
             sealed.append(request["code_only_authorization"])
         sealed += matrix(value, repo, request.get("matrix_path"), final)
     if status == "edited-unverified":
+        data.pop("review_acceptance_path", None)
         action = request.get("action")
         require(action in EDITS - {"implement"}, "Missing edit cause")
         if value.get("from_review"):
@@ -1923,7 +1966,8 @@ def transition(contract_path, repo, request_path, out):
     if status in {"gates-passed", "verified"}:
         sealed += validate_deliverables(value, repo, previous.get("deliverable_manifest_path"))
         require(previous.get("review_fingerprint") == final["fingerprint"], "Review is stale")
-        require(not state.load(absolute_file(data["review_path"]))["findings"], "Review has open findings")
+        require(not state.load(absolute_file(data["review_path"]))["findings"]
+                or data.get("review_acceptance_path"), "Review has open findings")
         sealed += check_set(value, repo, "required_gates", data.get("gate_evidence_paths"), final)
     if status == "verified":
         require(not data.get("code_only"), "Code-only authorization cannot certify completion")
@@ -1953,6 +1997,7 @@ SLICE_TRANSITIONS = {
     "edited-unverified": {"pre-review-passed"},
     "pre-review-passed": {"needs-fix", "reviewed"},
     "needs-fix": {"edited-unverified", "reviewed"},
+    "reviewed-with-findings": {"accepted", "edited-unverified"},
     "reviewed": {"accepted", "edited-unverified"},
     "accepted": {"edited-unverified"},
 }
@@ -2294,6 +2339,8 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     require("capsule_handoff" not in request or request.get("status") == "edited-unverified",
             "Capsule handoff requires edited-unverified")
     before = previous.get("status")
+    accepting = before == "capped" and status == "reviewed-with-findings"
+    require("review_acceptance_path" not in request or accepting, "Unexpected acceptance path")
     continuation_path = request.get("continuation_path")
     continuation_limit = None
     if continuation_path:
@@ -2327,9 +2374,9 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     if status in {"blocked", "capped"}:
         require(events, "Nothing to block yet")
         state.text(request.get("reason"), "blocker reason")
-    elif continuation_limit is None and not dependency_recheck:
+    elif continuation_limit is None and not dependency_recheck and not accepting:
         require(status in SLICE_TRANSITIONS.get(before, set()), f"Illegal slice transition: {before} -> {status}")
-    require(before not in {"blocked", "capped"} or continuation_limit is not None,
+    require(before not in {"blocked", "capped"} or continuation_limit is not None or accepting,
             "Exhausted slice needs explicit human continuation")
     expected_out = directory / f"state-{len(events) + 1}.json"
     require(Path(out).resolve() == expected_out.resolve(), "Slice transition output must be next immutable state")
@@ -2359,6 +2406,12 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     outside = [p for p in touched if not in_scope(p, item["write_scope"])]
     require(not outside, "Touched file outside slice write_scope: " + ", ".join(outside))
     final = fresh(value, repo, request.get("source_manifest"), touched)
+    if accepting:
+        require(set(request) <= {"status", "source_manifest", "base_manifest", "touched", "review_acceptance_path"},
+                "Acceptance cannot change slice context")
+        require(touched == previous["touched"] and base_path == previous["base_manifest"],
+                "Acceptance cannot change slice scope or base")
+        acceptance_path = accept_review_findings(contract_path, value, repo, events, request, final, slice_id)
     if continuation_limit is not None:
         require(final["fingerprint"] == previous["source_fingerprint"], "Continuation source must be unchanged")
         require(touched == previous["touched"] and base_path == previous["base_manifest"],
@@ -2404,6 +2457,8 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         data["amendment_sha256"] = value["_amendment"]["sha256"]
     if continuation_limit is not None:
         sealed.append(continuation_path)
+    if accepting:
+        sealed.append(acceptance_path)
     if events:
         sealed.append(str(events[-1][1]))
     if status == "implemented":
@@ -2415,6 +2470,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     elif status not in {"blocked", "capped"}:
         data["author_agent_id"] = previous["author_agent_id"]
     if status == "edited-unverified":
+        data.pop("review_acceptance_path", None)
         action = request.get("action")
         require(action in {"review-fix", "integration-fix"}, "Missing slice edit cause")
         paths, new_author = (capsule_handoff(contract_path, value, repo, request, previous, events,
@@ -2473,7 +2529,8 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     if status == "accepted":
         require(previous.get("review_fingerprint") == final["fingerprint"], "Slice review is stale")
         accepted_review = state.load(absolute_file(previous["review_path"]))
-        require(not accepted_review["findings"], "Slice review has open findings")
+        require(not accepted_review["findings"] or previous.get("review_acceptance_path"),
+                "Slice review has open findings")
         contributions = {c["criterion_id"] for c in item["contributions"]}
         for applied in value.get("_amendments", []):
             if applied["criterion_id"] not in contributions:
@@ -2843,8 +2900,15 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
                            and bool(event.get("gate_correction_reason")))
         if prior_status is not None:
             require(status in TRANSITIONS.get(prior_status, set()) or status in TERMINAL
+                    or (prior_status == "capped" and status == "reviewed-with-findings"
+                        and event.get("review_acceptance_path"))
                     or grant_same_state or grant_resumes_capped or gate_correction,
                     "Invalid historical lifecycle transition")
+        if status == "reviewed-with-findings" and not event.get("budget_grant_applied"):
+            path = accept_review_findings(contract_file, value, repo, events[:index], event,
+                                          manifest(value, repo, event["source_manifest"]))
+            require(event.get("artifact_hashes", {}).get(path) == sha(path),
+                    "Historical review acceptance is not sealed")
         if status == "edited-unverified":
             action = event.get("action")
             require(action in {"review-fix", "plan-gap", "gate-fix"},
@@ -2885,22 +2949,34 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
     return result
 
 
-def review_budget_status(contract_path, repo):
+def review_budget_status(contract_path, repo, slice_id=None):
     """Read-only pre-dispatch budget check bound to the repo's latest immutable state."""
     contract_file = absolute_file(contract_path)
     value = contract(contract_file)
     require(repo in value["repos"], "Unknown review-budget repo")
     check_related_budgets(value, repo, contract_file)
-    events = history(contract_file.parent / repo)
+    directory = contract_file.parent / repo
+    if slice_id is not None:
+        schedules = value.get("slice_schedules", {})
+        require(repo in schedules, "Repository has no slice schedule")
+        plan = slice_schedule(contract_file, repo, schedules[repo]["path"])
+        require(any(slice_id in group for group in plan["groups"]), "Unknown slice")
+        directory = directory / "slices" / slice_id
+    events = history(directory)
     require(events, "No lifecycle history")
     inherited = {}
     for _, path, event in events:
         bound(value, repo, event)
+        if slice_id is not None:
+            require(event.get("slice_id") == slice_id and event.get("schedule_sha256") == plan["schedule_sha256"],
+                    "Slice history belongs to a different slice or schedule")
         check_event_seals(value, repo, event, inherited)
         inherited = event.get("artifact_hashes", {})
-    limit, grants = review_budget(events, contract_file, value, repo)
+    limit, grants = (review_budget(events, contract_file, value, repo) if slice_id is None
+                     else (events[-1][2].get("review_fix_limit", SLICE_REVIEW_FIX_BUDGET), []))
     latest_path, latest = events[-1][1:]
-    scope = sorted(set(latest.get("scope", [])) | set(latest.get("source_scope", [])))
+    scope = (sorted(set(latest.get("scope", [])) | set(latest.get("source_scope", [])))
+             if slice_id is None else latest.get("touched", []))
     current = state.capture(value["repo_paths"][repo], scope, latest.get("excludes", []),
                             value.get("read_excludes", {}).get(repo, []))
     recorded = manifest(value, repo, latest["source_manifest"])
@@ -2913,16 +2989,21 @@ def review_budget_status(contract_path, repo):
     findings = []
     review_path = context.get("review_path")
     if context.get("status") == "needs-fix" and review_path:
-        findings = sorted(item["id"] for item in state.load(absolute_file(review_path))["findings"])
+        findings = state.load(absolute_file(review_path))["findings"]
     used = latest.get("review_fix_count", 0)
     historical_used = historical_budget_used(grants)
     result = {"run_id": value["run_id"], "repo": repo, "state_path": str(latest_path),
             "state_sha256": sha(latest_path), "latest_status": latest["status"],
             "limit": limit, "used_passes": used, "remaining_passes": max(0, limit - used),
-            "exhausted": used >= limit, "open_finding_ids": findings,
+            "exhausted": used >= limit, "open_finding_ids": sorted(item["id"] for item in findings),
+            "open_findings": findings,
+            "findings_by_severity": {severity: sum(item.get("severity") == severity for item in findings)
+                                     for severity in ("Critical", "Warning", "Suggestion")},
             "source_matches_state": not changed, "changed_source_paths": changed,
             "grants": grants, "status": "valid"}
-    continuity = budget_continuity(value, repo, contract_file)
+    if slice_id is not None:
+        result["slice_id"] = slice_id
+    continuity = budget_continuity(value, repo, contract_file, slice_id)
     if continuity:
         result.update({"historical_used_passes": continuity["used_passes"],
                        "historical_effective_limit": continuity["effective_limit"],
@@ -2976,8 +3057,29 @@ def complete(contract_path, out):
         if continuity:
             budget_summary.update({"historical_effective_limit": continuity["effective_limit"],
                                    "continuity": continuity})
+        open_findings = []
+        if latest.get("review_path"):
+            for finding in state.load(absolute_file(latest["review_path"]))["findings"]:
+                open_findings.append({**finding, "scope": "repo",
+                                      "review_acceptance_path": latest.get("review_acceptance_path")})
+        slices_root = root / repo / "slices"
+        if slices_root.is_dir():
+            for directory in sorted(p for p in slices_root.iterdir() if p.is_dir()):
+                slice_events = history(directory)
+                if not slice_events:
+                    continue
+                slice_latest = slice_events[-1][2]
+                inherited = {}
+                for _, _, event in slice_events:
+                    check_event_seals(value, repo, event, inherited)
+                    inherited = event.get("artifact_hashes", {})
+                if slice_latest.get("review_path"):
+                    paths.extend([str(slice_events[-1][1]), *slice_latest.get("artifact_hashes", {})])
+                    for finding in state.load(absolute_file(slice_latest["review_path"]))["findings"]:
+                        open_findings.append({**finding, "scope": "slice/" + directory.name,
+                                              "review_acceptance_path": slice_latest.get("review_acceptance_path")})
         repos[repo] = {"source_fingerprint": final["fingerprint"], "state_path": str(events[-1][1]),
-                       "review_budget": budget_summary}
+                       "review_budget": budget_summary, "open_findings": open_findings}
         paths += [str(events[-1][1]), *latest["artifact_hashes"]]
     if value.get("telemetry_policy", {}).get("run_local_seals"):
         require_run_local(value, root, paths)
@@ -3314,6 +3416,9 @@ def digest(contract_path, repo, verbose=False):
         summary["next_transitions"] = ["initialized"]
     elif status == "capped" and len(events) >= 2 and events[-2][2].get("status"):
         summary["next_transitions"] = sorted({events[-2][2]["status"]} | TERMINAL)
+        if (events[-2][2].get("status") == "needs-fix" and latest.get("review_fix_count", 0)
+                >= latest.get("review_fix_limit", REVIEW_FIX_BUDGET)):
+            summary["next_transitions"].append("reviewed-with-findings")
     else:
         summary["next_transitions"] = sorted(TRANSITIONS.get(status, set()) | TERMINAL)
     context = latest

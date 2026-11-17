@@ -59,6 +59,20 @@ def compact(report):
                      f"recorded goals + valid seals={flag(status.get('goals_verified'))}.")
 
     insights = report.get("insights") or {}
+    open_findings = insights.get("open_findings") or []
+    if open_findings:
+        counts = {severity: sum(f.get("severity") == severity for f in open_findings)
+                  for severity in ("Critical", "Warning", "Suggestion")}
+        lines += ["", f"## Открытые замечания ({len(open_findings)})", ""]
+        lines.append(", ".join(f"{severity}: {count}" for severity, count in counts.items()))
+        if telemetry.get("run_completed") is True:
+            lines.append("Результат: завершено с открытыми замечаниями.")
+        for finding in open_findings:
+            lines.append(f"- {cell(finding.get('repo'))} / {cell(finding.get('scope'))} / "
+                         f"{cell(finding.get('id'))} / {cell(finding.get('severity'))} / "
+                         f"{cell(finding.get('category'))} / {cell(finding.get('file'))}:{cell(finding.get('line'))} — "
+                         f"{cell(finding.get('description'))}. {cell(finding.get('failure_scenario'))} "
+                         f"Принято пользователем: {flag(finding.get('accepted_by_user'))}.")
     handoffs = insights.get("handoffs") or []
     if handoffs:
         lines += ["", "## Handoff и ограничения релиза", ""]
