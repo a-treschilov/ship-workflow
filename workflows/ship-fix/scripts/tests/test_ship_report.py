@@ -4,13 +4,16 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 import unittest
 from unittest.mock import patch
 
 
 HERE = Path(__file__).resolve()
-INSTALLED = (HERE.parents[4] / ".agents/skills/ship-analyze").is_dir()
+INSTALLED = HERE.parents[4].name == ".agents"
 WORKSPACE = HERE.parents[5] if INSTALLED else HERE.parents[4]
 SKILLS = WORKSPACE / (".agents/skills" if INSTALLED else "skills")
 DIRECTORY = SKILLS / "ship-analyze"
@@ -28,6 +31,15 @@ analyzer = load("analyze")
 
 
 class ReportTests(unittest.TestCase):
+    def test_explicit_workspace_reports_missing_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, "-I", "-B", str(DIRECTORY / "analyze.py"),
+                                     "--workspace", directory, "--run", "missing"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no run directory matching", result.stderr)
+            self.assertIn(directory, result.stderr)
+
     def sample(self):
         return {"run_id": "fixture", "schema_version": 2, "telemetry": {
             "run_completed": False, "recorded_completion": {"status": "completed", "at": "2026-10-14T00:00:00Z"},

@@ -1,8 +1,8 @@
 models:
-  crumb-implementer: "gpt-6-luna"
-  crumb-reviewer: "gpt-6.1-sol"
-  crumb-plan-checker: "gpt-6.1-sol"
-  crumb-slicer: "gpt-6.1-sol"
+  implementer: "inherit"
+  reviewer: "inherit"
+  plan-checker: "inherit"
+  slicer: "inherit"
 available_models:
   - "gpt-6-astra"
   - "gpt-6.1-sol"

@@ -10,7 +10,7 @@ import unittest
 
 
 HERE = Path(__file__).resolve()
-INSTALLED = (HERE.parents[4] / ".agents/skills/ship-analyze").is_dir()
+INSTALLED = HERE.parents[4].name == ".agents"
 WORKSPACE = HERE.parents[5] if INSTALLED else HERE.parents[4]
 SKILLS = WORKSPACE / (".agents/skills" if INSTALLED else "skills")
 PATH = SKILLS / 'ship-analyze/insights.py'

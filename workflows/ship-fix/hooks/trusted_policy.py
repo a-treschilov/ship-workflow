@@ -12,8 +12,8 @@ import shlex
 
 
 def resolve_root() -> Path:
-    """Find the project root from CRUMB_SHIP_ROOT or the nearest .agents marker, not install depth."""
-    override = os.environ.get("CRUMB_SHIP_ROOT")
+    """Find the project root from SHIP_ROOT or the nearest .agents marker, not install depth."""
+    override = os.environ.get("SHIP_ROOT")
     if override and Path(override).is_dir():
         return Path(override).resolve()
     start = Path.cwd().resolve()

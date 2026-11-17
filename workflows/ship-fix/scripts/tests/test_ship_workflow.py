@@ -18,6 +18,15 @@ state = workflow.state
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_validate_contract_rejects_foreign_slice_schedule(self):
+        schedule = self.save("foreign-schedule.json", {"schema_version": 2, "run_id": "another-run", "repo": "api"})
+        self.c["slice_schedules"] = {"api": {"path": schedule, "sha256": workflow.sha(schedule)}}
+        self.save("contract.json", self.c)
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "validate-contract", "--contract", self.contract],
+                                capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("not bound to this run/repo", result.stderr)
+
     def test_deferred_cross_repo_assessment_preserves_local_and_legacy_requirements(self):
         local_a = {"id": "a.local", "mandatory": True, "repos": ["a"]}
         local_b = {"id": "b.local", "mandatory": True, "repos": ["b"]}
@@ -27,6 +36,31 @@ class LifecycleTests(unittest.TestCase):
         cross["assessment_repo"] = "b"
         self.assertEqual(["a.local"], [x["id"] for x in workflow.criteria_for(value, "a")])
         self.assertEqual(["b.local", "cross"], [x["id"] for x in workflow.criteria_for(value, "b")])
+
+    def test_cross_repo_proof_honors_dependency_exclusions(self):
+        web = self.root / "web"
+        web.mkdir()
+        subprocess.run(["git", "init", "-q", str(web)], check=True)
+        (web / "source.txt").write_text("tracked")
+        subprocess.run(["git", "-C", str(web), "add", "source.txt"], check=True)
+        (web / "generated").mkdir()
+        (web / "generated/output.txt").write_text("ignored output")
+        dependency = self.save("web-manifest.json", state.capture(web, ["source.txt"], ["generated"]))
+        self.save("web/state-1.json", {"status": "initialized", "source_scope": ["source.txt"],
+                                       "excludes": ["generated"]})
+        value = copy.deepcopy(self.c)
+        value["repos"].append("web")
+        value["repo_paths"]["web"] = str(web)
+        value["criteria"][0]["repos"].append("web")
+        value["_contract_path"] = self.contract
+        record_path = self.evidence("fix.ac-1")
+        record = state.load(record_path)
+        record["dependency_manifests"] = {"web": dependency}
+        self.save(str(Path(record_path).relative_to(self.run)), record)
+        workflow.proof(value, "api", record_path, state.checked_manifest(record["after_manifest"]), "fix.ac-1")
+        del value["_contract_path"]
+        with self.assertRaisesRegex(ValueError, "source states differ"):
+            workflow.proof(value, "api", record_path, state.checked_manifest(record["after_manifest"]), "fix.ac-1")
 
     def test_deferred_cross_repo_contract_rejects_wrong_owner_and_missing_local_criterion(self):
         other = self.root / "other"
@@ -759,6 +793,18 @@ class LifecycleTests(unittest.TestCase):
         path = self.schedule(items, cross=["fix.ac-1"])
         self.assertTrue(all(len(g) == 1 for g in workflow.slice_schedule(self.contract, "api", path)["groups"]))
 
+    def test_slice_phase_is_bound_to_approved_schedule(self):
+        self.schedule([self.slice_item("a", ["app/A"])])
+        self.enable_policy()
+        start = self.run / "telemetry/slice-repair-start.json"
+        end = self.run / "telemetry/slice-repair-end.json"
+        fields = dict(phase_id="slice-repair", phase="review-fix", repo="api", slice_id="a")
+        workflow.phase_from_flags(self.contract, str(start), event="phase-start", **fields)
+        with self.assertRaisesRegex(ValueError, "Unknown telemetry slice"):
+            workflow.phase_from_flags(self.contract, str(end), event="phase-end", status="passed",
+                                      **{**fields, "slice_id": "unknown"})
+        workflow.phase_from_flags(self.contract, str(end), event="phase-end", status="passed", **fields)
+
     def test_slice_resources_and_parallel_flag_block_batching(self):
         items = [self.slice_item("a", ["app/A"], resources=["scratch-db"]),
                  self.slice_item("b", ["app/B"], resources=["scratch-db"]),
@@ -1204,6 +1250,63 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Stale"):
             self.move("implemented", matrix_path=m)
 
+    def test_unverified_matrix_still_checks_supplied_evidence(self):
+        evidence = self.evidence("fix.ac-1")
+        record = state.load(evidence)
+        record["data_scope"] = "wrong scope"
+        self.save(Path(evidence).name, record)
+        matrix_path = self.save("unverified-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "source.txt", "assertion": "result",
+            "status": "unverified", "reason": "pending", "evidence_paths": [evidence]}]))
+        with self.assertRaisesRegex(ValueError, "Wrong evidence data_scope"):
+            workflow.matrix(self.c, "api", matrix_path, state.checked_manifest(self.initial))
+        record["data_scope"] = "null"
+        self.save(Path(evidence).name, record)
+        workflow.matrix(self.c, "api", matrix_path, state.checked_manifest(self.initial))
+
+    def test_deliverable_snapshot_detects_unpublished_or_changed_file(self):
+        published = self.root / "report.txt"
+        published.write_text("first")
+        self.c["deliverables"] = {"api": [{"id": "report", "path": str(published),
+                                              "criterion_ids": ["fix.ac-1"]}]}
+        self.save("contract.json", self.c)
+        manifest = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "snapshots/1"))
+        value = workflow.contract(self.contract)
+        workflow.validate_deliverables(value, "api", manifest)
+        published.write_text("second")
+        with self.assertRaisesRegex(ValueError, "differs"):
+            workflow.validate_deliverables(value, "api", manifest)
+        second = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "snapshots/2"))
+        workflow.validate_deliverables(value, "api", second)
+        self.assertTrue(Path(manifest).is_file())
+
+    def test_check_input_snapshots_detect_change(self):
+        input_file = self.root / "input.txt"
+        input_file.write_text("original")
+        paths = workflow.snapshot_inputs([str(input_file)], self.run / "input-snapshot", self.repo, [])
+        workflow.check_inputs_unchanged(paths)
+        input_file.write_text("changed")
+        with self.assertRaisesRegex(ValueError, "changed during execution"):
+            workflow.check_inputs_unchanged(paths)
+
+    def test_execution_binding_rejects_wrong_producer(self):
+        log = self.run / "execution.log"
+        log.write_text("ok")
+        execution = self.save("execution.json", {"producer": "implementer", "command": "check", "exit_code": 0,
+                                                   "log": str(log)})
+        record = {"execution_record": execution, "artifact_paths": [execution, str(log)],
+                  "producer": "orchestrator", "command": "check", "exit_code": 0}
+        with self.assertRaisesRegex(ValueError, "producer"):
+            workflow.execution_binding(record)
+
+    def test_submission_collects_multiple_bad_evidence_paths(self):
+        matrix_path = self.save("bad-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "source.txt", "assertion": "result",
+            "status": "unverified", "reason": "pending", "evidence_paths": ["relative", "also-relative"]}]))
+        errors = workflow.submission_evidence_errors(self.c, "api", matrix_path,
+                                                       state.checked_manifest(self.initial), "criteria")
+        self.assertEqual(len(errors), 2)
+
     def test_from_review_requires_pre_review_and_author_handoff(self):
         self.c["from_review"] = True
         self.save("contract.json", self.c)
@@ -1262,12 +1365,13 @@ class LifecycleTests(unittest.TestCase):
             record["round"] = previous["latest_review_round"]
         record.update(start_changes or {})
         start = self.run / f"telemetry/{identifier}-start.json"
-        workflow.phase(self.contract, self.save(f"inputs/{identifier}-start.json", record), str(start))
+        record.update(schema_version=2, session_id="")
+        state.write_once(start, record)
         if close:
             record.update(event="phase-end", status=status, at=datetime.now(timezone.utc).isoformat())
             record.update(end_changes or {})
-            workflow.phase(self.contract, self.save(f"inputs/{identifier}-end.json", record),
-                           str(self.run / f"telemetry/{identifier}-end.json"))
+            record["start_sha256"] = workflow.sha(start)
+            state.write_once(self.run / f"telemetry/{identifier}-end.json", record)
         return identifier
 
     def policy_reviewed(self):
@@ -1275,6 +1379,95 @@ class LifecycleTests(unittest.TestCase):
         self.ready()
         self.implement()
         self.move("reviewed", review_path=self.review())
+
+    def test_repair_phase_rejects_bad_binding_before_dispatch(self):
+        self.policy_reviewed()
+        previous_path, previous = workflow.history(self.run / "api")[-1][1:]
+        out = self.run / "telemetry/early-repair-start.json"
+        fields = dict(phase_id="early-repair", phase="review-fix", event="phase-start", repo="api",
+                      action="plan-gap", agent_id="original-1", round=previous["latest_review_round"],
+                      previous_state_path=str(previous_path), previous_state_sha256=workflow.sha(previous_path))
+        with self.assertRaisesRegex(ValueError, "previous state mismatch"):
+            workflow.phase_from_flags(self.contract, str(out), **{**fields, "previous_state_sha256": "wrong"})
+        self.assertFalse(out.exists())
+        workflow.phase_from_flags(self.contract, str(out), **fields)
+        end = self.run / "telemetry/early-repair-end.json"
+        with self.assertRaisesRegex(ValueError, "end/start binding mismatch"):
+            workflow.phase_from_flags(self.contract, str(end), **{**fields, "event": "phase-end", "status": "passed", "round": 999})
+        self.assertFalse(end.exists())
+        workflow.phase_from_flags(self.contract, str(end), **{**fields, "event": "phase-end", "status": "passed"})
+
+    def test_fresh_repair_requires_bound_capsule_and_new_author(self):
+        self.c["author_rotation"] = "capsule"
+        self.save("contract.json", self.c)
+        self.policy_reviewed()
+        previous_path, previous = workflow.history(self.run / "api")[-1][1:]
+        manifest = self.capture("fresh-capsule-manifest.json")
+        capsule = self.save("fresh-capsule.json", self.artifact(written_by="original-1",
+                            source_fingerprint=previous["source_fingerprint"], manifest_path=manifest))
+        fields = dict(phase_id="fresh-repair", phase="review-fix", repo="api", action="plan-gap",
+                      agent_id="original-1", round=previous["latest_review_round"],
+                      previous_state_path=str(previous_path), previous_state_sha256=workflow.sha(previous_path))
+        start = self.run / "telemetry/fresh-repair-start.json"
+        with self.assertRaisesRegex(ValueError, "Missing absolute file"):
+            workflow.phase_from_flags(self.contract, str(start), event="phase-start", **fields)
+        workflow.phase_from_flags(self.contract, str(start), event="phase-start", capsule_path=capsule, **fields)
+        end = self.run / "telemetry/fresh-repair-end.json"
+        with self.assertRaisesRegex(ValueError, "new author"):
+            workflow.phase_from_flags(self.contract, str(end), event="phase-end", status="passed",
+                                      capsule_path=capsule, **fields)
+        workflow.phase_from_flags(self.contract, str(end), event="phase-end", status="passed", capsule_path=capsule,
+                                  **{**fields, "agent_id": "fresh-author"})
+
+    def test_phase_binding_recovery_records_fresh_author(self):
+        self.c["author_rotation"] = "capsule"
+        self.save("contract.json", self.c)
+        self.enable_policy()
+        self.ready()
+        self.implement()
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Warning", "status": "new",
+                   "category": "Logic", "description": "wrong output", "recommendation": "fix result",
+                   "failure_scenario": "null returns wrong result", "verification_expectation": "assert null output",
+                   "criterion_ids": ["fix.ac-1"], "verification_kind": "empirical"}
+        self.move("needs-fix", review_path=self.review([finding]))
+        previous_path, previous = workflow.history(self.run / "api")[-1][1:]
+        before = self.capture("recovery-before.json")
+        capsule = self.save("recovery-before-capsule.json", self.artifact(written_by="original-1",
+                            source_fingerprint=previous["source_fingerprint"], manifest_path=before))
+        phase = self.repair_pair("arbitrary-repair", action="review-fix", end_changes={"agent_id": "fresh-author"})
+        self.source.write_text("fixed by fresh author\n")
+        self.move("blocked", reason="missing capsule telemetry binding")
+        blocked_path, blocked = workflow.history(self.run / "api")[-1][1:]
+        after = self.capture("recovery-after.json")
+        result_capsule = self.save("recovery-after-capsule.json", self.artifact(written_by="fresh-author",
+                                   source_fingerprint=blocked["source_fingerprint"], manifest_path=after))
+        recovery = self.save("recovery.json", self.artifact(kind="ship-phase-binding-recovery-v1",
+            reason="fresh-author handoff capsule_path was omitted from immutable phase events",
+            user_authorization="User approved recovery", blocked_state_path=str(blocked_path),
+            blocked_state_sha256=workflow.sha(blocked_path), preceding_state_path=str(previous_path),
+            preceding_state_sha256=workflow.sha(previous_path), phase_id=phase, capsule_path=capsule,
+            new_author_agent_id="fresh-author", result_capsule_path=result_capsule))
+        for field, value, message in (("user_authorization", "", "Invalid phase-binding recovery"),
+                                      ("phase_id", "../foreign", "recorded repair phase"),
+                                      ("blocked_state_sha256", "bad", "state binding mismatch")):
+            altered = dict(state.load(recovery), **{field: value})
+            bad = self.save(f"recovery-bad-{field}.json", altered)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
+                workflow.phase_binding_recovery(self.contract, workflow.contract(self.contract), "api",
+                                                {"phase_binding_recovery_path": bad},
+                                                workflow.history(self.run / "api"), state.checked_manifest(after))
+        proof_path = self.evidence("fix.ac-1")
+        proof = state.load(proof_path)
+        proof["claims"] = [{"id": "api-1", "assertion": "correct output"}]
+        self.save(str(Path(proof_path).relative_to(self.run)), proof)
+        applied = self.save("recovery-applied.json", self.artifact(round=1, applied=[{
+            "id": "api-1", "verified": "output checked", "verification_kind": "empirical",
+            "evidence_paths": [proof_path]}], failed=[], skipped=[]))
+        event = self.move("edited-unverified", action="review-fix", repair_phase_id=phase,
+                          phase_binding_recovery_path=recovery, applied_path=applied,
+                          capsule_handoff={"capsule_path": capsule, "new_agent_id": "fresh-author"})
+        self.assertEqual("fresh-author", event["current_author_agent_id"])
+        self.assertEqual(1, event["review_fix_count"])
 
     def test_policy_types_and_legacy_absence(self):
         self.assertNotIn("telemetry_policy", workflow.contract(self.contract))

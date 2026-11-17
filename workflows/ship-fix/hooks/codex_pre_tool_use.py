@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 
 HERE = Path(__file__).resolve().parent
-SPEC = importlib.util.spec_from_file_location("crumb_trusted_policy", HERE / "trusted_policy.py")
+SPEC = importlib.util.spec_from_file_location("ship_trusted_policy", HERE / "trusted_policy.py")
 policy = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(policy)
 
@@ -33,7 +33,7 @@ def decide(payload):
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "permissionDecisionReason": "Trusted Crumb workflow/test command (simple repo-bound invocation)",
+        "permissionDecisionReason": "Trusted ship-workflow/test command (simple repo-bound invocation)",
     }}
 
 

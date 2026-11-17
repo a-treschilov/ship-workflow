@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve()
-INSTALLED = (HERE.parents[4] / ".agents/skills/ship-analyze").is_dir()
+INSTALLED = HERE.parents[4].name == ".agents"
 WORKSPACE = HERE.parents[5] if INSTALLED else HERE.parents[4]
 SKILLS = WORKSPACE / (".agents/skills" if INSTALLED else "skills")
 MODULE = SKILLS / "ship-analyze/agents.py"
@@ -29,7 +29,7 @@ class ShipAgentsTests(unittest.TestCase):
         self.subagents = self.root / "subagents"
         self.subagents.mkdir()
         (self.subagents / "agent-abc.meta.json").write_text(json.dumps(
-            {"agentType": "crumb-implementer", "description": "synthetic"}))
+            {"agentType": "implementer", "description": "synthetic"}))
         transcript = [
             line(type="user", timestamp="2026-10-20T10:00:00Z", message={"role": "user", "content": "first task"}),
             line(type="assistant", timestamp="2026-10-20T10:00:01Z", requestId="ocx-0001",
@@ -64,12 +64,12 @@ class ShipAgentsTests(unittest.TestCase):
         target = self.root / "out.json"
         agents.telemetry.OCX_LOG = self.ocx
         self.assertEqual(0, agents.main(["--subagents", str(self.subagents), "--ocx", str(self.ocx),
-                                         "--agent-type", "crumb-implementer", "--json", str(target)]))
+                                         "--agent-type", "implementer", "--json", str(target)]))
         return json.loads(target.read_text())["agents"]
 
     def test_tasks_split_at_prompts_and_tokens_join_exactly(self):
         (agent,) = self.run_main()
-        self.assertEqual("crumb-implementer", agent["agent_type"])
+        self.assertEqual("implementer", agent["agent_type"])
         first, second = agent["tasks"]
         self.assertEqual(2, first["requests_total"])
         self.assertEqual(2, first["matched"])

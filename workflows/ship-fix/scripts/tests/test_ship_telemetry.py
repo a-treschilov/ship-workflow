@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve()
-INSTALLED = (HERE.parents[4] / ".agents/skills/ship-analyze").is_dir()
+INSTALLED = HERE.parents[4].name == ".agents"
 WORKSPACE = HERE.parents[5] if INSTALLED else HERE.parents[4]
 SKILLS = WORKSPACE / (".agents/skills" if INSTALLED else "skills")
 spec = importlib.util.spec_from_file_location("telemetry", SKILLS / "ship-analyze/telemetry.py")
@@ -127,7 +127,7 @@ class TelemetryTests(unittest.TestCase):
 
     def test_tool_correlation_metadata_avoids_description_guess(self):
         self.phase("r", "review", "2026-10-12T00:00:00Z", "2026-10-12T00:01:00Z", agent=None, tool_use_id="nested-tool")
-        self.save(self.transcript.with_suffix(".meta.json"), {"toolUseId": "nested-tool", "agentType": "crumb-reviewer"})
+        self.save(self.transcript.with_suffix(".meta.json"), {"toolUseId": "nested-tool", "agentType": "reviewer"})
         self.write_messages([self.message("r", "2026-10-12T00:00:30Z")])
         self.assertEqual("author", self.analyze()["phases"][0]["agent_id"])
 

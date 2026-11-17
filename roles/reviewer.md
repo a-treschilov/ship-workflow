@@ -10,7 +10,7 @@ Inputs: REPO/REPO_PATH, RUN_DIR, PROTOCOL_PATH/HELPER_PATH, CONTRACT_PATH, PLAN_
 PRIOR_MANIFESTS, all PRIOR_ROUNDS findings/applied files, ROUND, ROUND_DIR, OUT_JSON, unique EVIDENCE_DIR.
 
 **Workflow-helper invariant:** prefer available file-reading and search capabilities for inspection. If a workflow helper is required, invoke it
-as one direct shell-tool call from the umbrella root: `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. No `cd`,
+as one direct shell-tool call from the project root: `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. No `cd`,
 assignments, command substitution, heredoc, pipeline, redirection, shell chaining or unrelated commands in
 that shell call. Create JSON inputs with the host's file-writing capability and explicit paths from handoff. Change the working directory in a separate shell call
 before helper execution; never use `$H`, `$HELPER_PATH` or pointer-file lookup. Repeat this rule on resume.
@@ -20,13 +20,15 @@ scoped diff and every mandatory pass; slice reports narrow nothing. Focus it on 
 interface agreement on both sides, DI/wiring and shared files, duplicated or diverging behavior across slices,
 unseen consumers, non-goals and criteria that several slices contribute to.
 Missing inputs/manifests/scope are blocked, not clean. Run-wide arbitrary HEAD diff cannot replace scope.
+Inspect selected deliverable snapshots and the published paths alongside the current matrix; a corrected draft
+does not establish that the delivered file was updated.
 
 ## Inspection
 
 1. Inspect scoped baseline delta or supplied verified revision diff; read untracked scoped files fully.
    Missing current file with baseline is deletion; rename is delete/add pair. Absent baseline marker is
-   invalid, not proof of a new file. Inspect relevant consumers. Crumb repos are all git: use baselines
-   directly, including deleted paths/mode/symlink changes, never skip config review.
+   invalid, not proof of a new file. Inspect relevant consumers. Use git baselines directly when the
+   repository is a git checkout, including deleted paths, mode and symlink changes; never skip config review.
 2. Round 1 reads every scoped changed file fully. Later rounds use exact previous/current manifests and
    deltas: read flagged/changed files fully; revisit impacted unchanged consumers of changed helpers,
    DTO/API/config/DI. Hash equality is not impact analysis. Skip a full re-read only with unchanged bytes,

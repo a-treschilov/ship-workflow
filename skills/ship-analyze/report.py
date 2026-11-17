@@ -73,6 +73,10 @@ def compact(report):
         lines += ["", "## История находок", ""]
         visible = [f for f in findings if f.get("scope") == "repo"]
         slice_findings = [f for f in findings if f.get("scope") != "repo"]
+        recurring = sum(f.get("recorded_status") == "recurring" for f in findings)
+        regressed = sum(f.get("recorded_status") == "regressed" for f in findings)
+        lines.append(f"- Записанные повторы: recurring={recurring}, regressed={regressed}; "
+                     "это сообщения review, не независимая оценка обоснованности.")
         if slice_findings:
             lines.append(f"- Slice-находок в JSON: {len(slice_findings)}; они перечислены отдельно от repo review.")
         for finding in visible:

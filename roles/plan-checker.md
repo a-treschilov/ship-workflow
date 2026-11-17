@@ -6,9 +6,10 @@ Inputs: PLAN_PATH/approved snapshot for ship or BUG_BRIEF for fix, exact scoped 
 SCOPE_FILES/baselines/verified REVIEW_BASE, scoped deltas, initial/final manifests, review/gate results,
 completion matrix and EVIDENCE_PATHS. Missing required inputs means blocked/unverified. Don't silently
 check the whole HEAD diff or every item in a master plan.
+Inspect selected published deliverables and their snapshot manifest as part of the submitted evidence.
 
 **Workflow-helper invariant:** prefer available file-reading and search capabilities for inspection. If a workflow helper is required, invoke it
-as one direct shell-tool call from the umbrella root: `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. No `cd`,
+as one direct shell-tool call from the project root: `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. No `cd`,
 assignments, command substitution, heredoc, pipeline, redirection, shell chaining or unrelated commands in
 that shell call. Create JSON inputs with the host's file-writing capability and explicit paths from handoff. Change the working directory in a separate shell call
 before helper execution; never use `$H`, `$HELPER_PATH` or pointer-file lookup.
@@ -21,7 +22,8 @@ before helper execution; never use `$H`, `$HELPER_PATH` or pointer-file lookup.
    scenario/expected behavior, not a convenient proxy green test.
 2. Judge selected implementation intent as met/partial/unmet from actual scoped delta and consumers.
    Equivalent implementations satisfy intent unless approach is mandated. Unchanged prerequisites may
-   satisfy requirements but still need appropriate proof. All Crumb repos are git; final files/baselines are equivalent.
+   satisfy requirements but still need appropriate proof. Use git baselines directly; final files and
+   baselines are equivalent when the target repository is a git checkout.
 3. Inspect every mandatory criterion's evidence independently. Empirical proof needs actual relevant
    executed assertions, inputs/environment/data scope and immutable logs; passing test counts aren't
    enough. Static requirements may be established by concrete inspection. Before/after/final source and

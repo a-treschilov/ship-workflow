@@ -14,7 +14,7 @@ from unittest.mock import patch
 HOOK = Path(__file__).resolve().parents[2] / "hooks/trusted-ship-helpers.py"
 CODEX_HOOK = Path(__file__).resolve().parents[2] / "hooks/codex_pre_tool_use.py"
 HERE = Path(__file__).resolve()
-INSTALLED = (HERE.parents[4] / ".agents/workflows/ship-fix/scripts").is_dir()
+INSTALLED = HERE.parents[4].name == ".agents"
 WORKSPACE = HERE.parents[5] if INSTALLED else HERE.parents[4]
 spec = importlib.util.spec_from_file_location("trusted_helpers", HOOK)
 trusted = importlib.util.module_from_spec(spec)
@@ -276,7 +276,10 @@ class TrustedHelpersTests(unittest.TestCase):
         workspace = WORKSPACE
         config = json.loads((workspace / ".codex/hooks.json").read_text())
         command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        cwd = workspace / "api"
+        cwd = next((workspace / name for name in sorted(trusted.policy.GO_REPOS | trusted.policy.NODE_REPOS)
+                    if (workspace / name).is_dir()), None)
+        if cwd is None:
+            self.skipTest("No trusted repository layout in this installed project")
         payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(cwd),
                    "tool_input": {"command": "git status"}}
         result = subprocess.run(command, shell=True, input=json.dumps(payload), text=True,
@@ -290,7 +293,7 @@ class TrustedHelpersTests(unittest.TestCase):
         workspace = WORKSPACE
         create = subprocess.run([str(workspace / ".claude/hooks/worktree-create.sh")],
                                 input=json.dumps({"hook_event_name": "WorktreeCreate",
-                                                  "cwd": str(workspace / "api"), "name": "agent"}),
+                                                  "cwd": str(workspace), "name": "agent"}),
                                 text=True, capture_output=True, timeout=5)
         self.assertEqual(0, create.returncode, create.stderr)
         self.assertEqual(str(workspace), create.stdout.strip())
@@ -315,7 +318,7 @@ class TrustedHelpersTests(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 result = subprocess.run([sys.executable, "-I", "-B", str(hook_copy)], input=body,
-                                        text=True, capture_output=True, timeout=5)
+                                        text=True, capture_output=True, timeout=5, cwd=self.root)
                 self.assertEqual(0, result.returncode, result.stderr)
                 response = json.loads(result.stdout)
                 self.assertEqual(allowed, response.get("hookSpecificOutput", {}).get("permissionDecision") == "allow")

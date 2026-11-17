@@ -3,12 +3,12 @@
 This is the shared lifecycle, artifact and gate contract. Commands select requirements; agents judge
 semantics; `ship_state.py` checks completeness/freshness and never executes checks or launches agents.
 Read this through absolute `PROTOCOL_PATH`; resolve helper locations from absolute `HELPER_PATH` and
-invoke them using the canonical relative form below. The umbrella
-is not a git repo. All git/build commands explicitly target the assigned repo.
+invoke them using the canonical relative form below. The project root
+is not necessarily a git repo. All git/build commands explicitly target the assigned repo.
 
 ### Canonical helper invocation
 
-Run every Python helper from the umbrella root using `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py`.
+Run every Python helper from the project root using `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py`.
 This is a literal relative script path, not a user-specific checkout path. For example:
 
 ```text
@@ -21,11 +21,11 @@ python3 -I -B .agents/workflows/ship-fix/scripts/ship_artifacts.py --task /absol
 historical source against today's checkout.
 
 **Each workflow helper MUST be invoked in one direct shell invocation, and that shell invocation must contain only the helper invocation.**
-First ensure the shell working directory is the umbrella root, then issue the helper call in a separate
+First ensure the shell working directory is the project root, then issue the helper call in a separate
 shell invocation. Never combine `cd`, variable assignments, command substitutions, loops, heredocs,
 pipelines, redirections, `&&`/`;`, or unrelated inspection/commands with a helper invocation. Do not
 launch helpers via `$H`, `$HELPER_PATH`, `$(dirname ...)`, aliases or shell functions. If cwd needs changing,
-use a standalone `cd /absolute/path/to/calorie` shell invocation, then call the helper separately.
+use a standalone `cd /absolute/path/to/project` shell invocation, then call the helper separately.
 Use the host's file-writing capability for JSON/request artifacts; pass explicit absolute input/output paths already available in run context. Do not retrieve RUN_DIR/TASK_PATH via scratchpad pointer files in a compound
 shell command. Script names/subcommands elsewhere in this protocol are shorthand: expand them to the
 canonical invocation. Preserve argv boundaries and original check commands after `run --`; this rule
@@ -52,8 +52,9 @@ semantics are genuinely shared and abstraction lowers maintenance cost, not mere
 look alike. Do not waive substantive Suggestions for speed.
 
 Implementers/checkpoints stay sequential: the safe worktree hook shares source. No real worktrees or
-parallel implementers are introduced here. Claude frontmatter and Codex TOML `model` fields are generated from
-the shared role assignments in `.agents/agent-models.yaml` by the explicit `agent_models.py sync` command; do this outside an active run,
+parallel implementers are introduced here. Claude frontmatter and Codex role files are generated from
+the shared role assignments in `.agents/agent-models.yaml` by the explicit `agent_models.py sync` command; `inherit`
+uses the host model configuration, while explicit IDs select pinned models. Do this outside an active run,
 then restart configured agent host. `ocx_models.py` refreshes the canonical OCX catalog and Claude discovery aliases
 without changing role assignments. Codex uses the canonical ID; Claude uses its advertised alias (including `[1m]`
 when offered). `/ship` and `/fix` only check for drift and stop rather than syncing a
@@ -142,9 +143,16 @@ A reproduced bug records `before_evidence: {repo: absolute_evidence_path}` on th
 Before and after evidence share the exact `scenario` string. Before failure is historical evidence, not
 proof of final code; never invent it. Each criterion_id refers to an actual acceptance criterion.
 
-Validate before use:
+Validate before use, including every declared slice schedule:
 `python3 -I -B HELPER_PATH validate-contract --contract CONTRACT_PATH`.
 All commands below use actual absolute variables, not literal placeholders.
+
+For policy-enabled repo repairs, `phase-start` validates the current state path/hash, action, author and
+round or attempt before dispatch. Capsule rotation also requires the current run-local capsule at start;
+`phase-end` repeats these bindings and names the observed new author. Invalid bindings are rejected before
+the phase event is written.
+Telemetry for slice-level phases supplies `--slice-id` on both boundaries; slice IDs must belong to the
+repo's approved schedule and are checked against one another.
 
 ## 3. First-touch source and preflight
 
@@ -153,7 +161,8 @@ starting HEAD/status/dirty WIP. For non-git or ignored dependencies, maintain a 
 array containing relevant config/source dependencies, without widening writable scope. Pass both arrays
 to transitions. Git capture includes all tracked/nonignored source plus explicit paths. External symlink
 contents need separate authorized dependency verification; symlink target text does not bind contents.
-Capture uses two matching scans. Same untracked generated-output exclusions must be used throughout;
+Capture uses two matching scans. Artifact checks use initialized source dependencies and exclusions for both
+captures. Same untracked generated-output exclusions must be used throughout;
 tracked/scoped source cannot be excluded. No blanket cache/source-directory exclusions.
 
 Before first edit/delete/rename (both paths):
@@ -200,7 +209,7 @@ Record the exit status of the check command itself, never of a pipeline tail: `c
 pipeline stage is the real tool). A log with failures next to `exit_code: 0` is invalid evidence.
 
 Shared scratch resources: a DB-backed check (integration, concurrency, migrations) must not run while another
-process uses the same scratch DB (for `api` tests: the dev MySQL container); concurrent runs produce deadlocks
+process uses the same scratch DB (for example, a service's test database container); concurrent runs produce deadlocks
 and shifted row counts that look like
 product failures. Immediately before
 each such check, probe read-only for other users (e.g. `ps` for a running `go test` and `show
@@ -252,7 +261,7 @@ Interrupted edits stay unverified.
 
 Before any repo-level review-fix or plan-gap repair preparation, the orchestrator runs
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`
-as one standalone read-only command from the umbrella root. This check is first: it precedes repair-phase
+as one standalone read-only command from the project root. This check is first: it precedes repair-phase
 telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, and author dispatch. It verifies the
 immutable history and reports the exact latest state path/hash, current limit, used/remaining passes,
 open finding IDs, and whether current scoped source still matches that state. Never prepare a repair when
@@ -323,7 +332,7 @@ not invent an applied result. Counters/rounds stay monotonic.
 
 ### Slice schedule (optional, large repo scope)
 
-For a repo scope too large for one bounded implementer dispatch, `crumb-slicer` (read-only) proposes slices and
+For a repo scope too large for one bounded implementer dispatch, `slicer` (read-only) proposes slices and
 a human approves them before any source edit. The orchestrator saves the proposal, shows the table (id,
 depends_on, parallel, write_scope, criteria, interfaces, unknowns), asks via host's user-input capability
 (approve / change / do not slice), and on approval writes immutable `RUN_DIR/slices-approved.json`:
@@ -473,6 +482,48 @@ accept the amendment or mark a criterion verified by itself. Existing seals and 
 remain intact. Later transitions inherit the exact same amendment and scope; replacing it or changing accepted
 slice versions is not supported by this mechanism.
 
+### Submission validation
+
+Before dispatching a reviewer, run `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py validate-submission --contract CONTRACT --repo REPO
+--matrix MATRIX --manifest MANIFEST` as a standalone helper command. For slices also supply `--slice ID
+--schedule SCHEDULE`. This read-only validation checks every supplied evidence path, including paths in
+unverified rows, against the effective criterion and source manifest. An empty unverified row remains
+unverified; validation does not certify implementation, review or acceptance. The same checks apply at
+matrix validation during lifecycle transitions.
+An approved requirement amendment may include paired `old_data_scope` and `new_data_scope` fields; evidence
+is validated against the effective amended scope and retains the amendment hash binding.
+`scope-check` compares the current tree to the initialized manifest, so unchanged pre-existing WIP is
+preserved; new or modified changes outside the assigned scope remain violations.
+
+Contracts may declare `read_excludes` as a repo-to-relative-path-list map. Captures must pass every path
+as `--read-exclude`; helpers use the contract automatically. These paths are omitted before any file content
+is read, including tracked files. A touched or dependency scope intersecting an exclusion is refused. This
+controls helper capture, not arbitrary shell commands or external programs: do not dispatch a command that
+would read a forbidden path. Existing `excludes` retains its untracked-file meaning.
+
+When a task produces deliverable files, declare `deliverables` in the contract as a repo-to-list map; each
+entry has a unique `id`, absolute `path`, and nonempty `criterion_ids`. Once the files exist, snapshot them:
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py snapshot-deliverables --contract CONTRACT --repo REPO --out-dir RUN_DIR/UNIQUE_DIR`.
+The resulting immutable manifest identifies the published bytes and run-local copies. Pass its path as
+`--deliverable-manifest` to `validate-submission` and as `deliverable_manifest_path` to repo pre-review.
+Pre-review and completion compare the live files with the selected snapshots. After an authorized change,
+create a new snapshot directory and follow the normal repair/review lifecycle. A snapshot is only a byte
+binding; it does not prove a command was safe or that a criterion was satisfied.
+For slice review, add `--slice ID --schedule SCHEDULE` when snapshotting and validating; the slice manifest
+contains only deliverables associated with that slice's criteria. Bind it in the slice pre-review request.
+
+Contract checks may declare `input_paths` as absolute file paths. The check runners snapshot these files
+before executing, require unchanged bytes immediately afterward and seal the snapshots and registry in
+the evidence. Declare all relevant inputs; a snapshot created later cannot prove historical input bytes.
+Before sealing a contract, compare each declared command's working directory and input paths with the
+selected run and deliverable paths. After a later-produced input becomes available, verify its exact path
+and, when safe and authorized, run the declared check before review; never execute a destructive check as
+a preflight substitute. A missing future input remains pending until its producing operation completes.
+
+For matrix repairs, `python3 -I -B .agents/workflows/ship-fix/scripts/ship_artifacts.py --task TASK_PATH matrix ROWS.json --base OLD_MATRIX` copies the
+previous rows and applies explicit replacements. Each replacement names its old `replaces_evidence_paths`;
+unmentioned rows remain unchanged. This is a mechanical update, not a correctness judgment.
+
 ### Review packet and results
 
 `packet --contract ... --repo ... --scope ... --baseline ... --out UNIQUE_PACKET_DIR` batches stable
@@ -503,20 +554,23 @@ gate and use a `gates-passed` to `gates-passed` transition with the complete rep
 proofs undergo ordinary gate validation and the old state and evidence remain sealed in history. This
 corrects evidence selection, not a failed check or code repair; never use it to waive a gate.
 
-Declare resolved gates in contract before implementation. Default requirements for Crumb repos:
-- `app`: npm run lint, npm run format:check, npx tsc --noEmit; add npm run build when routes,
-  Server/Client boundaries, `next.config` or deps change or the plan requires.
-- `landing` / `mobile`: npm run lint and npx tsc --noEmit; `landing` adds npm run build under the same
-  conditions as `app`.
-- `api`: go vet ./... and go test ./... (integration tests need the dev MySQL container idle).
-- `shared`: npm run build. The orchestrator then runs `npm --prefix shared run build` and
-  `npm --prefix shared run sync` before any consumer repo is processed, so consumers build against fresh
-  `node_modules/@crumb-ai/shared/`. Never run `npm version`, never create or push a git tag; any
-  `shared/package.json` version edit or consumer pin stays an uncommitted prepared change for the user to
-  release manually. This run's only shared operations are build + sync.
-Additional plan checks and performance criteria remain mandatory. `api` migrations: never edit an already
-applied `*.up.sql` (the dev hot-reload container checksum-guards applied migrations and crash-loops).
-Missing required runner blocks; don't invent one.
+Declare resolved gates in the contract before implementation. Use the target repository's own documented
+commands; this protocol does not prescribe a stack. Record each gate with a stable ID, `kind`,
+`verification` and `command` or `argv`, and include documentation and changelog checks where the project
+tracks them.
+
+Example gate sets (replace with the project's actual commands):
+- Node.js application: `npm run lint`, `npm run format:check`, `npx tsc --noEmit`; add `npm run build`
+  when routes, server/client boundaries, build configuration or dependencies change.
+- Go service: `go vet ./...` and `go test ./...`; declare any integration database and whether it must be
+  idle before the run.
+- Shared package: build the package before consumers build; run any declared sync step as a separate
+  operation before consumer gates.
+- Database migrations: never edit an applied migration when the project's migration runner
+  checksum-guards it; inspect and follow the repository's migration convention.
+
+Version bumps, tags, releases and production actions remain uncommitted preparations for the user unless
+separately authorized. Missing required runner blocks; don't invent one.
 Static inspection is not a replacement for missing empirical verification. Pin the actual runtime.
 
 ### Acceptance and completion
@@ -589,7 +643,7 @@ Before/after each phase use `phase --contract ... --file INPUT --out RUN_DIR/tel
 phase-start/phase-end, at UTC. End adds status passed/failed/blocked/interrupted and, when known,
 `end_reason` (done|context|api-error|user-stop|timeout|unknown) and an absolute `checkpoint_path` of the last
 implementer checkpoint. The same helper accepts the boundary as flags (`--repo`, `--phase-id`, `--phase`,
-`--event`, `--status`, `--end-reason`, `--agent-id`, `--round`, `--session-id`, `--at`); `at` defaults to now
+`--event`, `--status`, `--end-reason`, `--agent-id`, `--round`, `--attempt`, `--capsule-path`, `--session-id`, `--at`); `at` defaults to now
 and `session_id` is read from CODEX_SESSION_ID/CODEX_THREAD_ID. `digest --contract ... --repo ...` (or `--all-repos`) prints a
 compact read-only status, and `ship_run_checks.py gates --contract ... --repo ... --scope ... --out-dir ...
 --phase-id ...` runs required_gates with phase telemetry; batch a repo fan-out with `gates --all-repos` / `gates --repos a,b` plus `--phase-id-template {repo}-gates-1` and `--scope-dir DIR`.

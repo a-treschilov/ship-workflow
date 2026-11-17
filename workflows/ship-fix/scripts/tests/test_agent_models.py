@@ -63,14 +63,21 @@ class AgentModelConfigTests(unittest.TestCase):
         config.write_text(self.config_text(ids) + alias_section)
         self.assertEqual((self.models, ids, self.aliases), agent_models.parse_config(config))
 
+    def test_legacy_role_prefix_is_preserved_as_model_assignments(self):
+        text = self.config_text(sorted(set(self.models.values())))
+        for role in agent_models.ROLES:
+            text = text.replace(f"  {role}:", f"  old-{role}:")
+        models, _, _ = agent_models.parse_config_text(text)
+        self.assertEqual(self.models, models)
+
     def test_reject_duplicate_unknown_missing_and_empty_entries(self):
         config = self.root / "models.yaml"
         for body, expected in (
-            ("  crumb-implementer: a\n  crumb-implementer: b\n", "duplicate"),
+            ("  implementer: a\n  implementer: b\n", "duplicate"),
             ("  other: model\n", "unknown"),
-            ("  crumb-implementer: ''\n", "empty"),
-            ('  crumb-implementer: "bad id"\n', "invalid model ID"),
-            ("  crumb-implementer: model\n", "missing"),
+            ("  implementer: ''\n", "empty"),
+            ('  implementer: "bad id"\n', "invalid model ID"),
+            ("  implementer: model\n", "missing"),
         ):
             config.write_text("models:\n" + body + "available_models:\n")
             with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
@@ -91,6 +98,7 @@ class AgentModelConfigTests(unittest.TestCase):
         self.assertEqual(sorted(agent_models.ROLES), drift)
         self.assertEqual(sorted(agent_models.ROLES), agent_models.sync(self.models, self.aliases, self.root))
         self.assertEqual([], agent_models.check(self.models, self.aliases, self.root))
+
         self.assertEqual([], agent_models.sync(self.models, self.aliases, self.root))
 
         for role in agent_models.ROLES:
@@ -103,19 +111,56 @@ class AgentModelConfigTests(unittest.TestCase):
             self.assertNotIn("CCR-SUBAGENT-MODEL", codex["developer_instructions"])
             self.assertIn(f"Shared behavior for {role}.", codex["developer_instructions"])
 
-        role = "crumb-implementer"
+        role = "implementer"
         (self.root / ".codex/agents" / f"{role}.toml").write_text("stale")
         self.assertEqual([role], agent_models.check(self.models, self.aliases, self.root))
         self.assertEqual([role], agent_models.sync(self.models, self.aliases, self.root))
         self.assertEqual([], agent_models.check(self.models, self.aliases, self.root))
 
+    def test_inherited_models_do_not_require_a_gateway_or_aliases(self):
+        models = {role: "inherit" for role in agent_models.ROLES}
+        agent_models.sync(models, {}, self.root)
+        self.assertEqual([], agent_models.check(models, {}, self.root))
+        for role in agent_models.ROLES:
+            claude = (self.root / ".claude/agents" / f"{role}.md").read_text()
+            codex = tomllib.loads((self.root / ".codex/agents" / f"{role}.toml").read_text())
+            self.assertIn("model: inherit\n", claude)
+            self.assertNotIn("model", codex)
+
+    def test_codex_only_does_not_require_claude_aliases(self):
+        agent_models.sync(self.models, {}, self.root, host="codex")
+        self.assertEqual([], agent_models.check(self.models, {}, self.root, host="codex"))
+        self.assertEqual([], list((self.root / ".claude/agents").iterdir()))
+
+    def test_sync_rejects_symlinked_agent_without_external_write(self):
+        external = self.root / "external.txt"
+        external.write_text("user data")
+        target = self.root / ".codex/agents/implementer.toml"
+        target.symlink_to(external)
+        with self.assertRaisesRegex(ValueError, "symlinked agent path"):
+            agent_models.sync(self.models, self.aliases, self.root)
+        self.assertEqual("user data", external.read_text())
+        self.assertEqual([], list((self.root / ".claude/agents").iterdir()))
+
+    def test_host_specific_model_assignments(self):
+        models = {role: "inherit" for role in agent_models.ROLES}
+        config = self.config_text(sorted(set(self.models.values()))) + (
+            'claude_models:\n  implementer: "sonnet"\n'
+            'codex_models:\n  implementer: "gpt-example"\n')
+        overrides = agent_models.host_overrides(config)
+        agent_models.sync(models, {}, self.root, overrides=overrides)
+        self.assertIn("model: sonnet\n", (self.root / ".claude/agents/implementer.md").read_text())
+        codex = tomllib.loads((self.root / ".codex/agents/implementer.toml").read_text())
+        self.assertEqual("gpt-example", codex["model"])
+        self.assertEqual([], agent_models.check(models, {}, self.root, overrides=overrides))
+
     def test_changed_role_assignment_updates_both_hosts(self):
         agent_models.sync(self.models, self.aliases, self.root)
-        self.models["crumb-implementer"] = "gpt-6.1-sol"
-        self.assertEqual(["crumb-implementer"], agent_models.check(self.models, self.aliases, self.root))
-        self.assertEqual(["crumb-implementer"], agent_models.sync(self.models, self.aliases, self.root))
-        claude = (self.root / ".claude/agents/crumb-implementer.md").read_text()
-        codex = tomllib.loads((self.root / ".codex/agents/crumb-implementer.toml").read_text())
+        self.models["implementer"] = "gpt-6.1-sol"
+        self.assertEqual(["implementer"], agent_models.check(self.models, self.aliases, self.root))
+        self.assertEqual(["implementer"], agent_models.sync(self.models, self.aliases, self.root))
+        claude = (self.root / ".claude/agents/implementer.md").read_text()
+        codex = tomllib.loads((self.root / ".codex/agents/implementer.toml").read_text())
         self.assertIn("model: ocx-claude-native--gpt-6.1-sol[1m]\n", claude)
         self.assertEqual("gpt-6.1-sol", codex["model"])
 

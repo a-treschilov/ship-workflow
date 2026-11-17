@@ -81,7 +81,7 @@ def git(root, *args):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
 
-def capture_once(root, scope, excludes):
+def capture_once(root, scope, excludes, read_excludes=()):
     root = Path(root).resolve()
     require(root.is_dir(), f"Missing repo directory: {root}")
     # Do not mistake a directory inside a different checkout for an independent repo.
@@ -97,20 +97,24 @@ def capture_once(root, scope, excludes):
     else:
         require(bool(scope), "Non-git capture requires explicit source/dependency scope")
     explicit = {relative_path(p) for p in scope}
+    forbidden = [relative_path(p) for p in read_excludes]
+    def forbidden_path(path):
+        return any(path == item or path.startswith(item + "/") or item.startswith(path + "/") for item in forbidden)
+    require(not any(forbidden_path(p) for p in explicit), "Source scope intersects read_excludes")
     exclusions = [relative_path(p) for p in (*DEFAULT_EXCLUDES, *excludes)]
 
     def excluded(path):
         return any(path == item or path.startswith(item + "/") for item in exclusions)
 
-    paths = tracked | explicit | {p for p in others if not excluded(p)}
+    paths = {p for p in tracked | explicit | {p for p in others if not excluded(p)} if not forbidden_path(p)}
     files = {p: file_state(safe_path(root, p)) for p in sorted(paths)}
     payload = {"repo_path": str(root), "head": head, "files": files}
     return {**payload, "fingerprint": digest(payload)}
 
 
-def capture(root, scope, excludes=()):
-    first = capture_once(root, scope, excludes)
-    second = capture_once(root, scope, excludes)
+def capture(root, scope, excludes=(), read_excludes=()):
+    first = capture_once(root, scope, excludes, read_excludes)
+    second = capture_once(root, scope, excludes, read_excludes)
     require(first == second, "Source changed during capture; stabilize and retry")
     return first
 
@@ -299,6 +303,7 @@ def main():
         sub.add_argument("--out", required=True)
         if name == "capture":
             sub.add_argument("--exclude", action="append", default=[])
+            sub.add_argument("--read-exclude", action="append", default=[])
         else:
             sub.add_argument("--baseline", required=True)
     sub = commands.add_parser("baseline")
@@ -340,6 +345,17 @@ def main():
     sub = commands.add_parser("validate-evidence")
     sub.add_argument("--file", required=True)
     sub.add_argument("--manifest", required=True)
+    sub = commands.add_parser("validate-submission")
+    for flag in ("contract", "repo", "matrix", "manifest"):
+        sub.add_argument("--" + flag, required=True)
+    sub.add_argument("--slice")
+    sub.add_argument("--schedule")
+    sub.add_argument("--deliverable-manifest")
+    sub = commands.add_parser("snapshot-deliverables")
+    for flag in ("contract", "repo", "out-dir"):
+        sub.add_argument("--" + flag, required=True)
+    sub.add_argument("--slice")
+    sub.add_argument("--schedule")
     for name in ("validate-contract", "validate-history", "review-budget", "transition", "complete", "packet"):
         sub = commands.add_parser(name)
         sub.add_argument("--contract", required=True)
@@ -363,6 +379,7 @@ def main():
     sub.add_argument("--end-reason")
     sub.add_argument("--agent-id")
     sub.add_argument("--round", type=int)
+    sub.add_argument("--attempt", type=int)
     sub.add_argument("--session-id")
     sub.add_argument("--at")
     sub.add_argument("--action")
@@ -370,6 +387,7 @@ def main():
     sub.add_argument("--previous-state-sha256")
     sub.add_argument("--checkpoint-path")
     sub.add_argument("--capsule-path")
+    sub.add_argument("--slice-id")
     sub.add_argument("--out", required=True)
     sub = commands.add_parser("record-evidence")
     sub.add_argument("--contract", required=True)
@@ -423,15 +441,55 @@ def main():
         workflow = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(workflow)
         print(json.dumps(workflow.slice_schedule(args.contract, args.repo, args.file), indent=1))
-    elif args.command in {"validate-contract", "validate-history", "review-budget", "transition",
+    elif args.command in {"validate-contract", "validate-history", "review-budget", "transition", "validate-submission", "snapshot-deliverables",
                           "complete", "packet", "phase", "record-evidence", "digest"}:
         import importlib.util
         module_spec = importlib.util.spec_from_file_location(
             "ship_workflow", Path(__file__).with_name("ship_workflow.py"))
         workflow = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(workflow)
-        if args.command == "validate-contract":
-            workflow.contract(args.contract)
+        if args.command == "snapshot-deliverables":
+            selected = None
+            if args.slice:
+                require(args.schedule, "--slice needs --schedule")
+                workflow.slice_schedule(args.contract, args.repo, args.schedule)
+                item = next((entry for entry in load(args.schedule)["slices"] if entry["id"] == args.slice), None)
+                require(item is not None, "Unknown slice")
+                selected = {c["criterion_id"] for c in item["contributions"]}
+            else:
+                require(not args.schedule, "--schedule needs --slice")
+            print(workflow.snapshot_deliverables(args.contract, args.repo, args.out_dir, selected))
+        elif args.command == "validate-submission":
+            value = workflow.contract(args.contract)
+            final = workflow.manifest(value, args.repo, args.manifest)
+            events = workflow.history(Path(args.contract).resolve().parent / args.repo)
+            if events:
+                current = events[-1][2]
+                scope = sorted(set(current.get("scope", [])) | set(current.get("source_scope", [])))
+                workflow.fresh(value, args.repo, args.manifest, scope, current.get("excludes", []))
+            errors = workflow.submission_evidence_errors(value, args.repo, args.matrix, final,
+                                                          "rows" if args.slice else "criteria")
+            require(not errors, "Invalid submission:\n" + "\n".join(errors))
+            if args.slice:
+                require(args.schedule, "--slice needs --schedule")
+                workflow.slice_schedule(args.contract, args.repo, args.schedule)
+                schedule = load(args.schedule)
+                item = next((entry for entry in schedule["slices"] if entry["id"] == args.slice), None)
+                require(item is not None, "Unknown slice")
+                workflow.slice_matrix(value, args.repo, item, args.matrix, final)
+            else:
+                require(not args.schedule, "--schedule needs --slice")
+                workflow.matrix(value, args.repo, args.matrix, final)
+            selected = {c["criterion_id"] for c in item["contributions"]} if args.slice else None
+            workflow.validate_deliverables(value, args.repo, args.deliverable_manifest, selected)
+            print(json.dumps({"status": "valid", "repo": args.repo, "slice": args.slice}))
+        elif args.command == "validate-contract":
+            value = workflow.contract(args.contract)
+            schedules = value.get("slice_schedules", {})
+            require(isinstance(schedules, dict) and set(schedules) <= set(value["repos"]), "Invalid slice schedules")
+            for repo, declaration in schedules.items():
+                require(isinstance(declaration, dict), "Invalid slice schedule declaration")
+                workflow.slice_schedule(args.contract, repo, declaration.get("path"))
         elif args.command == "validate-history":
             print(json.dumps(workflow.validate_history(args.contract, args.repo), indent=2))
         elif args.command == "review-budget":
@@ -480,11 +538,11 @@ def main():
                 workflow.phase_from_flags(
                     args.contract, args.out, phase_id=args.phase_id, phase=args.phase,
                     event=args.event, repo=args.repo, status=args.status,
-                    end_reason=args.end_reason, agent_id=args.agent_id, round=args.round,
+                    end_reason=args.end_reason, agent_id=args.agent_id, round=args.round, attempt=args.attempt,
                     session_id=args.session_id, at=args.at, action=args.action,
                     previous_state_path=args.previous_state_path,
                     previous_state_sha256=args.previous_state_sha256,
-                    checkpoint_path=args.checkpoint_path, capsule_path=args.capsule_path)
+                    checkpoint_path=args.checkpoint_path, capsule_path=args.capsule_path, slice_id=args.slice_id)
         elif args.command == "digest":
             result = (workflow.digest_all_repos(args.contract, args.verbose) if args.all_repos
                       else workflow.digest(args.contract, args.repo, args.verbose))
@@ -498,7 +556,7 @@ def main():
         else:
             raise AssertionError(args.command)
     elif args.command == "capture":
-        write_once(args.out, capture(args.repo, scope_paths(args.scope), args.exclude))
+        write_once(args.out, capture(args.repo, scope_paths(args.scope), args.exclude, args.read_exclude))
     elif args.command == "project-ignored-dependencies":
         write_once(args.out, project_ignored_dependencies(args.manifest, args.dependencies))
     elif args.command == "baseline":

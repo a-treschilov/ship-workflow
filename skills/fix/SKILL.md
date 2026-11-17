@@ -7,20 +7,20 @@ Read `.agents/workflows/ship-fix/HOST-ADAPTERS.md` to map workflow operations to
 
 
 Fix the bug or improvement described in the user's prompt. If it is missing, ask for it and stop. `--repos a,b` selects repos explicitly.
-**Orchestrator MUST:** issue every workflow helper as one direct shell invocation from the umbrella root:
+**Orchestrator MUST:** issue every workflow helper as one direct shell invocation from the project root:
 `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. No `cd`, assignments, command substitution, heredoc,
 pipeline, redirection, shell chaining or unrelated command in the same shell invocation. Use the host's file-writing capability for JSON inputs;
 pass explicit paths from run context. If cwd must change, do so with a separate standalone shell invocation first.
 Repeat this exact constraint in every agent dispatch and resume prompt. Do not relax the trusted-tools hook.
 `--resume-run RUN_DIR` continues the same contract/history/counters after verifying brief and repo paths;
 do not initialize a replacement run to hide blocked work or reset budgets.
-Work from the umbrella root. Before any agent dispatch, run
+Work from the project root. Before any agent dispatch, run
 `python3 -I -B .agents/workflows/ship-fix/scripts/agent_models.py check` as a standalone shell invocation.
 If it reports drift, stop; regenerate the native agent files and restart the configured host before continuing.
 Read `.agents/workflows/ship-fix/PROTOCOL.md` fully first. Resolve it as absolute PROTOCOL_PATH and
 `.agents/workflows/ship-fix/scripts/ship_state.py` as absolute HELPER_PATH for agents.
 Follow the protocol's canonical helper invocation: `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py` from the
-umbrella root, without variable script paths or unrelated shell operations; include this rule in every
+project root, without variable script paths or unrelated shell operations; include this rule in every
 agent dispatch/resume. Shared protocol
 owns lifecycle/evidence/gates/budgets/telemetry; this adapter owns brief extraction, locate and fix acceptance.
 No worktrees, new agent types or parallel implementers.
@@ -28,11 +28,11 @@ No worktrees, new agent types or parallel implementers.
 ## 1. Locate, scope and acceptance
 
 Unless --repos supplied, locate relevant files/functions using local search. When a fresh locate agent
-is actually needed, use Explore/general-purpose, pass the umbrella constraints and ask for concrete code
+is actually needed, use Explore/general-purpose, pass the project constraints and ask for concrete code
 sites, not repo guesses. Confirm located repos before editing; ask on uncertain matches, stop if no match.
-No external code search requirement. Order `shared` → `api` → {`landing`, `app`, `mobile`} when multiple
-repos match; if `shared` changes, run `npm --prefix shared run build` + `npm --prefix shared run sync`
-before processing consumers (never `npm version`/tag/push — version edits stay uncommitted).
+No external code search requirement. Order repositories so shared packages are built and synced before their
+consumers; if a shared package changes, run its declared build and sync as separate commands before processing
+consumers (never version/tag/push — version edits stay uncommitted).
 
 Write exclusive RUN_DIR under plans/.fix-runs, run.json (description/session/start/repos) and v2 contract.
 New contracts explicitly include `telemetry_policy: {"repair_phase_required": true}` and `"author_rotation": "capsule"` (`--no-rotation` writes `"resume"`).
@@ -48,24 +48,25 @@ source when possible and record failure before edits; otherwise document why bas
 Both before/after scenario evidence uses the original_scenario string; no fabricated red test.
 A new feature/improvement need not fail before implementation. Capture true observed results and logs.
 
-Before freezing scope, include impacted documentation and, for user-, consumer- or operator-visible changes, `CHANGELOG.md` (`## Unreleased`; infra excluded). Confirmed drift discovered outside authorized scope is a blocking gap: seek approval to expand scope rather than silently defer it. Validate contract, initialize source/scope/baselines and execute preflight before implementer. Confirm
+Before freezing scope, include impacted documentation and, for user-, consumer- or operator-visible changes, `CHANGELOG.md` (`## Unreleased`; skip repositories that do not track releases). Confirmed drift discovered outside authorized scope is a blocking gap: seek approval to expand scope rather than silently defer it. Validate contract, initialize source/scope/baselines and execute preflight before implementer. Confirm
 actual runtime source/mount, safe test DB, dependencies and permissions. An unavailable mandatory check
 blocks before edits. Explicit user-authorized code-only work stays implemented/unverified, never success.
 Preserve unrelated dirty WIP; first-touch snapshots isolate same-file pre-existing edits.
+Validate the submission with the protocol's `validate-submission` command before dispatching each reviewer.
 
 ## 2. Shared implementation / review / gates
 
-Before spawning, issue `ship_artifacts.py init-task` as one direct shell invocation from the umbrella root;
-pass explicit paths and use the host's file-writing capability for any JSON inputs. Spawn original crumb-implementer with BUG_BRIEF,
+Before spawning, issue `ship_artifacts.py init-task` as one direct shell invocation from the project root;
+pass explicit paths and use the host's file-writing capability for any JSON inputs. Spawn original implementer with BUG_BRIEF,
 CONTRACT_PATH, REPO/REPO_PATH, absolute PROTOCOL_PATH/HELPER_PATH, RUN_DIR, TOUCHED_FILES_OUT,
 BASELINE_DIR, EVIDENCE_DIR and TASK_PATH. The spawn/resume prompt MUST repeat that each workflow helper
-runs alone as `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...` from umbrella root—never combine it with `cd`,
+runs alone as `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...` from project root—never combine it with `cd`,
 assignments, command substitution, heredoc, pipeline, redirection, shell chaining or unrelated commands.
 Require completion matrix.
 
-Dispatch crumb-implementer and fresh crumb-reviewer through the host adapter's agent capability with explicit inputs and acceptance criteria. Record the returned agent ID and correlation metadata. Platform configuration selects each model. Do not request worktree isolation: agents must share the source for repair and review.
+Dispatch implementer and fresh reviewer through the host adapter's agent capability with explicit inputs and acceptance criteria. Record the returned agent ID and correlation metadata. Platform configuration selects each model. Do not request worktree isolation: agents must share the source for repair and review.
 Stop/report exact spawn error, never substitute a model or launch a nested agent runner. Save the original instance
-ID as original_agent_id. Repairs follow the /ship rotation rule: by default a fresh crumb-implementer gets the last CAPSULE_PATH and a TASK_PATH from `init-task`, and the request carries `capsule_handoff`; the new capsule is sealed with `capsule --agent-id` after the return; under `resume` the original instance is resumed via the host's continuation capability. Never a context-less fixer.
+ID as original_agent_id. Repairs follow the /ship rotation rule: by default a fresh implementer gets the last CAPSULE_PATH and a TASK_PATH from `init-task`, and the request carries `capsule_handoff`; the new capsule is sealed with `capsule --agent-id` after the return; under `resume` the original instance is resumed via the host's continuation capability. Never a context-less fixer.
 Wrap all phases/resumes/checkpoints with protocol telemetry; actual IDs only, unknown usage is unknown.
 Record actual original_agent_id on implemented. For each repair choose a new unique phase_id:
 phase-start before the host's continuation capability to the original instance → wait for the specific actual result (delivery
@@ -74,7 +75,10 @@ result/proof checks. Lost result leaves an open phase. Review-fix/gate-fix are s
 uses phase=review-fix, action=plan-gap. Both events carry run/workflow/repo/action/original agent_id,
 round/attempt, previous_state_path/previous_state_sha256 and actual session/message/tool_use_id correlation
 fields when known, per protocol §6. Store CLI inputs outside telemetry/, and put repair_phase_id in the
-current edited-unverified request; never reuse IDs. The --from-review author_handoff exception in the
+current edited-unverified request; never reuse IDs. For capsule rotation both boundaries include `--capsule-path`;
+use `--round` for review-fix/plan-gap and `--attempt` for gate-fix. For slice phases pass `--slice-id` on both
+boundaries. The start names the current author; the end
+names the observed fresh author. The --from-review author_handoff exception in the
 shared protocol remains an author handoff, not an invented resumed implementer.
 
 Follow protocol transitions: implemented → independent pre-review → fresh review → original implementer
@@ -82,7 +86,7 @@ fix → fresh review → independent final gates. Prepare helper review packets 
 contract/brief, current/prior manifests, all prior findings/applied results. Validate coverage, fingerprints,
 proof and closed-finding dispositions. Review Suggestions too. Budgets and review numbering never reset.
 
-Before any review-fix/plan-gap repair preparation, run the standalone read-only precheck from the umbrella
+Before any review-fix/plan-gap repair preparation, run the standalone read-only precheck from the project
 root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`.
 Do this before repair telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, or author dispatch;
 show the reported limit, used passes, and open finding IDs. If source does not match the latest state, stop and
@@ -119,7 +123,7 @@ Issue each cross-repo-independent operation once, not once per repo: one exec ce
 
 Quality gates and a clean review do not prove the original bug is fixed. Mandatory final acceptance is a
 structured contract→assertion/evidence assessment. For a small fix the orchestrator independently inspects
-and records it, not the author. For complex/cross-repo goals use existing crumb-plan-checker with the fix
+and records it, not the author. For complex/cross-repo goals use existing plan-checker with the fix
 contract and original brief; no new verifier agent and no automatic checker call on every tiny fix.
 
 Acceptance must exercise original scenario, not a proxy green test. For reproduced bugs validate the

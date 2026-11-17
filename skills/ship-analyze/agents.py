@@ -1,6 +1,6 @@
 """Per-agent and per-task token accounting for resumable agents. Read-only; never reads raw transcripts into context.
 
-Usage: python3 -I -B agents.py --subagents DIR [--ocx PATH] [--agent-type crumb-implementer] [--json OUT]
+Usage: python3 -I -B agents.py --subagents DIR [--ocx PATH] [--agent-type implementer] [--json OUT]
 
 Each agent transcript is split into tasks at real prompts: the first prompt and every later message the coordinator
 sends into the same agent. A request is counted once (by requestId). Its tokens come only from the exact requestId

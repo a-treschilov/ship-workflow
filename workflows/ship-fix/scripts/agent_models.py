@@ -12,8 +12,8 @@ import sys
 
 
 def resolve_root() -> Path:
-    """Find the project root from CRUMB_SHIP_ROOT or the nearest .agents marker, not install depth."""
-    override = os.environ.get("CRUMB_SHIP_ROOT")
+    """Find the project root from SHIP_ROOT or the nearest .agents marker, not install depth."""
+    override = os.environ.get("SHIP_ROOT")
     if override and Path(override).is_dir():
         return Path(override).resolve()
     start = Path.cwd().resolve()
@@ -30,10 +30,10 @@ CLAUDE_ROLE_CONFIG = ROOT / ".agents/platforms/claude/roles.json"
 CODEX_ROLE_CONFIG = ROOT / ".agents/platforms/codex/roles.json"
 ROLE_SOURCE_DIR = ROOT / ".agents/roles"
 ROLES = (
-    "crumb-implementer",
-    "crumb-reviewer",
-    "crumb-plan-checker",
-    "crumb-slicer",
+    "implementer",
+    "reviewer",
+    "plan-checker",
+    "slicer",
 )
 
 
@@ -74,7 +74,7 @@ def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], l
             if not match:
                 raise ValueError(f"{path}:{number}: unsupported YAML syntax")
             active = match.group(1)
-            if active not in ("models", "available_models", "claude_aliases"):
+            if active not in ("models", "available_models", "claude_aliases", "claude_models", "codex_models"):
                 raise ValueError(f"{path}:{number}: unknown section {active!r}")
             if active in sections:
                 raise ValueError(f"{path}:{number}: duplicate section {active!r}")
@@ -89,11 +89,23 @@ def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], l
         raise ValueError(f"missing section(s): {', '.join(sorted(missing))}")
 
     models: dict[str, str] = {}
+    keys = [re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*(.+?)\s*", line)
+            for _, line in sections["models"]]
+    names = [match.group(1) for match in keys if match]
+    prefixes = {name[:-len(role)] for name in names for role in ROLES
+                if name.endswith("-" + role)}
+    legacy_prefix = None
+    if len(prefixes) == 1:
+        prefix = next(iter(prefixes))
+        if set(names) == {prefix + role for role in ROLES} and len(names) == len(ROLES):
+            legacy_prefix = prefix
     for number, line in sections["models"]:
         match = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*(.+?)\s*", line)
         if not match:
             raise ValueError(f"{path}:{number}: invalid model mapping")
         role, raw_value = match.groups()
+        if legacy_prefix:
+            role = role.removeprefix(legacy_prefix)
         if role not in ROLES:
             raise ValueError(f"{path}:{number}: unknown role {role!r}")
         if role in models:
@@ -122,7 +134,30 @@ def parse_config_text(text: str, path: Path = CONFIG) -> tuple[dict[str, str], l
         if model_id in aliases:
             raise ValueError(f"{path}:{number}: duplicate Claude alias for {model_id!r}")
         aliases[model_id] = _scalar(raw_alias.split(" #", 1)[0], path, number)
+    for section in ("claude_models", "codex_models"):
+        seen = set()
+        for number, line in sections.get(section, []):
+            match = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*(.+?)\s*", line)
+            if not match or match.group(1) not in ROLES or match.group(1) in seen:
+                raise ValueError(f"{path}:{number}: invalid or duplicate {section} role")
+            seen.add(match.group(1))
+            _scalar(match.group(2).split(" #", 1)[0], path, number)
     return models, available, aliases
+
+
+def host_overrides(text: str, path: Path = CONFIG) -> dict[str, dict[str, str]]:
+    parse_config_text(text, path)
+    overrides = {"claude": {}, "codex": {}}
+    active = None
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith(" "):
+            active = {"claude_models:": "claude", "codex_models:": "codex"}.get(line.strip())
+        elif active:
+            match = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*(.+?)\s*", line)
+            overrides[active][match.group(1)] = _scalar(match.group(2).split(" #", 1)[0], path, number)
+    return overrides
 
 
 def parse_config(path: Path = CONFIG) -> tuple[dict[str, str], list[str], dict[str, str]]:
@@ -139,7 +174,7 @@ def _load_role_config(path: Path) -> dict[str, dict[str, object]]:
     return value
 
 
-def _render_role(role: str, models: dict[str, str], aliases: dict[str, str], root: Path) -> dict[Path, str]:
+def _render_role(role: str, models: dict[str, str], aliases: dict[str, str], root: Path, host: str = "both", overrides=None) -> dict[Path, str]:
     claude_config = _load_role_config(root / ".agents/platforms/claude/roles.json")[role]
     codex_config = _load_role_config(root / ".agents/platforms/codex/roles.json")[role]
     if claude_config.get("name") != role or codex_config.get("name") != role:
@@ -155,13 +190,16 @@ def _render_role(role: str, models: dict[str, str], aliases: dict[str, str], roo
         raise ValueError(f"{role}: invalid Claude permission mode")
     if not models.get(role):
         raise ValueError(f"{role}: missing OCX model assignment")
+    overrides = overrides or {}
+    claude_model = overrides.get("claude", {}).get(role, models[role])
+    codex_model = overrides.get("codex", {}).get(role, models[role])
 
     claude_fields = [
         "---",
         f"name: {role}",
         f"description: {description}",
         f"tools: {', '.join(tools)}",
-        f"model: {aliases[models[role]]}",
+        f"model: {('inherit' if claude_model == 'inherit' else aliases.get(claude_model, claude_model))}",
     ]
     if permission_mode:
         claude_fields.append(f"permissionMode: {permission_mode}")
@@ -173,35 +211,44 @@ def _render_role(role: str, models: dict[str, str], aliases: dict[str, str], roo
     codex_text = (
         f'name = {json.dumps(role)}\n'
         f'description = {json.dumps(codex_description, ensure_ascii=False)}\n'
-        f'model = {json.dumps(models[role], ensure_ascii=False)}\n'
+        + (f'model = {json.dumps(codex_model, ensure_ascii=False)}\n' if codex_model != 'inherit' else '')
+        +
         f'developer_instructions = {json.dumps(body, ensure_ascii=False)}\n'
     )
-    return {
+    targets = {
         root / ".claude/agents" / f"{role}.md": claude_text,
         root / ".codex/agents" / f"{role}.toml": codex_text,
     }
+    return {path: content for path, content in targets.items()
+            if host == "both" or path.parent.parent.name == "." + host}
 
 
-def _all_role_targets(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT) -> dict[Path, str]:
+def _all_role_targets(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT, host: str = "both", overrides=None) -> dict[Path, str]:
     if set(models) != set(ROLES):
         raise ValueError("model assignments must include each configured role exactly once")
-    for model_id in models.values():
-        if not _valid_model_id(model_id) or not _valid_model_id(aliases.get(model_id, "")):
+    overrides = overrides or {}
+    for role, model_id in models.items():
+        needs_alias = host != "codex" and role not in overrides.get("claude", {})
+        if model_id != "inherit" and (not _valid_model_id(model_id) or (needs_alias and not _valid_model_id(aliases.get(model_id, "")))):
             raise ValueError(f"missing or invalid OCX model/Claude alias: {model_id!r}; run ocx_models.py")
     targets: dict[Path, str] = {}
     for role in ROLES:
-        targets.update(_render_role(role, models, aliases, root))
+        targets.update(_render_role(role, models, aliases, root, host, overrides))
     return targets
 
 
-def check(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT) -> list[str]:
-    targets = _all_role_targets(models, aliases, root)
+def check(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT, host: str = "both", overrides=None) -> list[str]:
+    targets = _all_role_targets(models, aliases, root, host, overrides)
     return sorted({path.stem.removesuffix(".md").removesuffix(".toml") for path, expected in targets.items()
-                   if not path.is_file() or path.read_text() != expected})
+                   if path.is_symlink() or path.parent.is_symlink() or path.parent.parent.is_symlink()
+                   or not path.is_file() or path.read_text() != expected})
 
 
-def sync(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT) -> list[str]:
-    targets = _all_role_targets(models, aliases, root)
+def sync(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT, host: str = "both", overrides=None) -> list[str]:
+    targets = _all_role_targets(models, aliases, root, host, overrides)
+    for path in targets:
+        if path.is_symlink() or path.parent.is_symlink() or path.parent.parent.is_symlink():
+            raise ValueError(f"refusing to overwrite symlinked agent path: {path}")
     changed: set[str] = set()
     for path, rendered in targets.items():
         if path.is_file() and path.read_text() == rendered:
@@ -215,20 +262,27 @@ def sync(models: dict[str, str], aliases: dict[str, str], root: Path = ROOT) -> 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("check", "sync"))
+    parser.add_argument("--host", choices=("claude", "codex", "both"))
     args = parser.parse_args()
     try:
+        if not args.host:
+            marker = ROOT / ".agents/.ship-version"
+            args.host = json.loads(marker.read_text()).get("host", "both") if marker.is_file() else "both"
+            if args.host not in {"claude", "codex", "both"}:
+                raise ValueError("invalid installed host in .ship-version")
         models, available, aliases = parse_config()
-        missing = set(models.values()) - set(available)
+        overrides = host_overrides(CONFIG.read_text(), CONFIG)
+        missing = set(models.values()) - set(available) - {"inherit"}
         if missing:
             raise ValueError(f"role models absent from OCX catalog: {', '.join(sorted(missing))}")
         if args.command == "check":
-            drift = check(models, aliases)
+            drift = check(models, aliases, host=args.host, overrides=overrides)
             if drift:
                 print(f"Agent adapter drift: {', '.join(drift)}. Run: python3 {Path(__file__).resolve()} sync, then reload the configured host.", file=sys.stderr)
                 return 1
-            print("Claude and Codex agent files match the shared role sources and OCX model assignments.")
+            print(f"{args.host} agent files match the shared role sources and model assignments.")
             return 0
-        changed = sync(models, aliases)
+        changed = sync(models, aliases, host=args.host, overrides=overrides)
     except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 2

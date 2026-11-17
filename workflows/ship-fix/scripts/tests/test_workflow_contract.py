@@ -10,7 +10,7 @@ import tomllib
 import unittest
 
 HERE = Path(__file__).resolve()
-INSTALLED = (HERE.parents[4] / ".agents/workflows/ship-fix/scripts").is_dir()
+INSTALLED = HERE.parents[4].name == ".agents"
 ROOT = HERE.parents[5] if INSTALLED else HERE.parents[4]
 SHARED = ROOT / (".agents/workflows/ship-fix" if INSTALLED else "workflows/ship-fix")
 SKILLS = ROOT / (".agents/skills" if INSTALLED else "skills")
@@ -20,14 +20,13 @@ analyzer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(analyzer)
 
 
-@unittest.skipUnless(INSTALLED and (ROOT / "api").is_dir(), "calorie-project integration only")
 class InstructionContractTests(unittest.TestCase):
     def setUp(self):
         self.ship = (SKILLS / "ship/SKILL.md").read_text()
         self.fix = (SKILLS / "fix/SKILL.md").read_text()
         self.protocol = (SHARED / "PROTOCOL.md").read_text()
         self.host_adapters = (SHARED / "HOST-ADAPTERS.md").read_text()
-        self.agents = {name: (ROLES / f"crumb-{name}.md").read_text()
+        self.agents = {name: (ROLES / f"{name}.md").read_text()
                        for name in ("implementer", "reviewer", "plan-checker", "slicer")}
 
     def test_adapters_use_portable_paths_and_absolute_handoffs(self):
@@ -36,7 +35,7 @@ class InstructionContractTests(unittest.TestCase):
             self.assertIn("absolute PROTOCOL_PATH", command)
             self.assertIn("absolute HELPER_PATH", command)
             self.assertIn("python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py", command)
-            self.assertIn("umbrella root", command)
+            self.assertIn("project root", command)
             self.assertNotIn(str(ROOT.parent), command)
             self.assertIn("independent review", command)
             self.assertIn("preflight", command)
@@ -52,8 +51,6 @@ class InstructionContractTests(unittest.TestCase):
             (ROOT / ".claude/skills/ship", SKILLS / "ship"),
             (ROOT / ".claude/skills/fix", SKILLS / "fix"),
             (ROOT / ".claude/skills/ship-analyze", SKILLS / "ship-analyze"),
-            (ROOT / ".claude/skills/startup-canvas", SKILLS / "startup-canvas"),
-            (ROOT / ".claude/skills/product-roadmapping", SKILLS / "product-roadmapping"),
             (ROOT / ".claude/scripts", SHARED / "scripts"),
             (ROOT / ".codex/scripts", SHARED / "scripts"),
             (ROOT / ".claude/hooks", SHARED / "hooks"),
@@ -68,47 +65,7 @@ class InstructionContractTests(unittest.TestCase):
         self.assertIn("Claude Code's agent tool", self.host_adapters)
         self.assertIn("Codex's custom subagent dispatch", self.host_adapters)
 
-    @unittest.skipUnless(INSTALLED, "project installation only")
-    def test_repository_review_skills_are_portable_and_claude_links_share_them(self):
-        required = {
-            "api": ("review", "review-fix", "review-apply", "review-learn"),
-            "app": ("review", "review-fix", "review-apply", "review-learn"),
-            "landing": ("review", "review-fix", "review-apply", "review-learn"),
-            "shared": ("review", "review-fix", "review-apply", "review-learn"),
-            "mobile": ("review", "review-fix", "review-apply", "review-learn", "release-notes"),
-            "infra": ("review",),
-        }
-        for repo, names in required.items():
-            repo_root = ROOT / repo
-            for name in names:
-                source = repo_root / ".agents/skills" / name
-                claude = repo_root / ".claude/skills" / name
-                skill = source / "SKILL.md"
-                with self.subTest(repo=repo, skill=name):
-                    self.assertTrue(skill.is_file())
-                    self.assertTrue(skill.read_text().startswith(f"---\nname: {name}\n"))
-                    self.assertTrue(claude.is_symlink())
-                    self.assertEqual(source.resolve(), claude.resolve())
-                    body = skill.read_text()
-                    self.assertNotIn("allowed-tools:", body)
-                    self.assertNotIn("AskUserQuestion", body)
-                    self.assertNotIn("!`git ", body)
-            self.assertFalse((repo_root / ".claude/commands/review.md").exists())
-
-        # Keep existing per-repository findings/applied JSON available at the new host-neutral paths.
-        for repo in required:
-            repo_root = ROOT / repo
-            for name in ("review-findings.json", "review-applied.json"):
-                legacy = repo_root / ".claude" / name
-                portable = repo_root / ".agents" / name
-                if legacy.is_file():
-                    self.assertTrue(portable.is_symlink())
-                    self.assertEqual(legacy.resolve(), portable.resolve())
-
-        reviewer = (ROLES / "crumb-reviewer.md").read_text()
-        self.assertIn("REPO_PATH/.agents/skills/review/SKILL.md", reviewer)
-
-    def test_workflow_helpers_are_standalone_from_umbrella_root(self):
+    def test_workflow_helpers_are_standalone_from_project_root(self):
         documents = {"protocol": self.protocol, "ship": self.ship, "fix": self.fix, **self.agents}
         for name, text in documents.items():
             lower = text.lower()
@@ -186,7 +143,7 @@ class InstructionContractTests(unittest.TestCase):
         model_config = importlib.util.module_from_spec(model_spec)
         model_spec.loader.exec_module(model_config)
         models, _available, aliases = model_config.parse_config()
-        for role in ("crumb-implementer", "crumb-reviewer", "crumb-plan-checker", "crumb-slicer"):
+        for role in ("implementer", "reviewer", "plan-checker", "slicer"):
             self.assertTrue(models.get(role), f"Missing model assignment: {role}")
         self.assertEqual([], model_config.check(models, aliases))
         for role, model in models.items():
@@ -197,9 +154,6 @@ class InstructionContractTests(unittest.TestCase):
         self.assertFalse((ROOT / ".claude/agent-models.yaml").exists())
         self.assertFalse((ROOT / ".claude/agent-models.yaml").is_symlink())
         self.assertIn("available_models:", config)
-        guidance = (ROOT / "AGENTS.md").read_text()
-        for instruction in ("ocx_models.py", "Edit the requested role's model", "agent_models.py sync", "restart Claude Code or"):
-            self.assertIn(instruction, guidance)
         for command in (self.ship,):
             self.assertIn("agent_models.py check", command)
             self.assertIn("stop;", command)
@@ -213,6 +167,17 @@ class InstructionContractTests(unittest.TestCase):
         self.assertIn("leave master", self.ship)
         self.assertIn("Only after valid completion.json", self.ship)
         self.assertIn("never verified/completed/archive", self.protocol)
+
+    @unittest.skipIf(INSTALLED, "package documentation only")
+    def test_ai_entry_points_and_documentation_rule(self):
+        guidance = (ROOT / "AGENTS.md").read_text()
+        self.assertIn("Documentation is part of the change", guidance)
+        self.assertIn("make test", guidance)
+        self.assertTrue((ROOT / "CLAUDE.md").is_symlink())
+        self.assertEqual((ROOT / "AGENTS.md").resolve(), (ROOT / "CLAUDE.md").resolve())
+        for name in ("README.md", "ARCHITECTURE.md", "INSTALLATION.md", "DEVELOPMENT.md", "AI-CONTEXT.md"):
+            with self.subTest(document=name):
+                self.assertTrue((ROOT / "docs" / name).is_file())
 
 
 class AnalyzerCompatibilityTests(unittest.TestCase):

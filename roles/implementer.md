@@ -17,7 +17,7 @@ requirements and non-goals are immutable. No git-state edits, no commit/push, no
 
 ## Artifact steps: use the script, not hand-written JSON
 
-`python3 -I -B .agents/workflows/ship-fix/scripts/ship_artifacts.py --task TASK_PATH <command>` from the umbrella root.
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_artifacts.py --task TASK_PATH <command>` from the project root.
 Resolve that root from absolute HELPER_PATH; if the working directory must change, use a standalone shell call first.
 The helper shell call MUST contain only this direct invocation: never combine it with `cd`, assignments,
 command substitutions, loops, heredocs, pipelines, redirections, `&&`/`;` or unrelated commands. Use the
@@ -45,6 +45,8 @@ helper, including in resumes. The script prints short results and exits 2 on ref
 - Prefer the host's structured file-editing capabilities. A scripted edit must follow `begin-edit` and be followed by `check-file`.
 - If you stop mid-edit, restore the file from its backup before returning. Never leave a half-edited file.
 - Batch coherent fixes, then rerun the shared targeted checks; a later edit makes earlier proof stale.
+- For repairs inspect all open findings, effective amendments, prior matrix and selected published deliverables.
+  Preserve previously corrected rows and verify the actual published file, not only its replacement draft.
 - Read large files with offset and limit. Do not read whole test logs or whole review JSON; the task
   gives you the findings you need.
 - Assert observable behaviour with real domain fixtures. Mock call counts alone do not prove a result.
@@ -73,11 +75,12 @@ a fresh author.
 - Fixtures use the actual domain type or state under test. Success, error and edge cases are covered, and the
   impacted consumers are checked.
 - Shared helpers and constants are used consistently. Extract only genuinely shared semantics.
-- ORM and migration types, nullability and defaults agree. Never edit an already applied
-  `*.up.sql` — the `api` dev hot-reload container checksum-guards applied migrations and crash-loops the API.
-- If `REPO` is `shared`: never run `npm version`, never bump a consumer's `package.json` pin yourself —
-  the orchestrator handles the shared build + sync and defers the version bump.
-- Web (`app`/`landing`) UI: render standard elements through the shared token-driven class helpers from
-  `@crumb-ai/shared`; mobile uses NativeWind `className` + reusable wrappers. No ad-hoc inline styles.
-- Inspect relevant documentation (`AGENTS.md`, README, docs, indexes, API contracts) and correct confirmed drift, including pre-existing drift noticed during the task. Add user-, consumer- or operator-visible changes to the repo's `CHANGELOG.md` under `## Unreleased` in the same task (except unversioned infra); no filler for invisible changes. If a required correction is outside write scope, do not edit outside scope: report it as a blocking gap for scope approval; never claim documentation is fully current.
+- ORM and migration types, nullability and defaults agree. Never edit an already applied migration when
+  the project's migration runner checksum-guards it; inspect the runner's convention first.
+- If the repository owns a released shared package, never run the package manager's version command and
+  never bump a consumer's dependency pin yourself — the orchestrator handles the shared build and sync and
+  defers the version bump.
+- UI work: render standard elements through the project's shared token-driven style layer. Keep bespoke
+  per-component styling to a minimum; no ad-hoc inline styles.
+- Inspect relevant documentation (`AGENTS.md`, README, docs, indexes, API contracts) and correct confirmed drift, including pre-existing drift noticed during the task. Add user-, consumer- or operator-visible changes to the repo's `CHANGELOG.md` under `## Unreleased` in the same task when the repository tracks releases; no filler for invisible changes. If a required correction is outside write scope, do not edit outside scope: report it as a blocking gap for scope approval; never claim documentation is fully current.
 - Targeted proof is not the independent final gate; say so in the report.

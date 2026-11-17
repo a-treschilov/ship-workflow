@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mechanical /ship artifact steps for crumb-implementer: backups, logs, evidence inputs, applied files, capsules.
+"""Mechanical /ship artifact steps for implementer: backups, logs, evidence inputs, applied files, capsules.
 
 Binds, copies and validates; never decides semantics. Claims, matrix rows and review dispositions come from
 the implementer's JSON input. Every output is write-once. Check commands come from the contract (`run --check`),
@@ -56,7 +56,14 @@ def task_file(path):
     require(Path(value["evidence_dir"]).is_absolute(), "evidence_dir must be absolute")
     value["touched_list"] = state.load(value["touched"]) if Path(value["touched"]).is_file() else []
     value["source_scope_list"] = state.load(value["source_scope"]) if value.get("source_scope") else []
+    value["read_excludes"] = state.load(value["contract"]).get("read_excludes", {}).get(value["repo"], [])
     return value
+
+
+def require_readable(task, path):
+    state.relative_path(path)
+    require(not any(path == p or path.startswith(p + "/") or p.startswith(path + "/")
+                    for p in task.get("read_excludes", [])), "Path intersects read_excludes")
 
 
 def next_free(base, suffix):
@@ -77,7 +84,7 @@ def begin_edit(task, paths):
     root = Path(task["repo_path"])
     touched = set(task["touched_list"])
     for path in paths:
-        state.relative_path(path)
+        require_readable(task, path)
         require(workflow.in_scope(path, task["write_scope"]), f"Outside write_scope: {path}")
         state.baseline(root, task["baseline_dir"], path)
         source = state.safe_path(root.resolve(), path)
@@ -94,6 +101,7 @@ def begin_edit(task, paths):
 def check_file(task, paths):
     failed = []
     for path in paths:
+        require_readable(task, path)
         source = state.safe_path(Path(task["repo_path"]).resolve(), path)
         require(source.is_file(), f"Not a regular file: {path}")
         size = source.stat().st_size
@@ -134,22 +142,27 @@ def run(task, name, argv, check):
     if check:
         argv = run_check(state.load(task["contract"]), task["repo"], check)
     require(argv, "Give --check ID or argv after --")
-    scope = sorted(set(task["touched_list"]) | set(task["source_scope_list"]))
+    dependencies, excludes = workflow.capture_policy(task["contract"], task["repo"])
+    scope = sorted(set(task["touched_list"]) | set(task["source_scope_list"]) | set(dependencies))
     root = task["repo_path"]
-    before = state.capture(root, scope)
+    before = state.capture(root, scope, excludes, task.get("read_excludes", []))
     before_path = evidence / "runs" / f"{name}-before.json"
     state.write_once(before_path, before)
+    check_spec = spec_for(state.load(task["contract"]), task["repo"], check) if check else {}
+    inputs = workflow.snapshot_inputs(check_spec.get("input_paths", []), evidence / "inputs" / f"{name}-files",
+                                      root, task.get("read_excludes", []))
     returncode, raw, timed_out = bounded_run(argv, root)
+    workflow.check_inputs_unchanged(inputs)
     log.parent.mkdir(parents=True, exist_ok=True)
     text = checks.sanitize(raw, truncated=timed_out or len(raw) >= checks.LIMIT)
     suffix = " (timeout)" if timed_out else ""
     log.write_text(text + f"\nEXIT={returncode}{suffix}\n", encoding="utf-8")
-    after = state.capture(root, scope)
+    after = state.capture(root, scope, excludes, task.get("read_excludes", []))
     after_path = evidence / "runs" / f"{name}-after.json"
     state.write_once(after_path, after)
-    state.write_once(record, {"name": name, "command": shlex.join(argv), "exit_code": returncode,
+    state.write_once(record, {"name": name, "producer": "implementer", "command": shlex.join(argv), "exit_code": returncode,
                               "before_manifest": str(before_path), "after_manifest": str(after_path),
-                              "log": str(log), "check": check, "timed_out": timed_out})
+                              "log": str(log), "check": check, "timed_out": timed_out, "input_artifacts": inputs})
     print(f"run {name}: exit={returncode} log={log}")
     for line in text.splitlines()[-20:]:
         print("  " + line)
@@ -215,18 +228,21 @@ def evidence_input(contract, repo, run_record, claims, environment, data_scope):
             "environment": env, "data_scope": scope,
             "claims": [{"id": i, "assertion": a} for i, a in claims],
             "before_manifest": run_record["before_manifest"], "after_manifest": run_record["after_manifest"],
-            "artifact_paths": [run_record["log"]]}
+            "artifact_paths": [run_record["log"], *run_record.get("input_artifacts", [])]}
 
 
 def record(task, name, claims, environment, data_scope):
     evidence = Path(task["evidence_dir"])
-    run_record = state.load(evidence / "runs" / f"{run_name(name)}.json")
+    execution_path = evidence / "runs" / f"{run_name(name)}.json"
+    run_record = state.load(execution_path)
     parsed = []
     for item in claims:
         require("=" in item, "Claim must be ID=assertion")
         identifier, assertion = item.split("=", 1)
         parsed.append((identifier, assertion))
     body = evidence_input(state.load(task["contract"]), task["repo"], run_record, parsed, environment, data_scope)
+    body["execution_record"] = str(execution_path)
+    body["artifact_paths"].append(str(execution_path))
     request = evidence / "inputs" / f"{name}-record.json"
     state.write_once(request, body)
     target = evidence / "records" / f"{name}.json"
@@ -323,15 +339,34 @@ def evidence_paths(task, runs):
     return paths
 
 
-def matrix(task, rows_file):
+def matrix(task, rows_file, base_file=None):
     rows = state.load(rows_file)
     require(isinstance(rows, list) and rows, "Matrix input is a non-empty array of rows")
+    key = "rows" if task.get("slice_id") else "criteria"
     out = []
+    if base_file:
+        base = state.load(workflow.absolute_file(base_file))
+        workflow.bound(state.load(task["contract"]), task["repo"], base)
+        require(base.get("slice_id") == task.get("slice_id"), "Matrix base belongs to another slice")
+        require(isinstance(base.get(key), list), "Matrix base lacks rows")
+        out = list(base[key])
+    identity = lambda row: (row.get("criterion_id"), row.get("part")) if task.get("slice_id") else row.get("criterion_id")
+    replacements = set()
     for row in rows:
+        row_id = identity(row)
+        require(row_id not in replacements, "Duplicate matrix replacement")
+        replacements.add(row_id)
         entry = {key: value for key, value in row.items() if key != "runs"}
         entry["evidence_paths"] = evidence_paths(task, row.get("runs", []))
+        if base_file:
+            matches = [i for i, old in enumerate(out) if identity(old) == row_id]
+            require(len(matches) == 1, "Matrix replacement must name one existing row")
+            require(row.get("replaces_evidence_paths") == out[matches[0]].get("evidence_paths"),
+                    "Matrix replacement must name previous evidence")
+            entry.pop("replaces_evidence_paths", None)
+            out[matches[0]] = entry
+            continue
         out.append(entry)
-    key = "rows" if task.get("slice_id") else "criteria"
     body = {"schema_version": workflow.VERSION, "run_id": state.load(task["contract"])["run_id"],
             "repo": task["repo"], key: out}
     if task.get("slice_id"):
@@ -381,6 +416,18 @@ def scope_check(task):
     if changed is None:
         print("scope-check skipped: non-git source root")
         return
+    events = workflow.history(Path(task["contract"]).resolve().parent / task["repo"])
+    if events:
+        initial_path = events[0][2].get("initial_manifest")
+        require(initial_path, "Initialized state lacks initial manifest")
+        initial = state.checked_manifest(initial_path)
+        dependencies, excludes = workflow.capture_policy(task["contract"], task["repo"])
+        scope = sorted(set(initial["files"]) | set(task["touched_list"]) | set(dependencies))
+        current = state.capture(task["repo_path"], scope, excludes, task.get("read_excludes", []))
+        require(initial["repo_path"] == current["repo_path"], "Initial manifest belongs to another repo")
+        changed = {p for p in set(initial["files"]) | set(current["files"])
+                   if initial["files"].get(p, {"kind": "missing"}) !=
+                   current["files"].get(p, {"kind": "missing"})}
     touched = set(task["touched_list"])
     outside = sorted(p for p in changed if not workflow.in_scope(p, task["write_scope"]))
     unowned = sorted(changed - touched)
@@ -422,7 +469,7 @@ def capsule(task, draft_file, agent_id):
     base = state.load(task["scope_file"]) if task.get("scope_file") and not task.get("slice_id") else task["touched_list"]
     scope = sorted(set(base) | set(task["source_scope_list"]))
     _, excludes = workflow.capture_policy(task["contract"], task["repo"])
-    manifest = state.capture(task["repo_path"], scope, excludes)
+    manifest = state.capture(task["repo_path"], scope, excludes, task.get("read_excludes", []))
     directory = Path(task["evidence_dir"]) / "capsules"
     target = next_free(directory, ".json")
     sidecar = directory / (target.stem + ".manifest.json")
@@ -445,7 +492,8 @@ def since_capsule(task, capsule_file):
     manifest = state.load(value["manifest_path"])
     base = state.load(task["scope_file"]) if task.get("scope_file") and not task.get("slice_id") else task["touched_list"]
     _, excludes = workflow.capture_policy(task["contract"], task["repo"])
-    current = state.capture(task["repo_path"], sorted(set(base) | set(task["source_scope_list"])), excludes)
+    current = state.capture(task["repo_path"], sorted(set(base) | set(task["source_scope_list"])), excludes,
+                            task.get("read_excludes", []))
     if current["fingerprint"] == value["source_fingerprint"]:
         print("no change since capsule")
         return
@@ -527,6 +575,7 @@ def parser():
     sub.add_argument("--data-scope")
     sub = commands.add_parser("matrix")
     sub.add_argument("rows")
+    sub.add_argument("--base")
     sub = commands.add_parser("applied")
     sub.add_argument("result")
     sub = commands.add_parser("preflight")
@@ -560,7 +609,7 @@ def main(argv):
     elif args.command == "record":
         record(task, args.name, args.claim, args.environment, args.data_scope)
     elif args.command == "matrix":
-        matrix(task, args.rows)
+        matrix(task, args.rows, args.base)
     elif args.command == "applied":
         applied(task, args.result)
     elif args.command == "preflight":

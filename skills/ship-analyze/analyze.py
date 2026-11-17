@@ -24,15 +24,20 @@ PROJECT_DIR = Path(os.environ.get("SHIP_ANALYZE_TRANSCRIPTS", DEFAULT_PROJECT_DI
 RUNS_DIR = WORKSPACE / "plans/.ship-runs"
 CCR_DB = Path.home() / ".claude-code-router/app-data/request-logs.sqlite"
 
-SHIP_AGENTS = ("crumb-implementer", "crumb-reviewer", "crumb-plan-checker")
-KNOWN_REPOS = (
-    "shared",
-    "api",
-    "landing",
-    "app",
-    "mobile",
-    "infra",
-)
+SHIP_AGENTS = ("implementer", "reviewer", "plan-checker")
+
+
+def known_repos():
+    """Best-effort repo names for legacy reports that did not record REPO."""
+    try:
+        return tuple(sorted(
+            path.name for path in WORKSPACE.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+            and ((path / ".git").exists() or (path / "package.json").is_file()
+                 or (path / "go.mod").is_file())
+        ))
+    except OSError:
+        return ()
 SEVERITIES = ("Critical", "Warning", "Suggestion")
 
 # Gate commands, per ship.md Step 1.3. Order matters: match the longest first so
@@ -175,9 +180,13 @@ def _run_recency_key(run_dir):
 def resolve_run(run_arg):
     """Return (run_dir, run_meta) or (None, None) for pre-history runs."""
     if not RUNS_DIR.is_dir():
+        if run_arg not in (None, "latest"):
+            sys.exit(f"error: no run directory matching {run_arg!r} in {RUNS_DIR}")
         return None, None
     all_runs = [d for d in RUNS_DIR.iterdir() if d.is_dir()]
     if not all_runs:
+        if run_arg not in (None, "latest"):
+            sys.exit(f"error: no run directory matching {run_arg!r} in {RUNS_DIR}")
         return None, None
     if run_arg in (None, "latest"):
         run_dir = max(all_runs, key=_run_recency_key)
@@ -185,6 +194,8 @@ def resolve_run(run_arg):
         matches = [d for d in all_runs if d.name.startswith(run_arg)]
         if not matches:
             sys.exit(f"error: no run directory matching {run_arg!r} in {RUNS_DIR}")
+        if len(matches) > 1:
+            sys.exit(f"error: ambiguous run prefix {run_arg!r} in {RUNS_DIR}")
         run_dir = matches[0]
     return run_dir, load_json(run_dir / "run.json") or {}
 
@@ -234,7 +245,7 @@ def scan_main_transcript(path):
                     # A resumed implementer: fix mode (review or gate).
                     msg = inp.get("message", "") or ""
                     spawns[f"sendmsg:{tuid}"] = {
-                        "agent_type": "crumb-implementer",
+                        "agent_type": "implementer",
                         "description": inp.get("summary", ""),
                         "prompt": msg,
                         "timestamp": ts,
@@ -337,7 +348,7 @@ def classify_phase(spawn):
     """Structural phase attribution — ship.md defines no marker strings."""
     agent = (spawn or {}).get("agent_type")
     prompt = (spawn or {}).get("prompt", "")
-    if agent == "crumb-implementer":
+    if agent == "implementer":
         # A fresh Task spawn is always implement mode; only a SendMessage resume
         # is a fix pass. Older runs inlined the plan instead of passing
         # PLAN_EXCERPT, so the spawn/resume distinction is the reliable signal.
@@ -346,10 +357,10 @@ def classify_phase(spawn):
         if "FINDINGS_JSON" in prompt:
             return "fix-review"
         return "fix-gate"
-    if agent == "crumb-reviewer":
+    if agent == "reviewer":
         m = RE_ROUND_VAR.search(prompt)
         return f"review-r{m.group(1)}" if m else "review"
-    if agent == "crumb-plan-checker":
+    if agent == "plan-checker":
         return "plan-check"
     return agent or "unknown"
 
@@ -675,13 +686,9 @@ def enrich_reports(reports, spawns):
             # Some spawns describe the target in prose instead of REPO: vars.
             # Match the longest repo path/name mentioned, so `..._client` never
             # loses to the analytics prefix it contains.
-            hits = [r for r in KNOWN_REPOS if r in haystack]
+            hits = [r for r in known_repos() if r in haystack]
             if hits:
                 entry["repo"] = max(hits, key=len)
-            elif re.search(r"\bfront[- ]?end\b", haystack, re.I):
-                entry["repo"] = "app"
-            elif re.search(r"\bback[- ]?end\b", haystack, re.I):
-                entry["repo"] = "api"
 
         m = RE_ROUND_VAR.search(prompt)
         if m:
@@ -812,6 +819,7 @@ def emit_report(report, output_format):
 def main():
     ap = argparse.ArgumentParser(description="Analyze a /ship or /fix run for accounting and verification.")
     ap.add_argument("--run", default="latest", help="run-id prefix under plans/.ship-runs, or 'latest'")
+    ap.add_argument("--workspace", help="project root containing plans and installed workflow")
     ap.add_argument("--session", help="session-id prefix; overrides the run's recorded session")
     ap.add_argument("--no-cost", action="store_true", help="skip legacy CCR cost enrichment")
     formats = ap.add_mutually_exclusive_group()
@@ -819,7 +827,12 @@ def main():
     formats.add_argument("--format", choices=("json", "compact"), default="json", help="output presentation")
     ap.add_argument("--workflow", choices=("ship", "fix"), default="ship", help="run namespace")
     args = ap.parse_args()
-    global RUNS_DIR
+    global WORKSPACE, RUNS_DIR, PROJECT_DIR
+    if args.workspace:
+        WORKSPACE = Path(args.workspace).expanduser().resolve()
+        if not WORKSPACE.is_dir():
+            ap.error("workspace must be an existing directory")
+        PROJECT_DIR = Path(os.environ.get("SHIP_ANALYZE_TRANSCRIPTS", Path.home() / ".claude/projects" / str(WORKSPACE).replace("/", "-"))).expanduser()
     RUNS_DIR = WORKSPACE / "plans" / (".fix-runs" if args.workflow == "fix" else ".ship-runs")
 
     run_dir, run_meta = resolve_run(args.run)

@@ -37,10 +37,12 @@ def run(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, text=True, **kwargs)
 
 
-def capture(repo_path, scope, out, excludes=()):
+def capture(repo_path, scope, out, excludes=(), read_excludes=()):
     argv = [sys.executable, "-I", "-B", str(HELPER), "capture", "--repo", repo_path, "--scope", scope, "--out", str(out)]
     for path in excludes:
         argv.extend(["--exclude", path])
+    for path in read_excludes:
+        argv.extend(["--read-exclude", path])
     done = run(argv)
     if done.returncode != 0:
         raise SystemExit("capture failed: " + (done.stdout + done.stderr).strip())
@@ -82,12 +84,18 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
             raise SystemExit(f"{cid}: output already exists in {out_dir}; use a new --out-dir (write-once)")
         before, after = out_dir / f"{cid}-before.json", out_dir / f"{cid}-after.json"
         log = out_dir / f"{cid}.log"
-        capture(repo_path, str(effective_scope), before, exclusions)
+        capture(repo_path, str(effective_scope), before, exclusions, contract.get("read_excludes", {}).get(repo, []))
+        inputs = workflow.snapshot_inputs(check.get("input_paths", []), out_dir / f"{cid}-inputs",
+                                          repo_path, contract.get("read_excludes", {}).get(repo, []))
         done = run(check["argv"], cwd=repo_path)
+        workflow.check_inputs_unchanged(inputs)
         log.write_text(sanitize((done.stdout + "\n--- stderr ---\n" + done.stderr).encode()))
         marker.write_text(f"{done.returncode}\n")
-        capture(repo_path, str(effective_scope), after, exclusions)
+        capture(repo_path, str(effective_scope), after, exclusions, contract.get("read_excludes", {}).get(repo, []))
         status = "passed" if done.returncode == 0 else "failed"
+        execution = out_dir / f"{cid}-execution.json"
+        workflow.state.write_once(execution, {"producer": "orchestrator", "command": shlex.join(check["argv"]),
+                                                "exit_code": done.returncode, "log": str(log)})
         body = {
             "kind": check["kind"], "status": status, "producer": "orchestrator",
             "command": shlex.join(check["argv"]), "exit_code": done.returncode,
@@ -95,7 +103,8 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
             "data_scope": check.get("data_scope") or DEFAULT_SCOPE,
             "claims": [{"id": cid, "assertion": f"{check.get('verification', cid)} Actual exit {done.returncode}."}],
             "before_manifest": str(before), "after_manifest": str(after),
-            "artifact_paths": [str(log), str(marker)], "criterion_id": cid,
+            "artifact_paths": [str(log), str(marker), str(execution), *inputs], "criterion_id": cid,
+            "execution_record": str(execution),
         }
         if status == "failed":
             body["reason"] = f"Declared command exited {done.returncode}; see {log.name}."

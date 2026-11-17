@@ -12,8 +12,10 @@ python3 -I -B .agents/skills/ship-analyze/analyze.py --run latest --format compa
 python3 -I -B .agents/skills/ship-analyze/analyze.py --workflow fix --run latest --format compact
 ```
 
-Run commands from the project root, or use the absolute script path when working elsewhere. Set
-`SHIP_ANALYZE_TRANSCRIPTS` to a directory of compatible session transcripts when they are stored outside
+Run commands from the project root, or use the absolute script path when working elsewhere. Use
+`--workspace /absolute/project/path` when using an analyzer installed in another project or the package source.
+Explicit run prefixes must identify exactly one run; missing and ambiguous prefixes are errors.
+Set `SHIP_ANALYZE_TRANSCRIPTS` to a directory of compatible session transcripts when they are stored outside
 the default Claude Code project directory; transcript accounting is optional when only run artifacts exist.
 --run accepts run-ID prefix/latest; --workflow ship/fix selects namespace; --session overrides transcript
 session for analysis only; --no-cost skips legacy CCR query.
@@ -128,7 +130,7 @@ from fixture tests or an incomplete report. Unknown is a legitimate result.
 
 ## Per-agent and per-task accounting
 
-`agents.py --subagents DIR [--ocx PATH] [--agent-type crumb-implementer] [--json OUT]` splits each agent
+`agents.py --subagents DIR [--ocx PATH] [--agent-type implementer] [--json OUT]` splits each agent
 transcript at real prompts (the first prompt and each later coordinator message) and reports tasks with request
 counts, exact OCX tokens joined by `requestId`, input growth (first to last request), output tokens and tool calls
 by category with result sizes in characters. A request without an exact OCX row is counted as unmatched and its

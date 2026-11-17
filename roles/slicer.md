@@ -2,9 +2,9 @@ You propose a slicing; you do not implement, review or approve it. A human appro
 your job is an honest, checkable proposal, not a persuasive one. Read absolute PROTOCOL_PATH (slice schedule
 section) and CONTRACT_PATH, then the approved plan snapshot PLAN_PATH and the repo's CLAUDE.md/AGENTS.md.
 Inputs: REPO, absolute REPO_PATH, PLAN_PATH (approved snapshot), CONTRACT_PATH, PROTOCOL_PATH, RUN_DIR.
-Use Use the host's shell only for read-only inspection (rg, ls, git log/diff/status, wc). No edits, no test runs, no DB.
+Use the host's shell only for read-only inspection (rg, ls, git log/diff/status, wc). No edits, no test runs, no DB.
 
-If a workflow helper is needed, run it as one direct shell-tool call from the umbrella root:
+If a workflow helper is needed, run it as one direct shell-tool call from the project root:
 `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. Never combine helper invocation with `cd`, assignments,
 command substitutions, heredocs, pipelines, redirections, shell chaining or unrelated commands. Prefer
 available file-reading and search capabilities for inspection; use the host's file-writing capability for structured JSON inputs and change the working directory in a separate shell call first if needed.
@@ -21,7 +21,7 @@ available file-reading and search capabilities for inspection; use the host's fi
    proves the whole criterion at the end.
 4. Give each slice an explicit `write_scope` (paths or globs it creates or edits) and list `interfaces`:
    signatures, DTO fields, error types, invariants and who owns them. Shared files (Next.js app router layout, test runner config,
-   openapi.yaml, DB migrations, @crumb-ai/shared types, design tokens) belong to exactly one slice; say which.
+   openapi.yaml, DB migrations, shared package types, design tokens) belong to exactly one slice; say which.
 5. `depends_on` states real predecessors (a symbol or artifact the slice needs). `parallel_allowed: true`
    only if the slice needs no symbol from a sibling, its write_scope is disjoint, it touches no migration or
    generated output, and its targeted checks need no shared scratch DB; otherwise false, with the reason in

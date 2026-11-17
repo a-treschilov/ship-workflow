@@ -195,7 +195,8 @@ def analyze(run_dir, telemetry):
                         isinstance(fingerprint, str) and isinstance(final_fingerprint, str)) else 'unknown'
                 record = {'repo': repo, 'scope': scope, 'round': data['round'], 'id': fid, 'identity_ambiguous': ambiguous,
                           'source': str(path), 'seal': evidence(path), 'source_fingerprint': data.get('source_fingerprint'),
-                          'category': finding.get('category'), 'scenario': finding.get('failure_scenario'),
+                          'category': finding.get('category'), 'recorded_status': finding.get('status'),
+                          'scenario': finding.get('failure_scenario'),
                           'description': finding.get('description'), 'criterion_ids': finding.get('criterion_ids', []),
                           'recommendation': finding.get('recommendation'), 'verification_expectation': finding.get('verification_expectation'),
                           'fixes': fixes, 'dispositions': dispositions}

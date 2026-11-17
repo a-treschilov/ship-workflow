@@ -1,4 +1,4 @@
-"""Mechanical artifact steps for crumb-implementer: CLI behaviour on a temporary git checkout."""
+"""Mechanical artifact steps for implementer: CLI behaviour on a temporary git checkout."""
 
 import importlib.util
 import json
@@ -106,6 +106,58 @@ class ArtifactTests(unittest.TestCase):
         again = self.cli("run", "r1", "--", "python3", "-c", "print('other')")
         self.assertEqual(again.returncode, 2)
         self.assertIn("already exists", again.stderr)
+
+    def test_run_respects_initialized_exclusions(self):
+        ignored = self.repo / "generated"
+        ignored.mkdir()
+        (ignored / "output.txt").write_text("output")
+        (self.run_dir / "repo/state-1.json").write_text(json.dumps({
+            "status": "initialized", "source_scope": ["src/a.txt"], "excludes": ["generated"]}))
+        result = self.cli("run", "excluded", "--", "python3", "-c", "print('ok')")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for suffix in ("before", "after"):
+            manifest = json.loads((self.evidence / f"runs/excluded-{suffix}.json").read_text())
+            self.assertNotIn("generated/output.txt", manifest["files"])
+            self.assertIn("src/a.txt", manifest["files"])
+
+    def test_scope_check_ignores_unchanged_preexisting_wip(self):
+        (self.repo / "other.txt").write_text("existing work\n")
+        initial = self.run_dir / "repo/initial.json"
+        initial.write_text(json.dumps(artifacts.state.capture(self.repo, ["src/a.txt"])))
+        (self.run_dir / "repo/state-1.json").write_text(json.dumps({
+            "status": "initialized", "initial_manifest": str(initial), "source_scope": [], "excludes": []}))
+        result = self.cli("scope-check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.repo / "other.txt").write_text("changed again\n")
+        result = self.cli("scope-check")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("other.txt", result.stdout)
+
+    def test_capture_read_exclusion_skips_tracked_and_untracked(self):
+        (self.repo / "secret").mkdir()
+        (self.repo / "secret/private.txt").write_text("private")
+        subprocess.run(["git", "-C", str(self.repo), "add", "secret/private.txt"], check=True)
+        result = artifacts.state.capture(self.repo, ["src/a.txt"], read_excludes=["secret"])
+        self.assertNotIn("secret/private.txt", result["files"])
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            artifacts.state.capture(self.repo, ["secret/private.txt"], read_excludes=["secret"])
+
+    def test_matrix_repair_preserves_unmodified_rows(self):
+        task = artifacts.task_file(self.task)
+        old_rows = [{"criterion_id": "c1", "evidence_paths": ["old"]},
+                    {"criterion_id": "c2", "evidence_paths": ["keep"]}]
+        base = self.run_dir / "base-matrix.json"
+        base.write_text(json.dumps({"schema_version": 2, "run_id": "run-1", "repo": "repo", "criteria": old_rows}))
+        records = self.evidence / "records"
+        records.mkdir(parents=True)
+        (records / "replacement.json").write_text("{}")
+        rows = self.run_dir / "replacement.json"
+        rows.write_text(json.dumps([{"criterion_id": "c1", "runs": ["replacement"],
+                                     "replaces_evidence_paths": ["old"]}]))
+        artifacts.matrix(task, str(rows), str(base))
+        result = json.loads((self.evidence / "matrix/1.json").read_text())
+        self.assertEqual(result["criteria"][1], old_rows[1])
+        self.assertEqual(result["criteria"][0]["evidence_paths"], [str(records / "replacement.json")])
 
     def test_run_check_uses_contract_argv_only(self):
         result = self.cli("run", "r2", "--check", "c1-check")
