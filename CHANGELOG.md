@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- Explain how projects configure review criteria and how review passes are recorded.
+
 ## v1.2.0 - 2026-11-18
 
 ### New Features

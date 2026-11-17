@@ -43,8 +43,9 @@ definitions automatically.
 - Checker: exact requirement extraction and goal/evidence validity; not another general code review.
 - Mechanical validation is not semantic proof. A passing test count, hash or `ready` label is insufficient.
 
-Approved requirements/non-goals and scope take precedence over general cleanup. Repo `review.md`
-provides substantive criteria, not its standalone whole-HEAD diff collection or output instructions.
+Approved requirements/non-goals and scope take precedence over general cleanup. The target repository's
+`REPO_PATH/.agents/skills/review/SKILL.md` provides substantive review criteria, not its standalone
+whole-HEAD diff collection or output instructions.
 This protocol supplies scope, baselines, history and output. Read applicable repo/module instructions.
 Unchanged consumers broken by the new delta are reviewable: anchor the changed cause and name affected
 sites. Unrelated pre-existing Boy Scout issues do not expand writable scope. Extract helpers only when
@@ -122,8 +123,10 @@ Parallel syntax pre-review example: `argv:
 ["sh","-c","find app components lib -name '*.ts' -o -name '*.tsx' -print0 | xargs -0 -P8 -n25 npx tsc --noEmit >/dev/null"]`.
 Pipeline exit is xargs's, nonzero on any type error, so no `$?` test is needed.
 When there is no runner, use a justified explicit inspection only if the requirement is truly static;
-never substitute inspection for runtime correctness. `required_passes` lists the repo rubric's complete
-set; reviewers may mark a conditional pass not-applicable with reasoning. Criteria include all selected
+never substitute inspection for runtime correctness. When preparing a new contract, the orchestrator reads
+each target repository's `.agents/skills/review/SKILL.md` and lists its complete set of review passes in
+`required_passes[repo]`, using stable IDs for the rubric topics. Reviewers may mark a conditional pass
+not-applicable with reasoning. Criteria include all selected
 requirements, environments/data scope, stable IDs/source references; do not relabel empirical as static.
 Multi-repo requirements name all repos; `cross_repo_contracts` reference their criterion_id.
 For a cross-repo requirement whose final proof depends on later implementations, a new contract may set
