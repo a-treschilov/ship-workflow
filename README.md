@@ -111,6 +111,31 @@ or delete an active run.
 New runs are created with the workflow's `init-run` helper; `validate-run` records setup success or failure
 before preflight. An interrupted setup can remain open, and a failed setup does not count as a passed check.
 
+### Configure review criteria
+
+Each target repository owns its review rubric at `.agents/skills/review/SKILL.md`. The installer does not
+create this file. Create or edit it in each repository to describe the checks your project needs. The reviewer
+reads the rubric and applicable repository and module instructions in every review round. The workflow protocol
+defines the review scope, baseline and result format.
+
+For example, add a `simplification` section that explains when the check applies and what problems to look for,
+such as unnecessarily nested conditions or duplicated behavior. Give each rubric topic a stable ID. Before a
+new `/ship` or `/fix` run, ask the orchestrator to include the checks in the contract. It reads the rubric and
+records the complete set of IDs in `required_passes` for each repository. An excerpt might look like this:
+
+```json
+"required_passes": {"app": ["logic", "security", "simplification"]}
+```
+
+Keep all existing rubric IDs when adding a new one. Inspect the run's `contract.json` to see the selected IDs.
+Each review records an `inspected` result or a justified `not-applicable` result for every ID under
+`coverage.mandatory_passes`. Run contracts and review records are immutable; rubric changes apply when a new
+contract is prepared.
+
+Rubrics can include Boy Scout suggestions for nearby code. The approved scope and protocol govern the review;
+unrelated pre-existing improvements do not expand the writable scope. See the
+[protocol](workflows/ship-fix/PROTOCOL.md) for the complete rules.
+
 ### Explore runs visually
 
 Run `./ship-view` from an installed project's root. It opens a local browser with repository progress, remaining

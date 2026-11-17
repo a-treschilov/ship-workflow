@@ -7,6 +7,10 @@
 - Show full open review findings and severity counts in repository review-budget checks.
 - Allow users to accept open review findings after exhausting the repair budget.
 
+### Documentation
+
+- Explain how projects configure review criteria and how review passes are recorded.
+
 ## v1.2.0 - 2026-11-18
 
 ### New Features
