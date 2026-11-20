@@ -674,7 +674,7 @@ def proof(value, repo, path, final, identifier, producer=None, expected_status="
     return paths
 
 
-def finding_proof(value, repo, path, final, identifier, kind):
+def finding_proof(value, repo, path, final, identifier, kind, historical_seals=None):
     record = state.load(absolute_file(path))
     bound(value, repo, record)
     require(record.get("kind") == kind and record.get("status") == "passed", "Finding proof unverified")
@@ -683,12 +683,33 @@ def finding_proof(value, repo, path, final, identifier, kind):
     require(identifier in {c["id"] for c in claims}, "Wrong finding proof")
     for claim in claims:
         state.text(claim.get("assertion"), "finding assertion")
-    state.evidence(record, final, value.get("read_excludes", {}).get(repo, []))
+    state.evidence(record, final, value.get("read_excludes", {}).get(repo, []),
+                   historical=historical_seals is not None)
     paths = [record["before_manifest"], record["after_manifest"], *record["artifact_paths"]]
     hashes = record.get("artifact_hashes")
     require(isinstance(hashes, dict) and set(hashes) == set(paths), "Missing finding artifact hashes")
-    check_seals(hashes)
+    if historical_seals is None:
+        check_seals(hashes)
+    else:
+        require(all(historical_seals.get(p) == digest for p, digest in hashes.items()),
+                "Historical finding proof does not match its state seals")
     return [path, *paths]
+
+
+def applied_findings(value, repo, path, review_path, final, historical_seals=None):
+    result = state.load(absolute_file(path))
+    bound(value, repo, result)
+    findings = state.load(review_path)
+    state.applied(result, findings)
+    kinds = {item["id"]: item["verification_kind"] for item in findings["findings"]}
+    sealed = [path]
+    for item in result["applied"]:
+        kind = kinds[item["id"]]
+        require(item.get("verification_kind") == kind, "Applied kind mismatch")
+        require(item.get("evidence_paths"), "Applied finding needs evidence")
+        for proof_path in item["evidence_paths"]:
+            sealed += finding_proof(value, repo, proof_path, final, item["id"], kind, historical_seals)
+    return result, sealed
 
 
 def check_set(value, repo, group, paths, final):
@@ -1204,9 +1225,24 @@ def review_budget(events, contract_path=None, value=None, repo=None, visited_con
             predecessor_event = events[index - 1][2]
             context_event = (events[index - 2][2] if predecessor_event.get("status") == "capped"
                              and index >= 2 else predecessor_event)
-            require(event.get("status") == context_event.get("status")
-                    and event.get("source_fingerprint") == predecessor_event.get("source_fingerprint"),
-                    "Grant event changed its review context or source")
+            recovery_path = event.get("slice_repair_recovery_path")
+            if recovery_path:
+                recovery_hash = sha(absolute_file(recovery_path))
+                prior_limit = max(0, base_limit + sum(item["additional_passes"] for item in grants)
+                                  - carried_over)
+                require(predecessor_event.get("status") == "needs-fix" and purpose == "review-fix"
+                        and event.get("status") == "edited-unverified" and event.get("action") == "review-fix"
+                        and predecessor_event.get("review_fix_count", 0) >= prior_limit
+                        and event.get("review_fix_count") == predecessor_event.get("review_fix_count", 0) + 1
+                        and data.get("slice_repair_recovery_sha256") == recovery_hash
+                        and event.get("artifact_hashes", {}).get(recovery_path) == recovery_hash
+                        and not data.get("historical_budget_sources"),
+                        "Grant does not bind an exhausted slice repair recovery")
+            else:
+                require("slice_repair_recovery_sha256" not in data and
+                        event.get("status") == context_event.get("status")
+                        and event.get("source_fingerprint") == predecessor_event.get("source_fingerprint"),
+                        "Grant event changed its review context or source")
             require(data.get("review_path") == context_event.get("review_path")
                     and data.get("review_round") == context_event.get("latest_review_round"),
                     "Grant review context binding mismatch")
@@ -1287,9 +1323,10 @@ def review_budget(events, contract_path=None, value=None, repo=None, visited_con
                - carried_over), grants
 
 
-def apply_budget_grant(contract_path, value, repo, request, events, previous, data):
+def apply_budget_grant(contract_path, value, repo, request, events, previous, data, recovery_path=None):
     """Validate a user's one-time run-local grant and return its sealed summary."""
-    require(events and request.get("status") != "edited-unverified", "Grant application needs an existing state")
+    require(events and (request.get("status") != "edited-unverified" or recovery_path),
+            "Grant application needs an existing state")
     path = absolute_file(request.get("budget_grant_path"))
     run_root = Path(contract_path).parent.resolve()
     require(path.resolve().is_relative_to(run_root), "Review-budget grant must be run-local")
@@ -1304,6 +1341,11 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
     extra = grant.get("additional_passes")
     require(type(extra) is int and extra > 0, "Grant needs positive integer additional_passes")
     historical_sources = grant.get("historical_budget_sources", [])
+    if recovery_path:
+        require(grant.get("slice_repair_recovery_sha256") == sha(recovery_path) and not historical_sources,
+                "Recovery grant must bind the recovery proof and preserve historical budget sources")
+    else:
+        require("slice_repair_recovery_sha256" not in grant, "Recovery grant needs a slice repair recovery")
     requested_historical, validated_sources = (historical_budget_sources(
         historical_sources, repo, value["workflow"], contract_path,
         {Path(contract_path).resolve()}) if historical_sources else (0, []))
@@ -1334,7 +1376,8 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
             "Cumulative review-fix budget is not exhausted")
     require(all(item.get("previous_state_path") != str(prior_path) for item in prior_grants),
             "A grant was already issued for this state")
-    require(data["source_fingerprint"] == previous["source_fingerprint"], "Grant cannot accompany source edits")
+    require(recovery_path or data["source_fingerprint"] == previous["source_fingerprint"],
+            "Grant cannot accompany source edits")
     for key in ("scope", "scope_path", "source_scope", "source_scope_path", "initial_manifest", "baseline_dir",
                 "current_author_agent_id", "original_agent_id", "gate_fix_count", "latest_review_round"):
         require(data.get(key, previous.get(key)) == previous.get(key), f"Grant cannot change {key}")
@@ -1361,6 +1404,9 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
                 "Grant purpose does not match capped state")
     else:
         raise ValueError("Review-budget grant can only continue needs-fix or capped state")
+    if recovery_path:
+        require(before == "needs-fix", "Recovery grant must start at needs-fix")
+        target = "edited-unverified"
     require(request.get("status") == target, "Grant transition must preserve its review context")
     review_path = context.get("review_path")
     require(grant.get("review_path") == review_path and review_path, "Grant review binding mismatch")
@@ -1680,7 +1726,8 @@ def transition(contract_path, repo, request_path, out):
     require(isinstance(request, dict), "Transition request must be an object")
     protected = {"review_fingerprint", "artifact_hashes", "initial_manifest", "code_only", "schema_version",
                  "run_id", "repo", "sequence", "at", "current_author_agent_id", "review_fix_limit",
-                 "review_fix_grants", "budget_grant", "amendment_sha256", "amendment_applied"}
+                 "review_fix_grants", "budget_grant", "amendment_sha256", "amendment_applied",
+                 "budget_grant_applied"}
     require(not protected & set(request), "Request overrides certified lifecycle fields")
     status = request.get("status")
     require("original_agent_id" not in request
@@ -1704,6 +1751,19 @@ def transition(contract_path, repo, request_path, out):
     if "deliverable_manifest_path" in request:
         require(status == "pre-review-passed", "Deliverable manifest can change only before review")
     before = previous.get("status")
+    sliced = repo in value.get("slice_schedules", {})
+    recovery_path = request.get("slice_repair_recovery_path")
+    if "slice_repair_recovery_path" in request:
+        require(recovery_path and sliced and before == "needs-fix" and status == "edited-unverified"
+                and request.get("action") == "review-fix" and not value.get("from_review"),
+                "Slice repair recovery requires needs-fix -> edited-unverified for a sliced repo")
+        require(set(request) <= {"status", "action", "source_manifest", "slice_repair_recovery_path",
+                                 "budget_grant_path"},
+                "Slice repair recovery cannot override lifecycle fields or include a repair phase")
+        validate_history(contract_path, repo)
+    source_anchor = next((event for _, _, event in reversed(events)
+                          if event["status"] in {"implemented", "edited-unverified"}), None)
+    recovery_anchor = source_anchor if source_anchor and source_anchor.get("slice_repair_recovery_path") else None
     requirement_amendment_path = request.get("amendment_path")
     is_requirement_amendment = ("amendment_path" in request
                                 and requirement_amendment_path != previous.get("amendment_path"))
@@ -1773,6 +1833,10 @@ def transition(contract_path, repo, request_path, out):
     dependency_scope = state.scope_paths(absolute_file(dependency_scope_path))
     require(set(previous.get("scope", [])) <= set(scope), "Touched scope must not shrink")
     final = fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
+    if sliced and before == "needs-fix" and status in {"reviewed", "capped"}:
+        previous_source = event_manifest(value, repo, previous)
+        require(state.same_source(final, previous_source, value.get("read_excludes", {}).get(repo, [])),
+                "Repo source changed since needs-fix. Record the repair or use slice repair recovery before continuing")
     if accepting:
         require(set(request) <= {"status", "source_manifest", "scope_path", "baseline_dir", "review_acceptance_path"},
                 "Acceptance cannot change lifecycle context")
@@ -1815,19 +1879,18 @@ def transition(contract_path, repo, request_path, out):
     elif repo in value.get("slice_schedules", {}) and before in {"implemented", "pre-review-passed", "needs-fix", "reviewed", "gates-passed", "verified"}:
         require(set(scope) == set(previous["scope"]), "Sliced repo scope expansion requires amendment")
     changed = names.changed(initial, final)
-    require(changed <= names.keys(scope), "Changes outside touched scope; resolve ownership first")
-    if policy:
-        accepted = [event for _, _, event in events
-                    if event["status"] in {"implemented", "edited-unverified"}]
+    if not recovery_path:
+        require(changed <= names.keys(scope), "Changes outside touched scope; resolve ownership first")
+    if policy or recovery_anchor:
         certification = {"pre-review-passed", "needs-fix", "reviewed", "gates-passed", "verified"}
         if status == "implemented":
-            require(not accepted and not any(event["status"] in certification for _, _, event in events),
+            require(not source_anchor and not any(event["status"] in certification for _, _, event in events),
                     "Source repairs cannot restart implementation; record edited-unverified")
         if status in certification:
             # A blocker/handoff may truthfully capture partially edited source, but must not
             # silently make that source the accepted implementation on unblock. Only initial
             # implementation or an explicitly recorded repair can advance this version anchor.
-            anchor = event_manifest(value, repo, accepted[-1]) if accepted else initial
+            anchor = event_manifest(value, repo, source_anchor) if source_anchor else initial
             require(state.same_source(final, anchor, names.read_excludes),
                     "Source changed without recorded repair; record edited-unverified with repair_phase_id "
                     "(or explicit from-review author_handoff)")
@@ -1836,7 +1899,7 @@ def transition(contract_path, repo, request_path, out):
         sealed.append(acceptance_path)
     for applied in value.get("_amendments", []):
         sealed.append(applied["path"])
-    if policy and events:
+    if (policy or recovery_anchor) and events:
         sealed.append(str(events[-1][1]))
     if value["workflow"] == "ship":
         sealed.append(value["approved_snapshot"])
@@ -1854,8 +1917,20 @@ def transition(contract_path, repo, request_path, out):
         data["amendment_applied"] = True
     data.pop("budget_grant", None)
     data.pop("budget_grant_applied", None)
+    data.pop("slice_repair_recovery_path", None)
+    if recovery_path:
+        require(scope == previous["scope"] and dependency_scope == previous["source_scope"],
+                "Slice repair recovery requires the recorded repo and dependency scope")
+        references, recovery_seals = slice_repair_recovery(
+            contract_path, value, repo, events, recovery_path, source_path, final)
+        require(changed <= names.keys(scope), "Changes outside touched scope; resolve ownership first")
+        data["slice_repair_recovery_path"] = recovery_path
+        data["slice_gate_path"] = references["slice_gate"]
+        data["applied_path"] = references["applied"]
+        sealed += recovery_seals
     if is_grant_transition:
-        target, grant_summary = apply_budget_grant(contract_path, value, repo, request, events, previous, data)
+        target, grant_summary = apply_budget_grant(
+            contract_path, value, repo, request, events, previous, data, recovery_path)
         require(status == target, "Grant transition status changed during validation")
         continuity = budget_continuity(value, repo, contract_path)
         base_limit = (continuity["effective_limit"] - continuity["used_passes"]) if continuity else REVIEW_FIX_BUDGET
@@ -1892,7 +1967,6 @@ def transition(contract_path, repo, request_path, out):
         pre, paths = preflight(value, repo, request.get("preflight_path"), initial)
         require((pre["status"] == "passed") == (status == "ready"), "Wrong preflight transition")
         sealed += paths
-    sliced = repo in value.get("slice_schedules", {})
     if sliced and status in {"implemented", "pre-review-passed"}:
         gate_path = request.get("slice_gate_path", previous.get("slice_gate_path"))
         gate = state.load(absolute_file(gate_path))
@@ -1909,6 +1983,17 @@ def transition(contract_path, repo, request_path, out):
         if status == "implemented":
             require(request.get("slice_authors") == gate["slice_authors"],
                     "slice_authors must equal the authors recorded by the accepted slices")
+        if recovery_anchor and status == "pre-review-passed":
+            if gate_path != recovery_anchor["slice_gate_path"]:
+                schedule = value["slice_schedules"][repo]["path"]
+                expected_gate = prepare_slice_gate(
+                    contract_path, repo, schedule, initial_path, source_path, amendment_path)
+                require(gate == expected_gate, "Replacement slice gate must certify current acceptance")
+            for identifier, expected in gate["slices"].items():
+                slice_events = history(directory / "slices" / identifier)
+                require(slice_events and slice_events[-1][2]["status"] == "accepted"
+                        and sha(slice_events[-1][1]) == expected,
+                        f"Slice {identifier} changed after the recovery gate. Run slice-gate again")
     if status == "implemented":
         if policy and not value.get("from_review"):
             state.text(request.get("original_agent_id"), "original implementer agent ID")
@@ -1925,7 +2010,7 @@ def transition(contract_path, repo, request_path, out):
         require(action in EDITS - {"implement"}, "Missing edit cause")
         if value.get("from_review"):
             require(action == "plan-gap" and request.get("author_handoff"), "From-review fixes need author handoff")
-        elif policy:
+        elif policy and not recovery_path:
             if request.get("phase_binding_recovery_path"):
                 require(before == "blocked" and action == "review-fix",
                         "Phase-binding recovery only resumes a blocked review-fix")
@@ -1956,20 +2041,13 @@ def transition(contract_path, repo, request_path, out):
             recovered = bool(request.get("phase_binding_recovery_path"))
             require((before == "needs-fix" or recovered and before == "blocked")
                     and previous.get("review_path"), "Review fix needs findings")
-            require(data["review_fix_count"] < budget_limit, "Review-fix budget exhausted")
+            require(data["review_fix_count"] < budget_limit,
+                    "Review-fix budget exhausted. Bind a user-approved grant to the recovery"
+                    if recovery_path else "Review-fix budget exhausted")
             data["review_fix_count"] += 1
-            applied_path = request.get("applied_path")
-            result = state.load(absolute_file(applied_path))
-            bound(value, repo, result)
-            findings = state.load(previous["review_path"])
-            state.applied(result, findings)
-            for item in result["applied"]:
-                original = next(f for f in findings["findings"] if f["id"] == item["id"])
-                require(item.get("verification_kind") == original["verification_kind"], "Applied kind mismatch")
-                require(item.get("evidence_paths"), "Applied finding needs evidence")
-                for p in item["evidence_paths"]:
-                    sealed += finding_proof(value, repo, p, final, item["id"], original["verification_kind"])
-            sealed.append(applied_path)
+            if not recovery_path:
+                _, proofs = applied_findings(value, repo, request.get("applied_path"), previous["review_path"], final)
+                sealed += proofs
         if action == "plan-gap":
             require(data["review_fix_count"] < budget_limit, "Plan-gap repair budget exhausted")
             data["review_fix_count"] += 1
@@ -1987,11 +2065,22 @@ def transition(contract_path, repo, request_path, out):
             data["gate_fix_count"] += 1
         for key in ("gate_evidence_paths", "assessment_path"):
             data.pop(key, None)
+        if recovery_path:
+            for key in ("pre_review_evidence_paths", "repair_phase_id", "slice_id", "capsule_handoff",
+                        "phase_binding_recovery_path", "author_identity_recovery_path"):
+                data.pop(key, None)
     if status == "pre-review-passed":
+        check_paths = request.get("pre_review_evidence_paths")
+        if recovery_anchor and isinstance(check_paths, list):
+            require(not {sha(absolute_file(path)) for path in check_paths} & set(inherited_seals.values()),
+                    "Slice repair recovery requires fresh repo pre-review check evidence")
         sealed += matrix(value, repo, request.get("matrix_path", previous.get("matrix_path")), final)
         sealed += validate_deliverables(value, repo, request.get("deliverable_manifest_path", previous.get("deliverable_manifest_path")))
-        sealed += check_set(value, repo, "pre_review_checks", request.get("pre_review_evidence_paths"), final)
+        sealed += check_set(value, repo, "pre_review_checks", check_paths, final)
     if status in {"needs-fix", "reviewed"} and not is_grant_transition and not identity_correction:
+        if recovery_anchor:
+            require(sha(absolute_file(request.get("review_path"))) not in inherited_seals.values(),
+                    "Slice repair recovery needs a fresh independent repo review")
         sealed += validate_deliverables(value, repo, previous.get("deliverable_manifest_path"))
         prior_paths = [e[2]["review_path"] for e in events
                        if e[2]["status"] in {"needs-fix", "reviewed"} and not e[2].get("budget_grant_applied")]
@@ -2014,6 +2103,8 @@ def transition(contract_path, repo, request_path, out):
     if status in TERMINAL:
         state.text(request.get("reason"), "blocker/handoff reason")
     data["artifact_hashes"] = {**previous.get("artifact_hashes", {}), **seal_files(sealed)}
+    if recovery_path:
+        fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
     # Scope is intentionally mutable; the event captures its values, not a mutable-file seal.
     state.write_once(out, data)
     return data
@@ -2159,7 +2250,8 @@ def integration_resume(value, repo, run, authorization, start, events, slice_id)
                                       str(prior_auth_path), paused["source_manifest"]]
 
 
-def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, previous, events, request, final):
+def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, previous, events, request, final,
+                           sibling_histories=None):
     """Bind a sequential reopen to certified sibling versions, never a replacement base."""
     path = request.get("integration_path") or previous.get("integration_path")
     if not path:
@@ -2273,8 +2365,8 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
     verified_bindings = {}
     for identifier, binding in bindings.items():
         require(identifier in items, "Unknown integration sibling")
-        directory = run / repo / "slices" / identifier
-        sibling_events = history(directory)
+        sibling_events = (history(run / repo / "slices" / identifier) if sibling_histories is None
+                          else sibling_histories[identifier])
         require(sibling_events, "Integration sibling has no history")
         event_path, event = sibling_events[-1][1:]
         require(Path(binding["path"]).resolve() == event_path.resolve()
@@ -2643,6 +2735,11 @@ def accepted_slices(contract_path, repo, ids):
 
 
 def slice_gate(contract_path, repo, schedule_path, initial_path, source_path, out, amendment_path=None):
+    record = prepare_slice_gate(contract_path, repo, schedule_path, initial_path, source_path, amendment_path)
+    state.write_once(out, record)
+
+
+def prepare_slice_gate(contract_path, repo, schedule_path, initial_path, source_path, amendment_path=None):
     """Certify that every slice is accepted, current and not stale before the repo-level lifecycle starts."""
     value = contract(contract_path)
     plan = slice_schedule(contract_path, repo, schedule_path)
@@ -2727,7 +2824,198 @@ def slice_gate(contract_path, repo, schedule_path, initial_path, source_path, ou
     if amendment_path:
         record["scope_amendment_path"] = str(amendment_path)
         record["amended_paths"] = sorted(additions)
-    state.write_once(out, record)
+    return record
+
+
+def recovery_reference(run, reference, label):
+    require(isinstance(reference, dict) and set(reference) == {"path", "sha256"},
+            f"Slice repair recovery needs a path and hash for {label}")
+    path = absolute_file(reference["path"])
+    require(path.resolve().is_relative_to(run), f"Slice repair recovery {label} must be run-local")
+    require(sha(path) == reference["sha256"], f"Slice repair recovery {label} hash mismatch")
+    return str(path)
+
+
+def gate_slice_histories(value, repo, gate, histories):
+    """Select the accepted history prefixes sealed by a gate, even after later slice operations."""
+    require(set(gate.get("slices", {})) == set(histories), "Slice gate does not bind the approved schedule")
+    prefixes = {}
+    for identifier, events in histories.items():
+        expected = gate["slices"][identifier]
+        matches = [i for i, path, _ in events if gate["artifact_hashes"].get(str(path)) == expected]
+        require(len(matches) == 1, f"Slice gate needs a sealed accepted state for {identifier}")
+        prefix = events[:matches[0]]
+        _, path, accepted = prefix[-1]
+        require(sha(path) == expected and accepted.get("status") == "accepted",
+                f"Slice gate does not bind an accepted state for {identifier}")
+        inherited = {}
+        for _, _, event in prefix:
+            bound(value, repo, event)
+            require(event.get("slice_id") == identifier and event.get("schedule_sha256") == gate["schedule_sha256"],
+                    f"Foreign slice history for {identifier}")
+            check_event_seals(value, repo, event, inherited)
+            inherited = event["artifact_hashes"]
+        prefixes[identifier] = prefix
+    return prefixes
+
+
+def slice_repair_recovery(contract_path, value, repo, events, recovery_path, source_path, final, historical_seals=None):
+    """Account for accepted slice repairs without recreating a repo author phase."""
+    run_path = Path(contract_path).parent
+    run = run_path.resolve()
+    live = historical_seals is None
+    declaration = value.get("slice_schedules", {}).get(repo)
+    require(declaration and events and events[-1][2]["status"] == "needs-fix",
+            "Slice repair recovery requires a sliced repo in needs-fix")
+    previous_path, previous = events[-1][1:]
+    recovery_path = absolute_file(recovery_path)
+    require(recovery_path.resolve().is_relative_to(run), "Slice repair recovery must be run-local")
+    recovery = state.load(recovery_path)
+    bound(value, repo, recovery)
+    references = {key: recovery_reference(run, recovery.get(key), key)
+                  for key in ("previous_state", "review", "slice_gate", "applied")}
+    require(references["previous_state"] == str(previous_path) and references["review"] == previous["review_path"],
+            "Slice repair recovery must bind the current needs-fix state and repo review")
+    schedule_path = absolute_file(declaration["path"])
+    schedule = state.load(schedule_path)
+    items = {item["id"]: item for item in schedule["slices"]}
+    gate = state.load(references["slice_gate"])
+    bound(value, repo, gate)
+    original_gate_path = absolute_file(previous.get("slice_gate_path"))
+    original_gate = state.load(original_gate_path)
+    bound(value, repo, original_gate)
+    before = event_manifest(value, repo, previous)
+    repo_review = state.load(references["review"])
+    bound(value, repo, repo_review)
+    require(repo_review.get("round") == previous.get("latest_review_round") and
+            repo_review.get("source_fingerprint") == before["fingerprint"] and
+            original_gate.get("source_fingerprint") == before["fingerprint"],
+            "Slice repair recovery needs the original gate and review on the needs-fix source")
+    for path in (original_gate_path, references["review"]):
+        require(previous["artifact_hashes"].get(str(path)) == sha(path),
+                "Original slice gate and repo review must be sealed by needs-fix")
+    for proof_gate in (original_gate, gate):
+        require(proof_gate.get("schedule_sha256") == declaration["sha256"] == sha(schedule_path),
+                "Slice gate schedule changed")
+        require(isinstance(proof_gate.get("artifact_hashes"), dict), "Slice gate is missing artifact seals")
+        check_seals(proof_gate["artifact_hashes"])
+    require(gate.get("source_fingerprint") == final["fingerprint"] and
+            all(gate["artifact_hashes"].get(str(path)) == sha(path) for path in (source_path, previous_path)),
+            "Slice gate is stale for needs-fix or the source capture. Run slice-gate again")
+    require(Path(source_path).resolve().is_relative_to(run), "Recovery source manifest must be run-local")
+    names = source_names(value, repo)
+    require(before["head"] == final["head"], "Slice repair recovery cannot adopt a changed HEAD")
+    changed = names.changed(before, final, missing=state.MISSING)
+    require(changed, "Slice repair recovery needs a source change since the repo review")
+    require(changed <= names.keys(previous["scope"]),
+            "Slice repair recovery found changed frozen dependencies or source outside repo scope")
+    if live:
+        expected_gate = prepare_slice_gate(contract_path, repo, str(schedule_path),
+                                           previous["initial_manifest"], source_path,
+                                           previous.get("scope_amendment_path"))
+        require(gate == expected_gate, "Slice gate differs from current acceptance proof. Run slice-gate again")
+    histories = {identifier: history(run_path / repo / "slices" / identifier) for identifier in items}
+    originals = gate_slice_histories(value, repo, original_gate, histories)
+    current = gate_slice_histories(value, repo, gate, histories)
+    if live:
+        require(all(len(current[identifier]) == len(events) for identifier, events in histories.items()),
+                "Slice gate is stale for current slice states. Run slice-gate again")
+    plan = {"schedule_sha256": declaration["sha256"]}
+    old_files, final_files = names.files(before["files"]), names.files(final["files"])
+    reopened = {identifier for identifier in items if gate["slices"][identifier] != original_gate["slices"][identifier]}
+    bindings = recovery.get("slices")
+    require(isinstance(bindings, dict) and set(bindings) == reopened,
+            "Slice repair recovery must bind every reaccepted slice")
+    # A same-state repo grant may postdate the original repo review.
+    review_event = next((event for _, _, event in reversed(events)
+                         if event["status"] == "needs-fix" and not event.get("budget_grant_applied")), None)
+    require(review_event and review_event["review_path"] == references["review"],
+            "Slice repair recovery could not find the original repo review event")
+    review_at = timestamp(review_event["at"])
+    owned, edited_slices = set(), set()
+    for identifier, prefix in current.items():
+        _, old_path, old = originals[identifier][-1]
+        _, accepted_path, accepted = prefix[-1]
+        require(set(accepted["dependency_states"]) == set(items[identifier]["depends_on"]) and
+                all(gate["slices"].get(dep) == digest for dep, digest in accepted["dependency_states"].items()),
+                f"Slice {identifier} has stale dependency acceptance. Recheck and reaccept it")
+        for event, files in ((old, old_files), (accepted, final_files)):
+            accepted_files = event["accepted_files"]
+            require(set(accepted_files) == set(event["touched"]) and
+                    all(files.get(names.key(path), state.MISSING) == recorded
+                        for path, recorded in accepted_files.items()),
+                    f"Slice {identifier} source differs from its acceptance")
+        if identifier not in reopened:
+            continue
+        binding = bindings[identifier]
+        require(isinstance(binding, dict), f"Invalid recovery binding for slice {identifier}")
+        checkpoint_path = recovery_reference(run, binding.get("checkpoint"), f"{identifier} checkpoint")
+        require(recovery_reference(run, binding.get("previous_state"), f"{identifier} previous state") == str(old_path) and
+                recovery_reference(run, binding.get("accepted_state"), f"{identifier} acceptance") == str(accepted_path),
+                f"Stale slice recovery versions for {identifier}")
+        suffix = prefix[len(originals[identifier]):]
+        require(suffix, f"Slice {identifier} did not advance from the review gate")
+        checkpoint = state.load(checkpoint_path)
+        require(checkpoint.get("previous_state_path") == str(old_path),
+                f"Slice {identifier} checkpoint is stale for the original acceptance")
+        authorization_path = absolute_file(checkpoint.get("authorization_path"))
+        authorization = state.load(authorization_path)
+        require(timestamp(authorization.get("approved_at")) >= review_at,
+                f"Slice {identifier} checkpoint authorization predates the repo review")
+        target_delta = changed & names.keys(old["touched"])
+        if target_delta:
+            require(not owned & target_delta, "Slice repair recovery has overlapping changed file ownership")
+            owned |= target_delta
+            edited_slices.add(identifier)
+        for sequence, _, event in suffix:
+            prior_path, prior = prefix[sequence - 2][1:]
+            require(all(event[field] == old[field] for field in ("touched", "author_agent_id", "base_manifest")),
+                    f"Slice {identifier} changed scope, author or base during integration repair")
+            require(event.get("integration_path") == checkpoint_path and
+                    all(event["artifact_hashes"].get(str(path)) == sha(path)
+                        for path in (prior_path, checkpoint_path, event["source_manifest"])),
+                    f"Slice {identifier} repair chain does not seal the supplied checkpoint and sources")
+            boundary = timestamp(event["at"])
+            require(timestamp(checkpoint.get("at")) <= boundary, "Integration checkpoint postdates its slice state")
+            status, prior_status = event["status"], prior["status"]
+            require(status in SLICE_TRANSITIONS.get(prior_status, set())
+                    or (prior_status == "accepted" and status == "pre-review-passed"
+                        and event.get("action") == "dependency-recheck")
+                    or (prior_status == "capped" and status == "needs-fix" and event.get("is_continuation"))
+                    or (prior_status == "capped" and status == "reviewed-with-findings"
+                        and event.get("review_acceptance_path"))
+                    or status == "capped" and prior_status == "needs-fix",
+                    f"Slice {identifier} has an invalid transition before acceptance")
+            siblings = {other: [entry for entry in history if timestamp(entry[2]["at"]) <= boundary]
+                        for other, history in current.items() if other != identifier}
+            snapshot = event_manifest(value, repo, event)
+            integration_checkpoint(value, repo, contract_path, plan, items, identifier, prior,
+                                   prefix[:sequence - 1], event, snapshot, sibling_histories=siblings)
+        snapshot = event_manifest(value, repo, accepted)
+        reviewed = prefix[-2][2]
+        accepted_review = absolute_file(accepted.get("review_path"))
+        require(accepted.get("review_path") == reviewed.get("review_path")
+                and accepted["artifact_hashes"].get(str(accepted_review)) == sha(accepted_review)
+                and review_source_matches(value, repo, reviewed, prefix[:-1], snapshot),
+                f"Slice {identifier} acceptance requires a sealed review of the accepted source")
+        snapshot_files = names.files(snapshot["files"])
+        require(all(snapshot_files.get(names.key(path), state.MISSING) == recorded
+                    for path, recorded in accepted["accepted_files"].items()),
+                f"Slice {identifier} acceptance differs from its sealed source")
+    require(changed == owned, "Slice repair recovery cannot attribute all source changes to authorized slices: "
+            + ", ".join(sorted(changed - owned)))
+    result, proofs = applied_findings(value, repo, references["applied"], references["review"], final, historical_seals)
+    finding_slices = recovery.get("finding_slices")
+    require(isinstance(finding_slices, dict) and set(finding_slices) == {item["id"] for item in result["applied"]},
+            "Slice repair recovery must bind each applied finding to its changed slices")
+    covered = set()
+    for identifiers in finding_slices.values():
+        require(isinstance(identifiers, list) and identifiers and all(isinstance(i, str) for i in identifiers)
+                and set(identifiers) <= edited_slices
+                and len(set(identifiers)) == len(identifiers), "Invalid applied finding slice scope")
+        covered.update(identifiers)
+    require(covered == edited_slices, "Slice repair recovery has changed slices without applied finding proof")
+    return references, [str(recovery_path), *references.values(), *gate["artifact_hashes"], *proofs]
 
 
 def batches(contract_path, repo):
@@ -2968,11 +3256,23 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
                                 and index >= 2 and status == events[index - 2][2].get("status"))
         gate_correction = (status == prior_status == "gates-passed"
                            and bool(event.get("gate_correction_reason")))
+        requirement_registration = (status == prior_status == "ready" and event.get("amendment_applied") is True
+                                    and event.get("amendment_path") and event.get("source_fingerprint") ==
+                                    events[index - 1][2].get("source_fingerprint"))
+        if requirement_registration:
+            amendment_path = absolute_file(event["amendment_path"])
+            amendment = state.load(amendment_path)
+            previous_path = events[index - 1][1]
+            require(value["workflow"] == "ship" and amendment.get("approved_by") == "user"
+                    and amendment.get("previous_state_path") == str(previous_path)
+                    and amendment.get("previous_state_sha256") == sha(previous_path)
+                    and event.get("artifact_hashes", {}).get(str(amendment_path)) == sha(amendment_path),
+                    "Invalid historical requirement amendment registration")
         if prior_status is not None:
             require(status in TRANSITIONS.get(prior_status, set()) or status in TERMINAL
                     or (prior_status == "capped" and status == "reviewed-with-findings"
                         and event.get("review_acceptance_path"))
-                    or grant_same_state or grant_resumes_capped or gate_correction,
+                    or grant_same_state or grant_resumes_capped or gate_correction or requirement_registration,
                     "Invalid historical lifecycle transition")
         if status == "reviewed-with-findings" and not event.get("budget_grant_applied"):
             path = accept_review_findings(contract_file, value, repo, events[:index], event,
@@ -2999,10 +3299,26 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
                 "Historical review-fix counter exceeds its recorded limit")
         prior_status = status
     inherited = {}
-    for _, path, event in events:
+    for index, (_, _, event) in enumerate(events):
         bound(value, repo, event)
         check_event_seals(value, repo, event, inherited)
         inherited = event.get("artifact_hashes", {})
+        recovery_path = event.get("slice_repair_recovery_path")
+        if recovery_path:
+            require(index and event["status"] == "edited-unverified" and event["action"] == "review-fix",
+                    "Invalid historical slice repair recovery transition")
+            previous = events[index - 1][2]
+            for key in ("initial_manifest", "baseline_dir", "scope_path", "scope", "source_scope_path",
+                        "source_scope", "excludes", "original_agent_id", "current_author_agent_id",
+                        "slice_authors", "review_path", "review_fingerprint", "scope_amendment_path"):
+                require(event.get(key) == previous.get(key), f"Historical recovery changed {key}")
+            references, seals = slice_repair_recovery(
+                contract_file, value, repo, events[:index], recovery_path, event["source_manifest"],
+                event_manifest(value, repo, event), historical_seals=inherited)
+            require(event.get("slice_gate_path") == references["slice_gate"]
+                    and event.get("applied_path") == references["applied"]
+                    and set(seals) <= inherited.keys(),
+                    "Historical slice repair recovery proof is not sealed")
     limit, grants = review_budget(events, contract_path, value, repo, visited)
     latest = events[-1][2]
     if latest.get("scope_amendment_path"):
@@ -3017,6 +3333,14 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
     if historical_budget_used(grants):
         result["historical_used_passes"] = historical_budget_used(grants)
     return result
+
+
+def pending_slice_recovery(events):
+    if events and events[-1][2]["status"] in {"edited-unverified", "pre-review-passed"}:
+        for _, _, event in reversed(events):
+            if event["status"] in {"implemented", "edited-unverified"}:
+                return event if event.get("slice_repair_recovery_path") else None
+    return None
 
 
 def review_budget_status(contract_path, repo, slice_id=None):
@@ -3051,12 +3375,14 @@ def review_budget_status(contract_path, repo, slice_id=None):
                             value.get("read_excludes", {}).get(repo, []))
     recorded = manifest(value, repo, latest["source_manifest"])
     changed = sorted(source_names(value, repo).changed(recorded, current, missing=state.MISSING))
+    source_matches = not changed and recorded["head"] == current["head"]
     context = latest
     if latest.get("status") == "capped" and len(events) >= 2:
         context = events[-2][2]
     findings = []
     review_path = context.get("review_path")
-    if context.get("status") == "needs-fix" and review_path:
+    recovery = pending_slice_recovery(events) if slice_id is None else None
+    if review_path and (context.get("status") == "needs-fix" or recovery):
         findings = state.load(absolute_file(review_path))["findings"]
     used = latest.get("review_fix_count", 0)
     historical_used = historical_budget_used(grants)
@@ -3067,10 +3393,17 @@ def review_budget_status(contract_path, repo, slice_id=None):
             "open_findings": findings,
             "findings_by_severity": {severity: sum(item.get("severity") == severity for item in findings)
                                      for severity in ("Critical", "Warning", "Suggestion")},
-            "source_matches_state": not changed, "changed_source_paths": changed,
+            "source_matches_state": source_matches, "changed_source_paths": changed,
             "grants": grants, "status": "valid"}
     if slice_id is not None:
         result["slice_id"] = slice_id
+    elif latest["status"] == "needs-fix" and not source_matches and repo in value.get("slice_schedules", {}):
+        result["next_step"] = (
+            "HEAD changed since the repo review. Reconcile HEAD before recovery."
+            if recorded["head"] != current["head"] else
+            "For authorized and reaccepted slice repairs, run slice-gate and submit slice_repair_recovery_path "
+            "via transition. Follow the repo review fix recovery procedure in PROTOCOL.md."
+            + (" A user-approved budget grant bound to the recovery is required." if used >= limit else ""))
     continuity = budget_continuity(value, repo, contract_file, slice_id)
     if continuity:
         result.update({"historical_used_passes": continuity["used_passes"],
@@ -3182,14 +3515,19 @@ def packet(contract_path, repo, scope_path, baseline_dir, out):
                      if previous else current["files"])
     state.write_once(directory / "source.json", current)
     state.write_once(directory / "delta.json", changes)
-    state.write_once(directory / "index.json", {
+    index = {
         "schema_version": VERSION, "run_id": value["run_id"], "repo": repo,
         "source_manifest": str(directory / "source.json"), "delta_path": str(directory / "delta.json"),
         "scope": scope, "changed_since_review": changed, "criteria": criteria_for(value, repo),
         "required_passes": value["required_passes"][repo],
         "prior_reviews": [r["review_path"] for r in reviews],
         "open_findings": state.load(reviews[-1]["review_path"])["findings"] if reviews else [],
-    })
+    }
+    recovery = pending_slice_recovery(events)
+    if recovery:
+        index["slice_repair_recovery_path"] = recovery["slice_repair_recovery_path"]
+        index["applied_path"] = recovery["applied_path"]
+    state.write_once(directory / "index.json", index)
 
 
 def record_evidence(contract_path, repo, request_path, out):

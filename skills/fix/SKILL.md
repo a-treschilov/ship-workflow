@@ -72,7 +72,7 @@ Dispatch implementer and fresh reviewer through the host adapter's agent capabil
 Stop/report exact spawn error, never substitute a model or launch a nested agent runner. Save the original instance
 ID as original_agent_id. Repairs follow the /ship rotation rule: by default a fresh implementer gets the last CAPSULE_PATH and a TASK_PATH from `init-task`, and the request carries `capsule_handoff`; the new capsule is sealed with `capsule --agent-id` after the return; under `resume` the original instance is resumed via the host's continuation capability. Never a context-less fixer.
 Wrap all phases/resumes/checkpoints with protocol telemetry; actual IDs only, unknown usage is unknown.
-Record actual original_agent_id on implemented. For each repair choose a new unique phase_id:
+Record actual original_agent_id on implemented. For each newly dispatched repair choose a new unique phase_id:
 phase-start before the host's continuation capability to the original instance → wait for the specific actual result (delivery
 acknowledgement is not completion) → phase-end with actual passed|failed|blocked|interrupted → normal
 result/proof checks. Lost result leaves an open phase. Review-fix/gate-fix are separate; acceptance/plan-gap
@@ -95,8 +95,11 @@ root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-bud
 For an explicitly identified successor, declare and validate matching `successor_scopes` and
 `budget_continuity` in the contract before dispatch; follow the protocol's source and decision rules.
 Do this before repair telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, or author dispatch;
-show the reported limit, used passes, and open finding IDs. If source does not match the latest state, stop and
-resolve that drift. Repeat the check before every repair. After an exhausted-budget approval, apply the grant
+show the reported limit, used passes, and open finding IDs. If already accepted integration repairs account
+for the source drift, follow "Recovering a repo review fix after slice acceptance" in the protocol. Record one
+repo review-fix and run fresh repo pre-review and independent whole-scope review. At exhaustion, use the
+user-approved grant bound to the recovery in the same transition. Resolve other drift before preparing a repair.
+Repeat the check before every new repair. After an exhausted-budget approval, apply the grant
 against the exact prior state before any repair preparation, then recheck the budget before continuing.
 For a slice review cap, pass `--slice SLICE` to `review-budget` and use the slice transition and decision
 procedure in the protocol.

@@ -170,6 +170,11 @@ the spellings identify the same entry and the recorded states agree. If the entr
 or the checkout moved to a filesystem with different filename rules, resolve any reported path or
 scope discrepancy before continuing.
 
+To continue a run after already accepted integration repairs, install a snapshot that supports repo repair
+recovery and reload the host so it reads the updated skill. Run `review-budget` against the original contract.
+For a sliced repo in `needs-fix` with authorized and reaccepted repairs, follow the repo repair recovery
+procedure in [the protocol](../workflows/ship-fix/PROTOCOL.md#recovering-a-repo-review-fix-after-slice-acceptance).
+
 Use `make sync` after changing a role or model assignment, and `make check` to verify generated native files
 without writing:
 

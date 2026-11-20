@@ -34,6 +34,7 @@ goal was met. `ship-workflow` keeps those claims separate:
 - Implementation, review, and final gates run with separate context and separate permissions.
 - Every transition binds the current source, evidence, logs, and prior state by hash.
 - Repair budgets stop an endless review loop; extensions require an explicit user decision.
+- Already accepted slice integration repairs can resume the same repo lifecycle using the current gate and existing budget.
 - Completion is a certificate over verified evidence, not a status label written by the implementer.
 
 The result is a reviewed, verified, uncommitted working tree for a human to inspect and release.

@@ -294,7 +294,8 @@ as one standalone read-only command from the project root. This check is first: 
 telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, and author dispatch. It verifies the
 immutable history and reports the exact latest state path/hash, current limit, used/remaining passes,
 open finding IDs, full finding records, counts by severity, and whether current scoped source still matches that state. Never prepare a repair when
-`source_matches_state` is false; resolve the unexpected edit through the existing lifecycle first. Repeat the
+`source_matches_state` is false. For already accepted, checkpointed slice repairs, follow the repo repair
+recovery procedure below. Resolve other source drift before preparing a repair. Repeat the
 check immediately before each subsequent repair, including after a grant is applied.
 For a slice add `--slice SLICE` to inspect its independent budget and findings.
 
@@ -493,7 +494,7 @@ still needs a fresh review before acceptance.
 every slice is accepted, its touched files and predecessor states are unchanged since acceptance, and every repo
 change since the run start is owned by some slice. It records `slice_authors` and `cross_slice_criteria`.
 
-The repo-level lifecycle then runs unchanged over the WHOLE diff: `implemented` and `pre-review-passed` require
+The repo-level lifecycle then runs over the WHOLE diff. Both `implemented` and `pre-review-passed` require
 `slice_gate_path` (fresh for the current fingerprint) and, on `implemented`, `slice_authors` equal to the gate's.
 The repo matrix must prove every criterion as a whole; slice matrices are partial and never complete a
 cross-slice criterion. The final fresh review reads the entire scoped diff and all mandatory passes; slice
@@ -502,6 +503,40 @@ both sides, DI/wiring and shared files, duplicated or diverging behavior between
 non-goals, cross-slice criteria. Repo-level review-fix/gate-fix budgets (3/2) are unchanged and separate from the
 per-slice budgets. A final-pass fix that edits slice files uses `slice_id` (author routing) and then needs
 `integration-fix` re-acceptance of the touched slices and a new slice-gate before the repo returns to pre-review.
+
+#### Recovering a repo review fix after slice acceptance
+
+An orchestrator may record the repo repair after the slice authors finish their approved integration operations
+and all slices are accepted. Before starting these operations, check the repo budget against `needs-fix`.
+When resuming already accepted repairs, `review-budget` may report source drift and point to this procedure.
+Keep the current `needs-fix` as the recovery anchor. Capture the full repo scope and frozen dependencies,
+then run `slice-gate` with the repo's original initial manifest and the new capture. Use that same capture
+in the recovery transition.
+
+Write a run-local recovery JSON with `schema_version`, `run_id`, `repo`, and `previous_state`, `review`,
+`slice_gate` and `applied` references of the form `{"path": "ABSOLUTE_PATH", "sha256": "HASH"}`. Its `slices`
+map keys are the slice IDs whose accepted states changed since the reviewed gate. Each entry has
+`previous_state`, `checkpoint` and `accepted_state` references in the same form. Include dependency-only
+rechecks whose acceptances changed. The operation must start at the old accepted state and retain its
+checkpoint through the new acceptance. Each checkpoint needs existing user authorization after the repo review.
+The `finding_slices` map keys are the applied finding IDs. The values list their changed slice IDs and must
+cover every changed slice. Write the applied artifact as a new `round-ROUND-applied.json` in a repo round
+directory named `rounds-*`. It uses the ordinary `applied`, `failed`, `skipped` arrays and proves applied
+findings against the full final repo snapshot. The next repo reviewer adjudicates the findings.
+
+Use `transition --contract CONTRACT --repo REPO --file REQUEST --out NEXT_STATE` with a request containing
+`status: edited-unverified`, `action: review-fix`, `source_manifest` and `slice_repair_recovery_path`.
+The helper verifies the original and current accepted versions, all checkpoint bindings, current gate and
+the exact repo delta. It keeps the original author, scope, source dependencies and first-touch baselines.
+The sealed slice states supply the repair record for this transition. Use the existing phase records as written.
+One repo review-fix pass covers the whole recovery. At the cap, add `budget_grant_path` to the same request
+and use a normal user-approved `review-fix` grant against the exact `needs-fix` and review. Include
+`slice_repair_recovery_sha256` in this grant and bind it to the recovery JSON. This joint transition spends
+one granted pass and records the grant once. Apply ordinary grants before edits when starting new repair work.
+
+Resume at repo pre-review with the current full-scope matrix and fresh independent check evidence. Then obtain a fresh
+whole-repo review, required gates and requirement assessment. Repo scope amendments use the newly `reviewed`
+state and the applicable ordinary budget rules. Keep older states, reviews, author records and telemetry as written.
 
 ### Parallel batches (shared checkout, no worktrees)
 
@@ -747,7 +782,7 @@ prove preflight or any check passed. Capture phases for resumed agents too, not 
 
 ### Resumed repairs: record the actual envelope
 
-For every review-fix, gate-fix and acceptance/plan-gap repair:
+For each new review-fix, gate-fix and acceptance/plan-gap repair dispatched to an author:
 1. Choose a new unique phase_id across the run; write CLI inputs in `RUN_DIR/inputs/`, outside `telemetry/`.
 2. Before host's continuation capability, record phase-start via the existing phase CLI/write_once, with actual run_id,
    workflow, repo, original agent_id, session_id when known, action and round/attempt. Review-fix and
@@ -774,6 +809,8 @@ edits, but do not authorize a new source version: policy-enabled proof progressi
 implemented/edited-unverified source (initial submitted source before a from-review repair). Record the
 repair before re-entering review/gates/acceptance, even after terminal/block detours; restarting
 implementation cannot reset this anchor. Unchanged block/unblock remains supported.
+For the repo recovery transition after already accepted slice repairs, use the sealed slice evidence
+defined in "Recovering a repo review fix after slice acceptance".
 The guard does not mechanically prove host's continuation capability order.
 If a fresh-author repair pair was already written but omitted the required capsule binding, never rewrite the
 immutable phase records. A narrowly scoped, run-local `ship-phase-binding-recovery-v1` record may be used

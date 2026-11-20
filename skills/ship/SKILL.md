@@ -111,7 +111,7 @@ the host's continuation capability as before and repeat the helper-call invarian
 Dispatch implementer, reviewer and checker through the host adapter's agent capability with explicit absolute inputs and task context; record the returned agent ID and correlation metadata. Every spawn runs with fresh context (on Codex with explicit `fork_turns: "none"`); all required context is passed as files and paths, not chat history. Host-specific agent configuration selects the model. Do not request worktree isolation: the project root is not necessarily a Git repository, and author continuation requires agents to share the original source. On dispatch failure, stop and report the exact error; never substitute a model or launch a nested agent runner.
 Wrap every spawn/resume/gate/checkpoint wait with protocol phase telemetry. Write each boundary with the helper's flag form, for example `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py phase --contract CONTRACT --repo REPO --phase-id ID --phase review --event phase-start --out RUN_DIR/telemetry/ID-start.json` and the matching `--event phase-end --status passed|failed|blocked|interrupted --end-reason ...`; omit `--at` (the helper uses now) and `--session-id` (it reads `CODEX_SESSION_ID`/`CODEX_THREAD_ID`). Do not build phase JSON with `apply_patch` and do not call a clock tool for `at`. Wait for the actual phase result with one blocking wait using the longest timeout the host supports and all active targets together; do not poll in short loops (see the common section of HOST-ADAPTERS.md). Record actual agent/correlation
 IDs on phase-end; unknown IDs stay unknown. Record actual original_agent_id on implemented.
-For every repair use a new unique phase_id: phase-start before the host's continuation capability (or before the fresh spawn) to the current author →
+For every newly dispatched repair use a new unique phase_id: phase-start before the host's continuation capability (or before the fresh spawn) to the current author →
 wait for the specific actual result (delivery acknowledgement is not completion) → phase-end with actual
 passed|failed|blocked|interrupted → normal result/proof checks. Lost result leaves an open phase.
 Review-fix/gate-fix are separate; acceptance/plan-gap uses phase=review-fix, action=plan-gap. Both events
@@ -138,7 +138,11 @@ For an explicitly identified successor, declare and validate `successor_scopes` 
 dispatch, including per-slice decisions; follow the source, decision and accounting requirements in the protocol.
 It must precede repair telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation and author dispatch;
 use its current repo/state result to show the limit, used passes and open finding IDs. If source differs from
-the latest state, stop and resolve that drift. Repeat the check before each repair; after exhaustion, apply any
+the latest state because the slice authors already completed authorized integration repairs, follow
+"Recovering a repo review fix after slice acceptance" in the protocol. Record the accepted work as one
+repo review-fix and run fresh repo pre-review and whole-scope review. At exhaustion, use the user-approved
+grant bound to the recovery in the same transition. Resolve other source drift before preparing a repair.
+Repeat the check before each new repair; after exhaustion, apply any
 approved grant to the exact previous state before preparing the repair, then check again.
 When a repo reaches the standard review-fix cap (3), do not start a replacement run and do not route review
 findings through gate-fix.

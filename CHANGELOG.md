@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.3 - 2026-11-21
+
+### Bug Fixes
+
+- Resume repo review in the same run after slices reaccept authorized integration repairs. Record one repo
+  repair pass and require fresh whole-repo review.
+
 ## v1.3.2 - 2026-11-21
 
 ### Bug Fixes

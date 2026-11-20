@@ -1,6 +1,7 @@
 """Executable v2 lifecycle fixtures, without agents, Docker or product repositories."""
 
 import copy
+from datetime import datetime, timezone
 import importlib.util
 import json
 import os
@@ -2081,8 +2082,8 @@ class SliceLifecycleTests(unittest.TestCase):
             "criterion_id": "fix.ac-1", "part": "part " + slice_id, "assertion": "part asserted",
             "status": "unverified", "reason": "proved at whole-criterion acceptance", "evidence_paths": []}]))
 
-    def slice_review(self, slice_id, touched, round_number, findings=None, dispositions=None):
-        fingerprint = state.capture(self.repo, touched)["fingerprint"]
+    def slice_review(self, slice_id, touched, round_number, findings=None, dispositions=None, source=None):
+        fingerprint = (state.load(source) if source else state.capture(self.repo, touched))["fingerprint"]
         result = self.artifact(round=round_number, source_fingerprint=fingerprint, accepted=True,
             coverage={"read": touched, "skipped": [], "mandatory_passes": [
                 {"id": "logic", "status": "inspected", "reason": "checked", "sites": touched},
@@ -2995,6 +2996,396 @@ class SliceLifecycleTests(unittest.TestCase):
             workflow.validate_history(self.contract, "api")
         with self.assertRaisesRegex(ValueError, "accepted slices changed"):
             workflow.complete(self.contract, str(self.run / "completion.json"))
+
+    def start_repo_recovery(self, used_passes=0):
+        (self.repo / ".gitignore").write_text("vendor/\n")
+        (self.repo / "vendor").mkdir()
+        self.dependency = self.repo / "vendor/library.js"
+        self.dependency.write_text("dependency v1\n")
+        (self.repo / "doc.txt").write_text("documentation before\n")
+        for args in (["init", "-q"], ["add", "-A"],
+                     ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
+        self.c["telemetry_policy"] = {"repair_phase_required": True}
+        self.save("contract.json", self.c)
+        self.dependency_scope = self.save("dependency-scope.json", ["vendor/library.js"])
+        self.initial_repo = self.repo_capture()
+        self.bases["a"] = self.cap(["a.txt"])
+        self.repo_move("initialized", source_manifest=self.initial_repo, source_scope_path=self.dependency_scope)
+        self.repo_move("ready", preflight_path=self.save("preflight.json", self.artifact(
+            status="passed", evidence_paths=[self.evidence("env.runtime", "static", source=self.repo_capture())])))
+        self.accept("a", "a.txt")
+        self.bases["b"] = self.cap(["b.txt"])
+        self.accept("b", "b.txt")
+        self.old_gate_path = self.repo_gate("original-gate.json")[0]
+        self.repo_matrix = self.save("repo-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "both slices", "assertion": "whole criterion",
+            "status": "unverified", "reason": "independent acceptance pending", "evidence_paths": []}]))
+        self.repo_move("implemented", matrix_path=self.repo_matrix, slice_gate_path=self.old_gate_path,
+                       slice_authors={"a": "author-a", "b": "author-b"}, original_agent_id="original-1")
+        self.findings = [{
+            "id": f"api-{index}", "file": name + ".txt", "line": 1, "severity": "Warning",
+            "status": "new", "category": "Logic", "description": "output is incorrect",
+            "recommendation": "repair the output", "failure_scenario": "wrong output returned",
+            "verification_expectation": "inspect the corrected output", "criterion_ids": ["fix.ac-1"],
+            "verification_kind": "static",
+        } for index, name in enumerate(("a", "b"), 1)]
+        self.repo_findings(1)
+        for index in range(used_passes):
+            phase_id = LifecycleTests.repair_pair(self, f"prior-repair-{index}", action="review-fix")
+            result = self.save(f"prior-applied-{index}.json", self.artifact(round=index + 1, applied=[], failed=[],
+                skipped=[{"id": item["id"], "reason": "repair attempt left the finding open"} for item in self.findings]))
+            self.repo_move("edited-unverified", action="review-fix", repair_phase_id=phase_id, applied_path=result)
+            self.repo_findings(index + 2)
+        self.repo_before_path, self.repo_before = workflow.history(self.run / "api")[-1][1:]
+        self.original_slices = {identifier: self.slice_latest(identifier)[0] for identifier in ("a", "b")}
+        self.checkpoints = {}
+
+    def repo_capture(self, scope=None):
+        return self.cap(state.scope_paths(scope or self.repo_scope) + ["vendor/library.js"])
+
+    def repo_move(self, status, scope=None, **fields):
+        request = {"status": status, "source_manifest": fields.pop("source_manifest", None) or self.repo_capture(scope),
+                   **fields}
+        if status == "initialized":
+            request.update(scope_path=self.repo_scope, baseline_dir=str(self.base))
+        if scope:
+            request["scope_path"] = scope
+        self.counter += 1
+        request_path = self.save(f"repo-request-{self.counter}.json", request)
+        sequence = len(workflow.history(self.run / "api")) + 1
+        return workflow.transition(self.contract, "api", request_path,
+                                   str(self.run / "api" / f"state-{sequence}.json"))
+
+    def repo_findings(self, round_number):
+        self.repo_move("pre-review-passed", pre_review_evidence_paths=[
+            self.evidence("early.tests", source=self.repo_capture())])
+        findings = [{**item, "status": "recurring"} for item in self.findings] if round_number > 1 else self.findings
+        review_path = self.repo_review(round_number, findings=findings)
+        self.repo_move("needs-fix", review_path=review_path)
+
+    def repo_review(self, round_number, findings=None, dispositions=None, scope=None):
+        return self.slice_review("whole", state.scope_paths(scope or self.repo_scope),
+                                 round_number, findings, dispositions, source=self.repo_capture(scope))
+
+    def repo_gate(self, name, scope=None, amendment=None):
+        source = self.repo_capture(scope)
+        path = str(self.run / name)
+        workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo, source, path, amendment)
+        return path, source
+
+    def slice_latest(self, identifier):
+        return workflow.history(self.run / "api" / "slices" / identifier)[-1][1:]
+
+    @staticmethod
+    def reference(path):
+        return {"path": str(path), "sha256": workflow.sha(path)}
+
+    def authorize_repo_slice_repairs(self, edit_paths=None, recertify=()):
+        start = self.repo_capture()
+        starting = {}
+        for identifier in ("a", "b"):
+            path, event = self.slice_latest(identifier)
+            starting[identifier] = {"state_path": str(path), "state_sha256": workflow.sha(path),
+                                    "author_agent_id": event["author_agent_id"]}
+        self.repo_integration_auth = self.save(f"authorization-{self.counter}.json", self.artifact(
+            user_authorization="User approves repairs to the findings of the repo review",
+            approved_at=datetime.now(timezone.utc).isoformat(), contract_sha256=workflow.sha(self.contract),
+            schedule_sha256=workflow.sha(self.schedule), starting_slices=starting,
+            start_manifest_path=start, start_manifest_sha256=workflow.sha(start),
+            edit_paths=edit_paths if edit_paths is not None else {"a": ["a.txt"], "b": ["b.txt"]},
+            recertify_slices=list(recertify)))
+
+    def repo_slice_checkpoint(self, identifier, mode):
+        start = self.cap(["a.txt", "b.txt"])
+        anchor, event = self.slice_latest(identifier)
+        sibling = "a" if identifier == "b" else "b"
+        return self.save(f"checkpoint-{identifier}-{self.counter}.json", self.artifact(
+            slice_id=identifier, mode=mode, user_authorization="Approved repo integration repair",
+            author_agent_id=event["author_agent_id"], previous_state_path=str(anchor),
+            previous_state_sha256=workflow.sha(anchor), contract_sha256=workflow.sha(self.contract),
+            schedule_sha256=workflow.sha(self.schedule), authorization_path=self.repo_integration_auth,
+            authorization_sha256=workflow.sha(self.repo_integration_auth), start_manifest=start,
+            start_manifest_sha256=workflow.sha(start), at=datetime.now(timezone.utc).isoformat(),
+            slice_states={sibling: self.reference(self.slice_latest(sibling)[0])}))
+
+    def repair_repo_slice(self, identifier, *, mode="repair", finish=True, checkpointed=True):
+        previous = self.slice_latest(identifier)[1]
+        touched = [identifier + ".txt"]
+        fields = {}
+        if checkpointed:
+            self.checkpoints[identifier] = self.repo_slice_checkpoint(identifier, mode)
+            fields["integration_path"] = self.checkpoints[identifier]
+        if mode == "repair":
+            (self.repo / touched[0]).write_text(identifier + "2\n")
+            self.move_slice(identifier, "edited-unverified", touched, action="integration-fix", **fields)
+            fields = {}
+        else:
+            fields["action"] = "dependency-recheck"
+        self.move_slice(identifier, "pre-review-passed", touched, **fields, pre_review_evidence_paths=[
+            self.evidence("early.tests", source=self.cap(touched))])
+        if finish:
+            self.move_slice(identifier, "reviewed", touched,
+                            review_path=self.slice_review(identifier, touched, previous["latest_review_round"] + 1))
+            self.move_slice(identifier, "accepted", touched)
+
+    def prepare_repo_recovery(self, edited=("a", "b"), cite_source=False):
+        gate, self.repaired_source = self.repo_gate("recovery-gate.json")
+        applied = []
+        skipped = []
+        for item in self.findings:
+            if item["file"][0] in edited:
+                proof = self.evidence(item["id"], "static", source=self.repaired_source)
+                if cite_source:
+                    record = state.load(proof)
+                    source_file = str(self.repo / item["file"])
+                    record["artifact_paths"] = [source_file]
+                    record["artifact_hashes"] = workflow.seal_files([self.repaired_source, source_file])
+                    proof = self.save(f"source-proof-{item['id']}.json", record)
+                applied.append({"id": item["id"], "verification_kind": "static", "verified": "inspected repair",
+                                "evidence_paths": [proof]})
+            else:
+                skipped.append({"id": item["id"], "reason": "no repair attempted"})
+        self.applied = self.save("recovery-applied.json", self.artifact(
+            round=self.repo_before["latest_review_round"], applied=applied, failed=[], skipped=skipped))
+        self.recovery = self.artifact(
+            previous_state=self.reference(self.repo_before_path), review=self.reference(self.repo_before["review_path"]),
+            slice_gate=self.reference(gate), applied=self.reference(self.applied),
+            slices={identifier: {"previous_state": self.reference(self.original_slices[identifier]),
+                                 "accepted_state": self.reference(self.slice_latest(identifier)[0]),
+                                 "checkpoint": self.reference(checkpoint)}
+                    for identifier, checkpoint in self.checkpoints.items()},
+            finding_slices={item["id"]: [item["file"][0]] for item in self.findings if item["file"][0] in edited})
+        self.recovery_path = self.save("repo-recovery.json", self.recovery)
+
+    def recover_repo(self, **fields):
+        return self.repo_move("edited-unverified", **{
+            "source_manifest": self.repaired_source, "action": "review-fix",
+            "slice_repair_recovery_path": self.recovery_path, **fields})
+
+    def recovery_grant(self, **fields):
+        return self.save(f"recovery-grant-{len(fields)}.json", self.artifact(**{
+            "workflow": "fix", "purpose": "review-fix", "additional_passes": 1, "approved_by": "user",
+            "approved_at": datetime.now(timezone.utc).isoformat(), "reason": "Complete accepted slice repairs",
+            "approval_question": "Approve one repo repair pass?", "user_authorization": "Approve one pass",
+            "contract_sha256": workflow.sha(self.contract), "previous_state_path": str(self.repo_before_path),
+            "previous_state_sha256": workflow.sha(self.repo_before_path), "review_path": self.repo_before["review_path"],
+            "review_sha256": workflow.sha(self.repo_before["review_path"]),
+            "review_round": self.repo_before["latest_review_round"], "finding_ids": ["api-1", "api-2"],
+            "slice_repair_recovery_sha256": workflow.sha(self.recovery_path), **fields}))
+
+    def close_recovered_review(self):
+        self.repo_move("pre-review-passed", pre_review_evidence_paths=[
+            self.evidence("early.tests", source=self.repo_capture())])
+        packet = self.run / "recovery-packet"
+        workflow.packet(self.contract, "api", self.repo_scope, str(self.base), str(packet))
+        index = state.load(packet / "index.json")
+        self.assertEqual((self.applied, self.recovery_path), (index["applied_path"], index["slice_repair_recovery_path"]))
+        dispositions = [{"id": item["id"], "status": "resolved", "reason": "rechecked repo repair",
+                         "evidence_paths": [self.evidence(item["id"], "static", source=self.repo_capture(),
+                                                          producer="reviewer")]}
+                        for item in self.findings]
+        next_round = self.repo_before["latest_review_round"] + 1
+        slice_review = self.slice_latest("b")[1]["review_path"]
+        with self.assertRaisesRegex(ValueError, "fresh independent repo review"):
+            self.repo_move("reviewed", review_path=slice_review)
+        review_copy = self.run / "slice-review-copy.json"
+        review_copy.write_bytes(Path(slice_review).read_bytes())
+        with self.assertRaisesRegex(ValueError, "fresh independent repo review"):
+            self.repo_move("reviewed", review_path=str(review_copy))
+        with self.assertRaisesRegex(ValueError, "closed-finding adjudication"):
+            self.repo_move("reviewed", review_path=self.repo_review(next_round))
+        return self.repo_move("reviewed", review_path=self.repo_review(next_round, dispositions=dispositions))
+
+    def test_repo_recovery_after_both_slice_integration_fixes(self):
+        self.start_repo_recovery()
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        self.authorize_repo_slice_repairs()
+        self.repair_repo_slice("a")
+        with self.assertRaisesRegex(ValueError, "stale: predecessor a was re-accepted"):
+            self.repo_gate("dependency-stale.json")
+        self.repair_repo_slice("b")
+        self.prepare_repo_recovery(cite_source=True)
+        budget = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual(("needs-fix", False, ["api-1", "api-2"]),
+                         (budget["latest_status"], budget["source_matches_state"], budget["open_finding_ids"]))
+        self.assertIn("slice_repair_recovery_path", budget["next_step"])
+        with self.assertRaisesRegex(ValueError, "use slice repair recovery"):
+            self.repo_move("reviewed", review_path=self.repo_review(2))
+        originals = {path: path.read_bytes() for path in self.run.rglob("*") if path.is_file()}
+        recovered = self.recover_repo()
+        self.assertEqual(("edited-unverified", 1, 0, 1), (recovered["status"], recovered["review_fix_count"],
+                         recovered["gate_fix_count"], recovered["latest_review_round"]))
+        self.assertEqual(self.repo_before["current_author_agent_id"], recovered["current_author_agent_id"])
+        self.assertEqual(self.repo_before["slice_authors"], recovered["slice_authors"])
+        self.assertNotIn("repair_phase_id", recovered)
+        post_recovery = workflow.review_budget_status(self.contract, "api")
+        self.assertTrue(post_recovery["source_matches_state"])
+        self.assertEqual(["api-1", "api-2"], post_recovery["open_finding_ids"])
+        with self.assertRaisesRegex(ValueError, "Illegal transition"):
+            self.repo_move("reviewed", review_path=self.repo_review(2))
+        with self.assertRaisesRegex(ValueError, "fresh repo pre-review"):
+            self.repo_move("pre-review-passed",
+                           pre_review_evidence_paths=self.slice_latest("b")[1]["pre_review_evidence_paths"])
+        reviewed = self.close_recovered_review()
+        self.assertEqual(2, reviewed["latest_review_round"])
+        state.baseline(self.repo, self.base, "doc.txt")
+        reviewed_path = workflow.history(self.run / "api")[-1][1]
+        approved = self.save("scope-amendment.json", self.artifact(
+            approved_by="user", user_authorization="approve additional documentation",
+            approved_at=datetime.now(timezone.utc).isoformat(), reason="correct documentation for the repaired behavior",
+            contract_sha256=workflow.sha(self.contract), schedule_sha256=workflow.sha(self.schedule),
+            previous_state_path=str(reviewed_path), previous_state_sha256=workflow.sha(reviewed_path),
+            author_agent_id=reviewed["current_author_agent_id"], before_manifest=reviewed["source_manifest"],
+            before_manifest_sha256=workflow.sha(reviewed["source_manifest"]),
+            slice_states=state.load(reviewed["slice_gate_path"])["slices"], paths=["doc.txt"]))
+        phase = LifecycleTests.repair_pair(self, "approved-plan-gap")
+        (self.repo / "doc.txt").write_text("documentation after\n")
+        expanded = self.save("updated-scope.json", ["a.txt", "b.txt", "doc.txt"])
+        gate, source = self.repo_gate("amended-recovery-gate.json", expanded, approved)
+        self.repo_move("edited-unverified", scope=expanded, source_manifest=source, action="plan-gap",
+                       scope_amendment_path=approved, slice_gate_path=gate, repair_phase_id=phase)
+        self.repo_move("pre-review-passed", scope=expanded, pre_review_evidence_paths=[
+            self.evidence("early.tests", source=self.repo_capture(expanded))])
+        self.repo_move("reviewed", scope=expanded, review_path=self.repo_review(3, scope=expanded))
+        self.repo_move("gates-passed", scope=expanded, gate_evidence_paths=[
+            self.evidence("gate.tests", source=self.repo_capture(expanded))])
+        assessment = self.save("recovery-assessment.json", self.artifact(
+            producer="orchestrator", requirements_match=True,
+            criteria=[{"criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                       "reason": "original scenario checked",
+                       "evidence_paths": [self.evidence("fix.ac-1", source=self.repo_capture(expanded))]}]))
+        self.repo_move("verified", scope=expanded, assessment_path=assessment)
+        certificate = self.run / "completion.json"
+        workflow.complete(self.contract, certificate)
+        self.assertEqual(2, state.load(certificate)["repos"]["api"]["review_budget"]["used_passes"])
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        self.dependency.write_text("dependency v2 after run\n")
+        (self.repo / "a.txt").unlink()
+        history = workflow.validate_history(self.contract, "api")
+        self.assertEqual(("verified", 2), (history["latest_status"], history["review_fix_count"]))
+
+    def test_recovery_refuses_substituted_or_stale_checkpoint_gate_and_budget_fields(self):
+        self.start_repo_recovery()
+        self.authorize_repo_slice_repairs()
+        self.repair_repo_slice("a")
+        self.repair_repo_slice("b")
+        self.prepare_repo_recovery()
+        clone = self.save("unconsumed-checkpoint.json", state.load(self.checkpoints["a"]))
+        changed_checkpoint = copy.deepcopy(self.recovery)
+        changed_checkpoint["slices"]["a"]["checkpoint"] = self.reference(clone)
+        missing = copy.deepcopy(self.recovery)
+        del missing["finding_slices"]["api-2"]
+        gate = state.load(self.recovery["slice_gate"]["path"])
+        bad_gate = self.save("substituted-gate.json", {**gate, "slice_authors": {"a": "fake", "b": "author-b"}})
+        gate_bad_hash = {**self.recovery["slice_gate"], "sha256": "wrong"}
+        for label, body, message in (
+                ("checkpoint", changed_checkpoint, "does not seal the supplied checkpoint"),
+                ("stale-checkpoint", {**self.recovery, "slices": {
+                    **self.recovery["slices"], "a": {**self.recovery["slices"]["a"],
+                                                     "checkpoint": self.reference(self.checkpoints["b"])}}},
+                 "checkpoint is stale"),
+                ("gate-hash", {**self.recovery, "slice_gate": gate_bad_hash}, "slice_gate hash mismatch"),
+                ("gate", {**self.recovery, "slice_gate": self.reference(bad_gate)}, "differs from current acceptance"),
+                ("old-gate", {**self.recovery, "slice_gate": self.reference(self.old_gate_path)}, "Slice gate is stale"),
+                ("findings", missing, "bind each applied finding")):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, message):
+                self.recover_repo(slice_repair_recovery_path=self.save(f"invalid-recovery-{label}.json", body))
+        for key in ("review_fix_count", "review_fix_limit", "gate_fix_count", "latest_review_round"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "certified lifecycle|override lifecycle"):
+                self.recover_repo(**{key: 0})
+        self.authorize_repo_slice_repairs(edit_paths={}, recertify=("b",))
+        self.repair_repo_slice("b", mode="dependency-recheck", finish=False)
+        with self.assertRaisesRegex(ValueError, "Slice not accepted: b"):
+            self.recover_repo()
+        self.move_slice("b", "reviewed", ["b.txt"], review_path=self.slice_review("b", ["b.txt"], 3))
+        self.move_slice("b", "accepted", ["b.txt"])
+        with self.assertRaisesRegex(ValueError, "differs from current acceptance"):
+            self.recover_repo()
+        self.assertEqual(self.repo_before_path, workflow.history(self.run / "api")[-1][1])
+
+    def test_recovery_refuses_unconfirmed_and_foreign_source_and_changed_dependency(self):
+        self.start_repo_recovery()
+        self.authorize_repo_slice_repairs()
+        self.repair_repo_slice("b", checkpointed=False)
+        self.prepare_repo_recovery(edited=("b",))
+        with self.assertRaisesRegex(ValueError, "bind every reaccepted slice"):
+            self.recover_repo()
+        candidate_checkpoint = self.save("unrecorded-checkpoint.json", self.artifact(
+            previous_state_path=str(self.original_slices["b"]), authorization_path=self.repo_integration_auth))
+        unconfirmed = self.save("unconfirmed-recovery.json", {**self.recovery, "slices": {"b": {
+            "previous_state": self.reference(self.original_slices["b"]), "checkpoint": self.reference(candidate_checkpoint),
+            "accepted_state": self.reference(self.slice_latest("b")[0])}}})
+        with self.assertRaisesRegex(ValueError, "does not seal the supplied checkpoint"):
+            self.recover_repo(slice_repair_recovery_path=unconfirmed)
+        for path, message in ((self.repo / "source.txt", "outside repo scope"),
+                              (self.dependency, "frozen dependencies"),
+                              (self.repo / "b.txt", "stale: b.txt changed after acceptance")):
+            original = path.read_bytes()
+            with self.subTest(path=path):
+                path.write_text("unaccepted changes\n")
+                source = self.repo_capture()
+                gate = state.load(self.recovery["slice_gate"]["path"])
+                gate["source_fingerprint"] = state.load(source)["fingerprint"]
+                gate["artifact_hashes"].update(workflow.seal_files([source]))
+                candidate = self.save(f"gate-{path.name}.json", gate)
+                recovery = self.save(f"recovery-{path.name}.json",
+                                     {**self.recovery, "slice_gate": self.reference(candidate)})
+                with self.assertRaisesRegex(ValueError, message):
+                    self.recover_repo(source_manifest=source, slice_repair_recovery_path=recovery)
+                path.write_bytes(original)
+        self.assertEqual(self.repo_before_path, workflow.history(self.run / "api")[-1][1])
+
+    def test_recovery_at_cap_requires_a_bound_grant_and_counts_one_pass(self):
+        self.start_repo_recovery(used_passes=3)
+        self.authorize_repo_slice_repairs()
+        self.repair_repo_slice("a")
+        self.repair_repo_slice("b")
+        self.prepare_repo_recovery()
+        self.assertIn("user-approved budget grant", workflow.review_budget_status(self.contract, "api")["next_step"])
+        with self.assertRaisesRegex(ValueError, "budget exhausted"):
+            self.recover_repo()
+        original = self.repo_before_path.read_bytes()
+        self.repo_before_path.write_text(json.dumps({**self.repo_before, "review_fix_count": 0}))
+        with self.assertRaisesRegex(ValueError, "counter is not derived"):
+            self.recover_repo()
+        self.repo_before_path.write_bytes(original)
+        with self.assertRaisesRegex(ValueError, "grant must bind the recovery"):
+            self.recover_repo(budget_grant_path=self.recovery_grant(slice_repair_recovery_sha256="wrong"))
+        grant = self.recovery_grant()
+        recovered = self.recover_repo(budget_grant_path=grant)
+        self.assertEqual((4, 4, 4), (recovered["review_fix_count"], recovered["review_fix_limit"],
+                                     recovered["latest_review_round"]))
+        with self.assertRaisesRegex(ValueError, "requires needs-fix"):
+            self.recover_repo(budget_grant_path=grant)
+        history = workflow.validate_history(self.contract, "api")
+        self.assertEqual((4, 4, 1), (history["review_fix_count"], history["review_fix_limit"],
+                                     history["granted_additional_passes"]))
+        self.close_recovered_review()
+        self.authorize_repo_slice_repairs(edit_paths={}, recertify=("b",))
+        self.repair_repo_slice("b", mode="dependency-recheck")
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+
+    def test_recovery_includes_read_only_reacceptance_and_keeps_the_remaining_finding_open(self):
+        self.start_repo_recovery()
+        self.authorize_repo_slice_repairs(edit_paths={"a": ["a.txt"]}, recertify=("b",))
+        self.repair_repo_slice("a")
+        self.repair_repo_slice("b", mode="dependency-recheck")
+        self.prepare_repo_recovery(edited=("a",))
+        recovered = self.recover_repo()
+        result = state.load(recovered["applied_path"])
+        self.assertEqual(["api-1"], [item["id"] for item in result["applied"]])
+        self.assertEqual(["api-2"], [item["id"] for item in result["skipped"]])
+        self.repo_move("pre-review-passed", pre_review_evidence_paths=[
+            self.evidence("early.tests", source=self.repo_capture())])
+        dispositions = [{"id": "api-1", "status": "resolved", "reason": "rechecked against whole-source behavior",
+                         "evidence_paths": [self.evidence("api-1", "static", source=self.repo_capture(),
+                                                          producer="reviewer")]}]
+        self.repo_move("needs-fix", review_path=self.repo_review(
+            2, findings=[{**self.findings[1], "status": "recurring"}], dispositions=dispositions))
+        budget = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual((1, ["api-2"]), (budget["used_passes"], budget["open_finding_ids"]))
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
 
 
 class ParallelBatchTests(unittest.TestCase):

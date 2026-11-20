@@ -85,6 +85,11 @@ The orchestrator may split a large repository scope into approved slices. Slices
 histories and budgets, but the final repository review still reads the whole scoped diff and may reopen an
 accepted slice when a later edit invalidates it.
 
+When approved integration repairs reach slice acceptance before the repo repair is recorded, the repo can
+append an `edited-unverified` state using the original review, sealed slice checkpoint chains and a current
+slice gate. The transition spends one repository repair pass and starts the usual whole-repo review cycle.
+Historical validation uses the accepted state versions recorded by the gates.
+
 ## State and evidence
 
 A run lives in a unique directory under `plans/.ship-runs/` or `plans/.fix-runs/`. It contains:

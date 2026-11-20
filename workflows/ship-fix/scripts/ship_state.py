@@ -561,7 +561,7 @@ def applied(value, review):
             "Each finding must occur exactly once in applied/failed/skipped")
 
 
-def evidence(value, final, read_excludes=()):
+def evidence(value, final, read_excludes=(), *, historical=False):
     require(isinstance(value, dict), "Evidence must be an object")
     for field in ("criterion_id", "environment", "data_scope"):
         text(value.get(field), field)
@@ -584,7 +584,7 @@ def evidence(value, final, read_excludes=()):
     artifacts = value.get("artifact_paths")
     require(isinstance(artifacts, list) and bool(artifacts), "Missing evidence artifacts")
     for path in artifacts:
-        require(Path(path).is_absolute() and Path(path).is_file(), f"Missing absolute artifact: {path}")
+        require(Path(path).is_absolute() and (historical or Path(path).is_file()), f"Missing absolute artifact: {path}")
     after = checked_manifest(value["after_manifest"])
     match(checked_manifest(value["before_manifest"]), after)
     match_source(after, final, read_excludes)
