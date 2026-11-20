@@ -136,16 +136,20 @@ later change.
 
 ## Release
 
-1. Update `CHANGELOG.md` with the user-visible changes under the next version; add the release date when known.
-2. Run `make test`.
-3. Verify no project-specific names or paths remain.
-4. Commit, create an annotated semver tag, and push the tag:
+From the source checkout, invoke `/release vX.Y.Z` in Claude Code or `$release vX.Y.Z` in Codex.
+The skill is part of the source checkout. Publishing uses the checkout's GitHub `origin` and authenticated
+Git and GitHub CLI access.
 
-   ```bash
-   git tag -a v1.2.0 -m 'ship-workflow v1.2.0'
-   git push origin v1.2.0
-   ```
+1. Move the entries from `Unreleased` into a dated `vX.Y.Z` section in `CHANGELOG.md`.
+2. Verify that the release contents contain no project-specific names or paths, then commit them.
+3. The publisher runs `make test`, creates an annotated tag, installs that tag in a scratch project,
+   and runs `agent_models.py check`. It then pushes the tag and publishes the GitHub Release using the
+   exact version `vX.Y.Z` as its title and the matching changelog section as its notes.
 
-5. Install the tag into a scratch project and run `agent_models.py check` there.
+For a prepared, clean commit, the same publisher runs from the source root:
 
-Never move or rewrite a published tag. A release is a new tag, not a replacement snapshot.
+```sh
+python3 -I -B .agents/skills/release/scripts/publish.py vX.Y.Z
+```
+
+Retry an interrupted publication from the same commit. Keep published tags and releases intact.

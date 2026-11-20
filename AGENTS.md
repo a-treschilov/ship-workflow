@@ -30,7 +30,7 @@ and keeps no run state.
   product, company, team, repository or host prefix.
 - Keep one source of truth. Lifecycle rules live in `PROTOCOL.md`; host-specific tool names live in
   `HOST-ADAPTERS.md` and the platform files; role behavior lives in `roles/`.
-- Helpers run as one standalone command from the project root:
+- Installed lifecycle helpers run as one standalone command from the project root:
   `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. Do not combine a helper with `cd`,
   assignments, command substitution, loops, heredocs, pipelines, redirections or unrelated commands.
 - `agent_models.py` and `trusted_policy.py` resolve the project root from `SHIP_ROOT` or the nearest `.agents`
@@ -84,3 +84,6 @@ model gateway.
 Tag releases with annotated semver tags (`vX.Y.Z`) after updating `CHANGELOG.md` and passing `make test`. Never
 move or rewrite a published tag. Install the new tag into a scratch project and run `agent_models.py check`
 there before announcing the release.
+
+Use the source checkout's `release` skill to publish the tag and GitHub Release. The release title is the
+version string `vX.Y.Z`. See [Development](docs/DEVELOPMENT.md#release).

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- Publish an annotated tag and GitHub Release from the source checkout with the `release` skill.
+  The GitHub Release uses the version as its title.
+
 ## v1.3.3 - 2026-11-21
 
 ### Bug Fixes
