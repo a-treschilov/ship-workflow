@@ -208,6 +208,45 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual({"source.txt", "SOURCE.TXT"}, capture["files"].keys())
         self.assertEqual({"SOURCE.TXT"}, state.capture(self.repo, [], read_excludes=["source.txt"])["files"].keys())
 
+    def test_capture_nested_directories_with_read_excludes_preserves_manifest(self):
+        repo = self.repo.resolve()
+        nested = repo / "outer" / "inner"
+        nested.mkdir(parents=True)
+        tracked = "outer/inner/Tracked.TXT"
+        untracked = "outer/inner/Visible.txt"
+        (repo / tracked).write_text("tracked")
+        self.git("add", tracked)
+        (repo / untracked).write_text("untracked")
+        link = nested / "private-link"
+        link.symlink_to("private", target_is_directory=True)
+        read_excludes = ["outer/inner/private"]
+        previous = self.save("before.json", state.capture(repo, [], read_excludes=read_excludes))
+        previous_bytes = previous.read_bytes()
+
+        private = nested / "private"
+        private.mkdir()
+        (private / "protected.txt").write_text("protected")
+        metadata = nested / ".git"
+        metadata.mkdir()
+        (metadata / "config").write_text("metadata")
+        scan, listdir = os.scandir, os.listdir
+
+        def guarded(reader, path):
+            directory = Path(path)
+            for blocked in (private, metadata, link):
+                self.assertFalse(directory == blocked or blocked in directory.parents,
+                                 f"capture entered {directory}")
+            return reader(path)
+
+        with patch.object(state.os, "scandir", side_effect=lambda p: guarded(scan, p)), \
+                patch.object(state.os, "listdir", side_effect=lambda p: guarded(listdir, p)):
+            captured = state.capture(repo, [], read_excludes=read_excludes)
+        link_name = "outer/inner/private-link"
+        self.assertEqual({"source.txt", tracked, untracked, link_name}, captured["files"].keys())
+        self.assertEqual({"kind": "symlink", "target": "private"}, captured["files"][link_name])
+        state.match(state.checked_manifest(previous), captured)
+        self.assertEqual(previous_bytes, previous.read_bytes())
+
     def test_read_exclusion_prunes_both_spellings_before_descending(self):
         if not (self.repo / "SOURCE.TXT").exists():
             self.skipTest("filesystem distinguishes case")

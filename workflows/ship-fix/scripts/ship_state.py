@@ -226,7 +226,7 @@ def capture_once(root, scope, excludes, read_excludes=()):
         tracked = {p for p in git_paths(root, "--cached") if not forbidden_path(p)}
         if forbidden:
             # Avoid asking Git to traverse excluded directories during untracked discovery.
-            def walk(directory, prefix=""):
+            def walk(directory: Path, prefix=""):
                 with os.scandir(directory) as entries:
                     for entry in entries:
                         name = prefix + entry.name
@@ -234,7 +234,7 @@ def capture_once(root, scope, excludes, read_excludes=()):
                                 or names.intersects(name, forbidden)):
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            walk(entry.path, name + "/")
+                            walk(Path(entry.path), name + "/")
                         else:
                             others.add(name)
             walk(root)

@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.2 - 2026-11-21
+
+### Bug Fixes
+
+- Capture nested directories with read exclusions enabled when they contain Git metadata.
+
 ## v1.3.1 - 2026-11-20
 
 ### Bug Fixes
