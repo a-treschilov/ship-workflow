@@ -172,6 +172,105 @@ class WorkflowStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             state.baseline(self.repo, self.base, "source.txt")
 
+    def test_baseline_alias_uses_existing_first_touch_record(self):
+        if not (self.repo / "SOURCE.TXT").exists():
+            self.skipTest("filesystem distinguishes case")
+        state.baseline(self.repo, self.base, "source.txt")
+        state.baseline(self.repo, self.base, "SOURCE.TXT")
+        self.source.write_text("changed\n")
+        changes = state.delta(self.repo, self.base, ["SOURCE.TXT"])["changes"]
+        self.assertEqual("SOURCE.TXT", changes[0]["path"])
+        self.assertIn("+changed", changes[0]["diff"])
+        (self.base / "source.txt").write_text("tampered")
+        with self.assertRaisesRegex(ValueError, "Baseline was modified"):
+            state.baseline(self.repo, self.base, "SOURCE.TXT")
+
+    def test_capture_uses_tracked_spelling_for_walked_and_explicit_aliases(self):
+        if not (self.repo / "SOURCE.TXT").exists():
+            self.skipTest("filesystem distinguishes case")
+        self.source.rename(self.repo / "temporary.txt")
+        (self.repo / "temporary.txt").rename(self.repo / "SOURCE.TXT")
+        captured = state.capture(self.repo, [], read_excludes=["private"])
+        self.assertEqual({"source.txt"}, captured["files"].keys())
+        self.assertEqual(captured, state.capture(self.repo, ["SOURCE.TXT"], read_excludes=["private"]))
+        self.assertEqual(captured, state.capture(self.repo, ["SOURCE.TXT"]))
+        state.baseline(self.repo, self.base, "source.txt")
+        state.baseline(self.repo, self.base, "SOURCE.TXT")
+        (self.repo / "SOURCE.TXT").write_text("new\n")
+        self.assertEqual(1, len(state.delta(self.repo, self.base, ["source.txt", "SOURCE.TXT"])["changes"]))
+
+    def test_case_distinct_files_are_captured_separately(self):
+        alternate = self.repo / "SOURCE.TXT"
+        if alternate.exists():
+            self.skipTest("filesystem ignores case")
+        os.link(self.source, alternate)
+        capture = state.capture(self.repo, ["SOURCE.TXT"], read_excludes=["private"])
+        self.assertEqual({"source.txt", "SOURCE.TXT"}, capture["files"].keys())
+        self.assertEqual({"SOURCE.TXT"}, state.capture(self.repo, [], read_excludes=["source.txt"])["files"].keys())
+
+    def test_read_exclusion_prunes_both_spellings_before_descending(self):
+        if not (self.repo / "SOURCE.TXT").exists():
+            self.skipTest("filesystem distinguishes case")
+        private = self.repo / "Private"
+        private.mkdir()
+        (private / "tracked").write_text("protected")
+        self.git("add", "Private/tracked")
+        (private / "untracked").write_text("protected")
+        scan, listdir = os.scandir, os.listdir
+
+        def guarded(reader, path):
+            self.assertNotEqual(private, Path(path), "entered excluded directory")
+            return reader(path)
+
+        with patch.object(state.os, "scandir", side_effect=lambda p: guarded(scan, p)), \
+                patch.object(state.os, "listdir", side_effect=lambda p: guarded(listdir, p)):
+            read_excludes = ["private/tracked", "private", "SOURCE.TXT"]
+            self.assertEqual({}, state.capture(self.repo, [], read_excludes=read_excludes)["files"])
+            for name in ("Private/tracked", "source.txt"):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "read_excludes"):
+                    state.capture(self.repo, [name], read_excludes=read_excludes)
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            state.guard_excluded_path(self.repo / "PRIVATE/tracked", self.repo, ["Private"])
+
+    def test_manifest_alias_comparison_rejects_conflicting_or_stale_states(self):
+        if not (self.repo / "SOURCE.TXT").exists():
+            self.skipTest("filesystem distinguishes case")
+        legacy = {k: copy.deepcopy(self.manifest[k]) for k in ("repo_path", "head", "files")}
+        legacy["files"]["SOURCE.TXT"] = legacy["files"]["source.txt"]
+        legacy["fingerprint"] = state.digest(legacy)
+        path = self.save("legacy.json", legacy)
+        original_bytes = path.read_bytes()
+        state.match_source(state.checked_manifest(path), self.manifest)
+        with self.assertRaisesRegex(ValueError, "Stale certification"):
+            state.match(legacy, self.manifest)
+        conflicting = copy.deepcopy(legacy)
+        conflicting["files"]["SOURCE.TXT"] = state.MISSING
+        conflicting.pop("fingerprint")
+        conflicting["fingerprint"] = state.digest(conflicting)
+        path_conflict = self.save("conflicting.json", conflicting)
+        with self.assertRaisesRegex(ValueError, "Conflicting manifest entries"):
+            state.match_source(state.checked_manifest(path_conflict), self.manifest)
+        self.source.write_text("new source")
+        with self.assertRaisesRegex(ValueError, "Stale certification"):
+            state.match_source(state.checked_manifest(path), state.capture(self.repo, []))
+        self.assertEqual(original_bytes, path.read_bytes())
+
+    def test_unrecorded_alias_baseline_is_rejected(self):
+        if not (self.repo / "SOURCE.TXT").exists():
+            self.skipTest("filesystem distinguishes case")
+        self.base.mkdir()
+        (self.base / "source.txt").write_text("unrecorded")
+        with self.assertRaisesRegex(ValueError, "Unrecorded baseline"):
+            state.baseline(self.repo, self.base, "SOURCE.TXT")
+
+    def test_hard_links_keep_distinct_first_touch_records(self):
+        os.link(self.source, self.repo / "other.txt")
+        state.baseline(self.repo, self.base, "source.txt")
+        with self.assertRaisesRegex(ValueError, "Missing first-touch record"):
+            state.delta(self.repo, self.base, ["other.txt"])
+        state.baseline(self.repo, self.base, "other.txt")
+        self.assertTrue((self.base / ".ship-state" / (state.digest("other.txt") + ".json")).is_file())
+
     def test_non_git_requires_scope(self):
         plain = self.root / "plain"
         plain.mkdir()

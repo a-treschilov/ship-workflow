@@ -111,22 +111,30 @@ def scope_amendment(contract_path, value, repo, path, events, initial):
             "Scope amendment needs unique paths")
     root = Path(value["repo_paths"][repo])
     require((root / ".git").exists(), "Scope amendment requires a git repository")
-    tracked = {p.decode() for p in state.git(root, "ls-files", "-z", "--cached").split(b"\0") if p}
+    names = source_names(value, repo)
+    tracked = state.git_paths(root, "--cached")
+    require(len(names.keys(additions)) == len(additions), "Scope amendment needs unique source entries")
+    before_files, initial_files = names.files(before["files"]), names.files(initial["files"])
+    already_scoped = names.keys(anchor.get("scope", []) + anchor.get("source_scope", []))
     baseline_dir = Path(anchor["baseline_dir"])
     for name in additions:
         state.relative_path(name)
         require(not any(char in name for char in "*?[]"), "Scope amendment paths cannot be patterns")
         require(name in tracked, "Scope amendment path must be tracked")
-        require(not any(in_scope(name, item["write_scope"]) for item in slices),
+        key = names.key(name)
+        require(not any(in_scope(spelling, item["write_scope"], names)
+                        for item in slices for spelling in {name, key}),
                 "Scope amendment path belongs to an approved slice")
-        require(name not in anchor.get("scope", []) and name not in anchor.get("source_scope", []),
+        require(key not in already_scoped,
                 "Scope amendment path is already scoped")
-        require(before["files"].get(name, {"kind": "missing"}) == initial["files"].get(name, {"kind": "missing"}),
+        require(before_files.get(key, state.MISSING) == initial_files.get(key, state.MISSING),
                 "Scope amendment cannot adopt pre-existing source drift")
-        marker = baseline_dir / ".ship-state" / (state.digest(name) + ".json")
-        record = state.load(absolute_file(marker))
-        require(record.get("path") == name and record.get("state") == initial["files"].get(name) and
-                state.file_state(state.safe_path(baseline_dir, name)) == record["state"],
+        try:
+            record = state.baseline_record(root, baseline_dir, name)
+        except ValueError as error:
+            raise ValueError("Scope amendment needs a matching first-touch baseline") from error
+        require(record is not None and record.get("state") == initial_files.get(key) and
+                state.file_state(state.safe_path(baseline_dir, record["path"])) == record["state"],
                 "Scope amendment needs a matching first-touch baseline")
     return additions, [str(path), str(anchor_path), str(before_path), anchor["slice_gate_path"]]
 
@@ -410,9 +418,32 @@ def manifest(value, repo, path):
 
 def fresh(value, repo, path, scope, excludes=()):
     recorded = manifest(value, repo, path)
-    state.match(recorded, state.capture(value["repo_paths"][repo], scope, excludes,
-                                        value.get("read_excludes", {}).get(repo, [])))
+    read_excludes = value.get("read_excludes", {}).get(repo, [])
+    state.match_source(recorded, state.capture(value["repo_paths"][repo], scope, excludes, read_excludes), read_excludes)
     return recorded
+
+
+def source_names(value, repo):
+    return state.PathNames(Path(value["repo_paths"][repo]).resolve(), value.get("read_excludes", {}).get(repo, []))
+
+
+def event_manifest(value, repo, event):
+    source = manifest(value, repo, event["source_manifest"])
+    require(source["fingerprint"] == event["source_fingerprint"], "Source manifest does not match state fingerprint")
+    return source
+
+
+def review_source_matches(value, repo, previous, events, final):
+    fingerprint = previous.get("review_fingerprint")
+    if fingerprint == final["fingerprint"]:
+        return True
+    for _, _, event in reversed(events):
+        if (event["status"] in {"reviewed", "reviewed-with-findings"}
+                and event.get("review_path") == previous.get("review_path")
+                and event.get("source_fingerprint") == fingerprint):
+            return state.same_source(event_manifest(value, repo, event), final,
+                                     value.get("read_excludes", {}).get(repo, []))
+    return False
 
 
 def snapshot_deliverables(contract_path, repo, out_dir, criterion_ids=None):
@@ -561,6 +592,8 @@ def check_event_seals(value, repo, event, inherited_seals=None):
                               value.get("read_excludes", {}).get(repo, []))
     historical = manifest(value, repo, source_manifest_path)
     repo_root = Path(value["repo_paths"][repo]).resolve()
+    names = source_names(value, repo)
+    historical_files = historical["files"]
     inherited_seals = inherited_seals or {}
     immutable = {}
     for path, expected in seals.items():
@@ -571,7 +604,12 @@ def check_event_seals(value, repo, event, inherited_seals=None):
             immutable[path] = expected
             continue
 
-        source_entry = historical["files"].get(relative)
+        source_entry = historical_files.get(relative)
+        if source_entry is None:
+            candidates = {p: record for p, record in historical_files.items()
+                          if state.spelling_key(p) == state.spelling_key(relative)}
+            if candidates:
+                source_entry = names.files(candidates).get(names.key(relative))
         if source_entry and source_entry.get("kind") == "file" and source_entry.get("sha256"):
             historically_bound = source_entry["sha256"] == expected
             inherited_bound = inherited_seals.get(path) == expected
@@ -618,7 +656,7 @@ def proof(value, repo, path, final, identifier, producer=None, expected_status="
     for field in ("environment", "data_scope"):
         if expected.get(field):
             require(record.get(field) == expected[field], f"Wrong evidence {field}")
-    state.evidence(record, final)
+    state.evidence(record, final, value.get("read_excludes", {}).get(repo, []))
     paths = [path, record["before_manifest"], record["after_manifest"], *record["artifact_paths"]]
     hashes = record.get("artifact_hashes")
     require(isinstance(hashes, dict) and set(hashes) == set(paths[1:]), "Missing evidence artifact hashes")
@@ -628,8 +666,7 @@ def proof(value, repo, path, final, identifier, producer=None, expected_status="
         dep = manifest(value, dependency, dependency_path)
         _, excludes = (capture_policy(value["_contract_path"], dependency)
                        if value.get("_contract_path") else ([], []))
-        state.match(dep, state.capture(value["repo_paths"][dependency], list(dep["files"]), excludes,
-                                       value.get("read_excludes", {}).get(dependency, [])))
+        fresh(value, dependency, dependency_path, list(dep["files"]), excludes)
         paths.append(dependency_path)
     # A criterion spanning repositories must name the source versions it depends on.
     dependencies = set(expected.get("repos", [])) - {repo}
@@ -646,7 +683,7 @@ def finding_proof(value, repo, path, final, identifier, kind):
     require(identifier in {c["id"] for c in claims}, "Wrong finding proof")
     for claim in claims:
         state.text(claim.get("assertion"), "finding assertion")
-    state.evidence(record, final)
+    state.evidence(record, final, value.get("read_excludes", {}).get(repo, []))
     paths = [record["before_manifest"], record["after_manifest"], *record["artifact_paths"]]
     hashes = record.get("artifact_hashes")
     require(isinstance(hashes, dict) and set(hashes) == set(paths), "Missing finding artifact hashes")
@@ -759,7 +796,9 @@ def review(value, repo, path, final, scope, prior_paths, run_root=None, evidence
         state.relative_path(p)
     covered = reads + [e["path"] for e in skips]
     require(len(set(covered)) == len(covered), "Duplicate review coverage")
-    require(set(scope) <= set(covered), "Review omits scoped paths")
+    names = source_names(value, repo)
+    scope_keys = names.keys(scope)
+    require(scope_keys <= names.keys(covered), "Review omits scoped paths")
     passes = coverage.get("mandatory_passes")
     unique_ids(passes, "mandatory passes")
     require(set(value["required_passes"][repo]) <= {p["id"] for p in passes}, "Missing rubric pass")
@@ -785,7 +824,7 @@ def review(value, repo, path, final, scope, prior_paths, run_root=None, evidence
             sealed += finding_proof(value, repo, p, final, item["id"], kind)
     for item in result["findings"]:
         require(item.get("verification_kind") in {"static", "empirical"}, "Finding lacks verification kind")
-        if item["file"] not in scope:
+        if names.key(item["file"]) not in scope_keys:
             require(run_root is not None and result.get("finding_path_root") == str(run_root),
                     "Finding must anchor scoped cause or sealed run-local evidence")
             anchor = (run_root / item["file"]).resolve()
@@ -1742,6 +1781,7 @@ def transition(contract_path, repo, request_path, out):
         acceptance_path = accept_review_findings(contract_path, value, repo, events, request, final)
     initial_path = previous.get("initial_manifest", source_path)
     initial = manifest(value, repo, initial_path)
+    names = source_names(value, repo)
     if previous.get("scope_amendment_path"):
         require(request.get("scope_amendment_path", previous["scope_amendment_path"]) ==
                 previous["scope_amendment_path"], "Cannot remove or replace scope amendment")
@@ -1762,9 +1802,8 @@ def transition(contract_path, repo, request_path, out):
             require(str(events[-1][1]) == state.load(amendment_path)["previous_state_path"],
                     "Scope amendment anchor is not current")
             before_amendment = manifest(value, repo, anchor["source_manifest"])
-            delta_paths = {name for name in set(before_amendment["files"]) | set(final["files"])
-                           if before_amendment["files"].get(name) != final["files"].get(name)}
-            require(delta_paths <= set(additions), "Scope amendment changed unapproved source")
+            delta_paths = names.changed(before_amendment, final)
+            require(delta_paths <= names.keys(additions), "Scope amendment changed unapproved source")
             gate_path = absolute_file(request.get("slice_gate_path"))
             gate = state.load(gate_path)
             bound(value, repo, gate)
@@ -1775,9 +1814,8 @@ def transition(contract_path, repo, request_path, out):
             amendment_seals.append(str(gate_path))
     elif repo in value.get("slice_schedules", {}) and before in {"implemented", "pre-review-passed", "needs-fix", "reviewed", "gates-passed", "verified"}:
         require(set(scope) == set(previous["scope"]), "Sliced repo scope expansion requires amendment")
-    changed = {p for p in set(initial["files"]) | set(final["files"])
-               if initial["files"].get(p) != final["files"].get(p)}
-    require(changed <= set(scope), "Changes outside touched scope; resolve ownership first")
+    changed = names.changed(initial, final)
+    require(changed <= names.keys(scope), "Changes outside touched scope; resolve ownership first")
     if policy:
         accepted = [event for _, _, event in events
                     if event["status"] in {"implemented", "edited-unverified"}]
@@ -1789,8 +1827,8 @@ def transition(contract_path, repo, request_path, out):
             # A blocker/handoff may truthfully capture partially edited source, but must not
             # silently make that source the accepted implementation on unblock. Only initial
             # implementation or an explicitly recorded repair can advance this version anchor.
-            anchor = accepted[-1]["source_fingerprint"] if accepted else initial["fingerprint"]
-            require(final["fingerprint"] == anchor,
+            anchor = event_manifest(value, repo, accepted[-1]) if accepted else initial
+            require(state.same_source(final, anchor, names.read_excludes),
                     "Source changed without recorded repair; record edited-unverified with repair_phase_id "
                     "(or explicit from-review author_handoff)")
     sealed = [contract_path, source_path, request_path, *amendment_seals]
@@ -1843,13 +1881,14 @@ def transition(contract_path, repo, request_path, out):
         baseline_dir = data.get("baseline_dir")
         require(isinstance(baseline_dir, str) and Path(baseline_dir).is_absolute(), "Missing first-touch baseline directory")
         delta = state.delta(value["repo_paths"][repo], baseline_dir, scope)
+        initial_files = names.files(initial["files"])
         for entry in delta["changes"]:
-            require(entry["before"] == initial["files"].get(entry["path"], {"kind": "missing"}),
+            require(entry["before"] == initial_files.get(names.key(entry["path"]), state.MISSING),
                     "First-touch baseline differs from run start; resolve concurrent edits")
     if status == "initialized":
         require(not events and not changed, "Initialization must precede implementation")
     if status in {"ready", "preflight-blocked"}:
-        require(final["fingerprint"] == initial["fingerprint"], "Preflight must precede source edits")
+        require(state.same_source(final, initial, names.read_excludes), "Preflight must precede source edits")
         pre, paths = preflight(value, repo, request.get("preflight_path"), initial)
         require((pre["status"] == "passed") == (status == "ready"), "Wrong preflight transition")
         sealed += paths
@@ -1965,7 +2004,7 @@ def transition(contract_path, repo, request_path, out):
         sealed += paths
     if status in {"gates-passed", "verified"}:
         sealed += validate_deliverables(value, repo, previous.get("deliverable_manifest_path"))
-        require(previous.get("review_fingerprint") == final["fingerprint"], "Review is stale")
+        require(review_source_matches(value, repo, previous, events, final), "Review is stale")
         require(not state.load(absolute_file(data["review_path"]))["findings"]
                 or data.get("review_acceptance_path"), "Review has open findings")
         sealed += check_set(value, repo, "required_gates", data.get("gate_evidence_paths"), final)
@@ -2028,10 +2067,12 @@ def glob_regex(pattern):
     return "".join(out)
 
 
-def in_scope(path, patterns):
+def in_scope(path, patterns, names=None):
     for pattern in patterns:
         if not re.search(r"[*?]", pattern):
-            if path == pattern.rstrip("/") or path.startswith(pattern.rstrip("/") + "/"):
+            literal = pattern.rstrip("/")
+            if (path == literal or path.startswith(literal + "/")
+                    or names is not None and names.intersects(path, [literal])):
                 return True
             continue
         if re.fullmatch(glob_regex(pattern), path):
@@ -2106,9 +2147,9 @@ def integration_resume(value, repo, run, authorization, start, events, slice_id)
         require(isinstance(names, list) and names and set(names) <= set(prior_auth.get("partial_slices", {}).get(owner, [])),
                 "Resume repair exceeds the checkpointed partial paths")
         paths.update(names)
-    changed = {name for name in set(before["files"]) | set(start["files"])
-               if before["files"].get(name, {"kind": "missing"}) != start["files"].get(name, {"kind": "missing"})}
-    require(changed <= paths, "Resume changed source outside the authorized partial repair")
+    names = source_names(value, repo)
+    changed = names.changed(before, start, missing=state.MISSING)
+    require(changed <= names.keys(paths), "Resume changed source outside the authorized partial repair")
     require(before["head"] == start["head"], "Integration resume HEAD changed")
     require(timestamp(paused["at"]) <= timestamp(resume.get("approved_at")) <=
             timestamp(authorization.get("approved_at")), "Invalid integration resume approval time")
@@ -2122,7 +2163,8 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
     """Bind a sequential reopen to certified sibling versions, never a replacement base."""
     path = request.get("integration_path") or previous.get("integration_path")
     if not path:
-        return set(), []
+        return set(), [], {}
+    names = source_names(value, repo)
     path = absolute_file(path)
     run = Path(contract_path).parent.resolve()
     require(path.resolve().is_relative_to(run), "Integration checkpoint must be run-local")
@@ -2154,7 +2196,8 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
     mode = checkpoint.get("mode")
     require(mode in {"repair", "dependency-recheck"}, "Invalid integration mode")
     allowed = authorization.get("edit_paths", {}).get(slice_id, [])
-    require(isinstance(allowed, list) and all(in_scope(name, items[slice_id]["write_scope"]) for name in allowed),
+    write_scope = items[slice_id]["write_scope"]
+    require(isinstance(allowed, list) and all(in_scope(name, write_scope, names) for name in allowed),
             "Invalid authorized integration paths")
     if mode == "repair":
         require(allowed, "Slice has no authorized integration edits")
@@ -2178,10 +2221,15 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
     anchored_source = manifest(value, repo, anchored["source_manifest"])
     require(auth_start["head"] == anchored_source["head"] == start["head"] == final["head"],
             "Integration HEAD changed")
-    require(all(start["files"].get(name, {"kind": "missing"}) ==
-                final["files"].get(name, {"kind": "missing"})
-                for name in set(start["files"]) | set(final["files"])
-                if not in_scope(name, items[slice_id]["write_scope"])),
+    start_files, final_files = names.files(start["files"]), names.files(final["files"])
+    spellings = names.spellings(start["files"].keys() | final["files"].keys() | set(anchored["touched"]))
+
+    def target_path(name):
+        return any(in_scope(path, write_scope, names) for path in spellings.get(name, {name}))
+
+    changes = names.changed(start, final)
+    own_changes = {name for name in changes if target_path(name)}
+    require(names.changed(start, final, missing=state.MISSING) <= own_changes,
             "Integration foreign source changed outside target scope")
     resumed, resume_seals = integration_resume(value, repo, run, authorization, start, events, slice_id)
     if resumed is not None:
@@ -2203,22 +2251,18 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
                  and request.get("action") == "dependency-recheck"),
                 "Integration starts with its authorized repair or dependency recheck")
         origin = resumed[1] if resumed is not None else anchored
-        for name in anchored["touched"]:
-            require(start["files"].get(name, {"kind": "missing"}) ==
-                    manifest(value, repo, origin["source_manifest"])["files"].get(name, {"kind": "missing"}),
+        origin_files = names.files(manifest(value, repo, origin["source_manifest"])["files"])
+        for name in names.keys(anchored["touched"]):
+            require(start_files.get(name, state.MISSING) == origin_files.get(name, state.MISSING),
                     "Integration start differs from the anchored slice source")
             if resumed is not None:
-                require(final["files"].get(name, {"kind": "missing"}) ==
-                        start["files"].get(name, {"kind": "missing"}),
+                require(final_files.get(name, state.MISSING) == start_files.get(name, state.MISSING),
                         "Integration resume cannot add target source edits")
     require(request.get("base_manifest", previous["base_manifest"]) == previous["base_manifest"],
             "Integration cannot replace the original slice base")
     require(set(request.get("touched", previous["touched"])) == set(previous["touched"]),
             "Integration checkpoint cannot expand the slice touched scope")
-    own_changes = {name for name in set(start["files"]) | set(final["files"])
-                   if in_scope(name, items[slice_id]["write_scope"])
-                   and start["files"].get(name) != final["files"].get(name)}
-    require(own_changes <= set(allowed) if mode == "repair" else not own_changes,
+    require(own_changes <= names.keys(allowed) if mode == "repair" else not own_changes,
             "Source changed outside the authorized integration edits")
     foreign = set()
     sealed = [str(path), str(authorization_path), str(anchor), str(start_path), str(auth_start_path), *resume_seals]
@@ -2226,6 +2270,7 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
     require(isinstance(bindings, dict) and slice_id not in bindings, "Invalid integration sibling bindings")
     require(set(bindings) == set(authorization.get("starting_slices", {})) - {slice_id},
             "Integration checkpoint omits an authorized sibling binding")
+    verified_bindings = {}
     for identifier, binding in bindings.items():
         require(identifier in items, "Unknown integration sibling")
         directory = run / repo / "slices" / identifier
@@ -2236,6 +2281,7 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
                 and binding["sha256"] == sha(event_path),
                 "Integration sibling state changed")
         require(event.get("status") == "accepted", "Integration sibling is not accepted")
+        verified_bindings[identifier] = binding
         inherited = {}
         for _, _, historical in sibling_events:
             bound(value, repo, historical)
@@ -2244,16 +2290,18 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
             check_event_seals(value, repo, historical, inherited)
             inherited = historical.get("artifact_hashes", {})
         for name, recorded in event["accepted_files"].items():
-            require(in_scope(name, items[identifier]["write_scope"]), "Sibling path outside its approved scope")
-            require(start["files"].get(name, {"kind": "missing"}) == recorded,
+            require(in_scope(name, items[identifier]["write_scope"], names), "Sibling path outside its approved scope")
+            key = names.key(name)
+            require(start_files.get(key, state.MISSING) == recorded,
                     "Integration sibling does not match its acceptance")
-            require(final["files"].get(name, {"kind": "missing"}) == recorded,
+            require(final_files.get(key, state.MISSING) == recorded,
                     "Integration sibling source changed")
-            foreign.add(name)
+            foreign.add(key)
         sealed.append(str(event_path))
     partial = checkpoint.get("partial_slices", {})
     require(isinstance(partial, dict), "Invalid partial integration slices")
     authorized_partial = authorization.get("partial_slices", {})
+    authorized_files = names.files(auth_start["files"])
     require(partial == authorized_partial, "Integration checkpoint omits authorized partial provenance")
     for identifier, paths in partial.items():
         require(identifier in items and identifier != slice_id and identifier not in bindings,
@@ -2262,19 +2310,18 @@ def integration_checkpoint(value, repo, contract_path, plan, items, slice_id, pr
         require(isinstance(paths, list) and paths == authorized_partial.get(identifier),
                 "Partial integration paths lack explicit authorization")
         for name in paths:
-            require(in_scope(name, items[identifier]["write_scope"]), "Partial path outside its approved scope")
-            recorded = auth_start["files"].get(name, {"kind": "missing"})
-            require(recorded != {"kind": "missing"}, "Partial integration path missing from authorized snapshot")
-            require(start["files"].get(name) == recorded and final["files"].get(name) == recorded,
+            require(in_scope(name, items[identifier]["write_scope"], names), "Partial path outside its approved scope")
+            key = names.key(name)
+            recorded = authorized_files.get(key, state.MISSING)
+            require(recorded != state.MISSING, "Partial integration path missing from authorized snapshot")
+            require(start_files.get(key) == recorded and final_files.get(key) == recorded,
                     "Partial integration source changed")
-            foreign.add(name)
+            foreign.add(key)
         sealed.append(authorization["start_manifest_path"])
     base = manifest(value, repo, anchored["base_manifest"])
-    foreign_at_start = {name for name in set(base["files"]) | set(start["files"])
-                        if not in_scope(name, items[slice_id]["write_scope"])
-                        and base["files"].get(name) != start["files"].get(name)}
+    foreign_at_start = {name for name in names.changed(base, start) if not target_path(name)}
     require(foreign_at_start <= foreign, "Integration checkpoint omits foreign source provenance")
-    return foreign, sealed
+    return foreign, sealed, verified_bindings if entering else {}
 
 
 def predecessor_provenance(value, repo, contract_path, items, slice_id, final, request):
@@ -2284,6 +2331,8 @@ def predecessor_provenance(value, repo, contract_path, items, slice_id, final, r
     require(set(bindings) == set(items[slice_id]["depends_on"]),
             "Predecessor provenance must bind every dependency exactly")
     run = Path(contract_path).parent.resolve()
+    names = source_names(value, repo)
+    final_files = names.files(final["files"])
     covered, sealed = {}, []
     for identifier in sorted(bindings):
         binding = bindings[identifier]
@@ -2296,12 +2345,14 @@ def predecessor_provenance(value, repo, contract_path, items, slice_id, final, r
         bound(value, repo, event)
         require(event.get("status") == "accepted", "Predecessor is not accepted")
         for name, recorded in event["accepted_files"].items():
-            require(in_scope(name, items[identifier]["write_scope"]), "Predecessor path outside its approved scope")
-            covered[name] = recorded
+            require(in_scope(name, items[identifier]["write_scope"], names), "Predecessor path outside its approved scope")
+            key = names.key(name)
+            require(key not in covered or covered[key] == recorded, "Conflicting predecessor file states")
+            covered[key] = recorded
         sealed.append(str(event_path))
     # Only paths whose current bytes equal the predecessor's accepted bytes are foreign-provenanced.
     matched = {name for name, recorded in covered.items()
-               if final["files"].get(name, {"kind": "missing"}) == recorded}
+               if final_files.get(name, state.MISSING) == recorded}
     return matched, sealed
 
 
@@ -2380,6 +2431,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
             "Exhausted slice needs explicit human continuation")
     expected_out = directory / f"state-{len(events) + 1}.json"
     require(Path(out).resolve() == expected_out.resolve(), "Slice transition output must be next immutable state")
+    names = source_names(value, repo)
     group = next(g for g in plan["groups"] if slice_id in g)
     barrier_path = request.get("batch_barrier_path") or previous.get("batch_barrier_path")
     siblings = set()
@@ -2394,7 +2446,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
                 "A batch member's base is the batch start manifest")
         request.setdefault("base_manifest", barrier["base_manifest"])
         if status == "implemented":
-            require(sorted(request.get("touched", [])) == sorted(barrier["owned"][slice_id]),
+            require(names.keys(request.get("touched", [])) == names.keys(barrier["owned"][slice_id]),
                     "Touched files must equal what the barrier attributed to this slice")
         for other, paths in barrier["owned"].items():
             if other != slice_id:
@@ -2403,7 +2455,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     base = manifest(value, repo, base_path)
     touched = sorted(set(previous.get("touched", [])) | set(request.get("touched", [])))
     require(set(previous.get("touched", [])) <= set(touched), "Slice touched files must not shrink")
-    outside = [p for p in touched if not in_scope(p, item["write_scope"])]
+    outside = [p for p in touched if not in_scope(p, item["write_scope"], names)]
     require(not outside, "Touched file outside slice write_scope: " + ", ".join(outside))
     final = fresh(value, repo, request.get("source_manifest"), touched)
     if accepting:
@@ -2416,11 +2468,12 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         require(final["fingerprint"] == previous["source_fingerprint"], "Continuation source must be unchanged")
         require(touched == previous["touched"] and base_path == previous["base_manifest"],
                 "Continuation cannot change source scope or base")
-    foreign, integration_seals = integration_checkpoint(
+    foreign, integration_seals, new_bindings = integration_checkpoint(
         value, repo, contract_path, plan, items, slice_id, previous, events, request, final)
+    final_files = names.files(final["files"])
     require(not dependency_recheck or integration_seals, "Dependency recheck needs integration authorization")
     if dependency_recheck:
-        require(all(final["files"].get(name, {"kind": "missing"}) == recorded
+        require(all(final_files.get(names.key(name), state.MISSING) == recorded
                     for name, recorded in previous["accepted_files"].items()),
                 "Dependency recheck cannot change this slice's source")
     bound_predecessors = previous.get("predecessor_states")
@@ -2428,19 +2481,31 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         require(status == "implemented" and not events,
                 "Predecessor provenance only accompanies the first implementation")
         bound_predecessors = request["predecessor_states"]
+    if bound_predecessors is not None and new_bindings:
+        bound_predecessors = {identifier: new_bindings.get(identifier, binding)
+                              for identifier, binding in bound_predecessors.items()}
+    if integration_seals:
+        require(set(items[slice_id]["depends_on"]) <= accepted_slices(
+            contract_path, repo, set(items[slice_id]["depends_on"])),
+            "Slice predecessors need current source and dependency acceptance")
     predecessor, predecessor_seals = set(), []
     if bound_predecessors is not None:
         predecessor, predecessor_seals = predecessor_provenance(
             value, repo, contract_path, items, slice_id, final, {"predecessor_states": bound_predecessors})
-    changed = {p for p in set(base["files"]) | set(final["files"]) if base["files"].get(p) != final["files"].get(p)}
-    require(changed <= set(touched) | siblings | foreign | predecessor,
+    changed = names.changed(base, final)
+    unowned = changed - names.keys(touched) - names.keys(siblings) - foreign - predecessor
+    require(not unowned,
             "Changes outside the slice's declared touched files: "
-            + ", ".join(sorted(changed - set(touched) - siblings - foreign - predecessor)))
+            + ", ".join(sorted(unowned)))
     data = {**previous, **request, "schema_version": VERSION, "run_id": value["run_id"], "repo": repo,
             "slice_id": slice_id, "sequence": len(events) + 1, "at": datetime.now(timezone.utc).isoformat(),
             "schedule_sha256": plan["schedule_sha256"], "base_manifest": base_path, "touched": touched,
             "batch_barrier_path": barrier_path,
             "source_fingerprint": final["fingerprint"]}
+    if bound_predecessors is not None:
+        data["predecessor_states"] = bound_predecessors
+    if integration_seals:
+        data["integration_path"] = integration_seals[0]
     for key in ("review_fix_count", "latest_review_round"):
         data[key] = previous.get(key, 0)
     if not events and continuity:
@@ -2527,7 +2592,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         data["review_fingerprint"] = final["fingerprint"]
         sealed += paths
     if status == "accepted":
-        require(previous.get("review_fingerprint") == final["fingerprint"], "Slice review is stale")
+        require(review_source_matches(value, repo, previous, events, final), "Slice review is stale")
         accepted_review = state.load(absolute_file(previous["review_path"]))
         require(not accepted_review["findings"] or previous.get("review_acceptance_path"),
                 "Slice review has open findings")
@@ -2537,7 +2602,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
                 continue
             require(accepted_review.get("amendment_sha256") in requirement_amendment_suffix(value, applied["criterion_id"]),
                     "Slice acceptance requires review of amended requirement")
-        data["accepted_files"] = {p: final["files"].get(p, {"kind": "missing"}) for p in touched}
+        data["accepted_files"] = {p: final_files.get(names.key(p), state.MISSING) for p in touched}
         data["dependency_states"] = {}
         require(set(item["depends_on"]) <= accepted_slices(contract_path, repo, set(item["depends_on"])),
                 "Slice predecessors need current source and dependency acceptance")
@@ -2640,20 +2705,19 @@ def slice_gate(contract_path, repo, schedule_path, initial_path, source_path, ou
     else:
         require(not amendment_path, "Scope amendment requires repo history")
     final = fresh(value, repo, source_path, sorted(touched | set(dependency_scope) | set(additions)), exclusions)
+    names = source_names(value, repo)
+    final_files = names.files(final["files"])
     for identifier, (_, path, event) in latest.items():
         for name, recorded in event["accepted_files"].items():
-            require(final["files"].get(name, {"kind": "missing"}) == recorded,
+            require(final_files.get(names.key(name), state.MISSING) == recorded,
                     f"Slice {identifier} is stale: {name} changed after acceptance; re-review it")
         for dep, dep_sha in event["dependency_states"].items():
             require(sha(latest[dep][1]) == dep_sha, f"Slice {identifier} is stale: predecessor {dep} was re-accepted")
-    changed = {p for p in set(initial["files"]) | set(final["files"]) if initial["files"].get(p) != final["files"].get(p)}
-    require(changed <= touched | set(additions), "Repo changes not owned by any accepted slice: " +
-            ", ".join(sorted(changed - touched - set(additions))))
+    unowned = names.changed(initial, final) - names.keys(touched | set(additions))
+    require(not unowned, "Repo changes not owned by any accepted slice: " + ", ".join(sorted(unowned)))
     if amendment_path:
         before = manifest(value, repo, state.load(amendment_path)["before_manifest"])
-        amendment_delta = {p for p in set(before["files"]) | set(final["files"])
-                           if before["files"].get(p) != final["files"].get(p)}
-        require(amendment_delta <= set(additions), "Scope amendment changed unapproved source")
+        require(names.changed(before, final) <= names.keys(additions), "Scope amendment changed unapproved source")
     record = {"schema_version": VERSION, "run_id": value["run_id"], "repo": repo,
                            "source_fingerprint": final["fingerprint"], "slice_authors": authors,
                            "amendment_sha256": value.get("_amendment", {}).get("sha256"),
@@ -2730,24 +2794,30 @@ def batch_barrier(contract_path, repo, schedule_path, start_path, manifest_path,
         require(result.get("status") in {"passed", "failed", "blocked", "interrupted"}, "Invalid writer status")
     base = manifest(value, repo, start["base_manifest"])
     final = fresh(value, repo, manifest_path, start["scope"])
-    changed = sorted(p for p in set(base["files"]) | set(final["files"]) if base["files"].get(p) != final["files"].get(p))
+    names = source_names(value, repo)
+    spellings = names.spellings(base["files"].keys() | final["files"].keys())
+    reported = {names.key(path): path for path in sorted(base["files"])}
+    reported.update({names.key(path): path for path in sorted(final["files"])})
+    changed = sorted(names.changed(base, final))
     owned, violations = {i: [] for i in start["members"]}, []
     if base.get("head") != final.get("head"):
         violations.append("git HEAD moved during the batch")
     for path in changed:
-        owners = [i for i in start["members"] if in_scope(path, start["write_scopes"][i])]
+        owners = [i for i in start["members"]
+                  if any(in_scope(name, start["write_scopes"][i], names) for name in spellings[path])]
         if len(owners) == 1:
-            owned[owners[0]].append(path)
+            owned[owners[0]].append(reported[path])
         else:
             violations.append(f"{path}: " + ("no member owns it" if not owners else "several members own it"))
     if not violations and changed:
         try:
-            delta = state.delta(value["repo_paths"][repo], start["baseline_dir"], changed)
+            delta = state.delta(value["repo_paths"][repo], start["baseline_dir"], [reported[p] for p in changed])
         except ValueError as error:
             violations.append(str(error))
         else:
+            base_files = names.files(base["files"])
             for entry in delta["changes"]:
-                if entry["before"] != base["files"].get(entry["path"], {"kind": "missing"}):
+                if entry["before"] != base_files.get(names.key(entry["path"]), state.MISSING):
                     violations.append(f"{entry['path']}: baseline differs from the batch start state")
     record = {"schema_version": VERSION, "run_id": value["run_id"], "repo": repo, "batch": number,
               "members": start["members"], "base_manifest": start["base_manifest"], "final_manifest": str(manifest_path),
@@ -2980,9 +3050,7 @@ def review_budget_status(contract_path, repo, slice_id=None):
     current = state.capture(value["repo_paths"][repo], scope, latest.get("excludes", []),
                             value.get("read_excludes", {}).get(repo, []))
     recorded = manifest(value, repo, latest["source_manifest"])
-    changed = sorted(name for name in set(current["files"]) | set(recorded["files"])
-                     if current["files"].get(name, {"kind": "missing"})
-                     != recorded["files"].get(name, {"kind": "missing"}))
+    changed = sorted(source_names(value, repo).changed(recorded, current, missing=state.MISSING))
     context = latest
     if latest.get("status") == "capped" and len(events) >= 2:
         context = events[-2][2]
@@ -3110,10 +3178,8 @@ def packet(contract_path, repo, scope_path, baseline_dir, out):
     reviews = [e[2] for e in events if e[2]["status"] in {"needs-fix", "reviewed"}
                and not e[2].get("budget_grant_applied")]
     previous = manifest(value, repo, reviews[-1]["source_manifest"]) if reviews else None
-    changed = [p for p in current["files"] if previous is None
-               or current["files"][p] != previous["files"].get(p)]
-    if previous:
-        changed += sorted(set(previous["files"]) - set(current["files"]))
+    changed = sorted(source_names(value, repo).changed(previous, current)
+                     if previous else current["files"])
     state.write_once(directory / "source.json", current)
     state.write_once(directory / "delta.json", changes)
     state.write_once(directory / "index.json", {
@@ -3151,7 +3217,7 @@ def prepare_evidence_record(contract_path, repo, record):
         require(prepared.get("amendment_sha256") in suffix, "Evidence lacks amendment binding")
     prepared["criterion_id"] = claims[0]["id"]
     final = manifest(value, repo, prepared["after_manifest"])
-    state.evidence(prepared, final)
+    state.evidence(prepared, final, value.get("read_excludes", {}).get(repo, []))
     execution_binding(prepared)
     prepared["artifact_hashes"] = seal_files([
         prepared["before_manifest"], prepared["after_manifest"], *prepared["artifact_paths"]])

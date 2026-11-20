@@ -369,6 +369,48 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn(replacement, corrected["artifact_hashes"])
         self.assertEqual(0, corrected["review_fix_count"])
 
+    def test_legacy_alias_manifest_can_continue_without_rewriting_review(self):
+        if not (self.repo / "SOURCE.TXT").exists():
+            self.skipTest("filesystem distinguishes case")
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "add", "source.txt"], check=True)
+        self.source.rename(self.repo / "rename.tmp")
+        (self.repo / "rename.tmp").rename(self.repo / "SOURCE.TXT")
+        self.c["read_excludes"] = {"api": ["private"]}
+        self.save("contract.json", self.c)
+
+        def legacy_manifest(label):
+            current = state.capture(self.repo, [], read_excludes=["private"])
+            current.pop("fingerprint")
+            current["files"]["SOURCE.TXT"] = current["files"]["source.txt"]
+            return self.save(label, {**current, "fingerprint": state.digest(current)})
+
+        initial = legacy_manifest("legacy-initial.json")
+        self.move("initialized", source_manifest=initial)
+        preflight = self.save("preflight.json", self.artifact(
+            status="passed", evidence_paths=[self.evidence("env.runtime", "static", source=initial)]))
+        self.move("ready", preflight_path=preflight, source_manifest=initial)
+        self.scope = self.save("alias-scope.json", ["source.txt", "SOURCE.TXT"])
+        self.implement()
+        reviewed_source = legacy_manifest("legacy-reviewed.json")
+        review_path = self.review()
+        review = state.load(review_path)
+        review["source_fingerprint"] = state.checked_manifest(reviewed_source)["fingerprint"]
+        review["coverage"]["read"] = ["SOURCE.TXT"]
+        self.save("round-1-findings.json", review)
+        self.move("reviewed", source_manifest=reviewed_source, review_path=review_path)
+        state_path = self.run / "api/state-5.json"
+        history = {path: Path(path).read_bytes() for path in [initial, reviewed_source, review_path, state_path]}
+        self.assertTrue(workflow.review_budget_status(self.contract, "api")["source_matches_state"])
+        unowned = self.repo / "unowned.txt"
+        unowned.write_text("concurrent change")
+        with self.assertRaisesRegex(ValueError, "Changes outside touched scope"):
+            self.move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests")])
+        unowned.unlink()
+        self.move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests")])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        self.assertEqual(history, {path: Path(path).read_bytes() for path in history})
+
     def test_full_lifecycle_and_cli_completion(self):
         self.ready()
         self.implement()
@@ -2049,11 +2091,11 @@ class SliceLifecycleTests(unittest.TestCase):
         self.counter += 1
         return self.save(f"slice-review-{self.counter}.json", result)
 
-    def accept(self, slice_id, filename, author="author-" ):
+    def accept(self, slice_id, filename, author="author-", **kwargs):
         touched = [filename]
         (self.repo / filename).write_text(filename[0] + "1\n")
         self.move_slice(slice_id, "implemented", touched, author_agent_id=author + slice_id,
-                        matrix_path=self.slice_matrix(slice_id))
+                        matrix_path=self.slice_matrix(slice_id), **kwargs)
         self.move_slice(slice_id, "pre-review-passed", touched,
                         pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(touched))])
         self.move_slice(slice_id, "reviewed", touched, review_path=self.slice_review(slice_id, touched, 1))
@@ -2106,7 +2148,7 @@ class SliceLifecycleTests(unittest.TestCase):
         (self.repo / "a.txt").write_text("a1\n")
         self.gate("g3.json")
 
-    def integration_fixture(self):
+    def integration_fixture(self, edit_b=False):
         from datetime import datetime, timezone
         schedule = state.load(self.schedule)
         schedule["slices"].append(self.slice_item("c", ["c.txt"], depends_on=["b"],
@@ -2120,7 +2162,8 @@ class SliceLifecycleTests(unittest.TestCase):
         self.bases["a"] = self.cap(["a.txt"])
         self.accept("a", "a.txt")
         self.bases["b"] = self.cap(["b.txt"])
-        self.accept("b", "b.txt")
+        a_state = workflow.history(self.run / "api/slices/a")[-1][1]
+        self.accept("b", "b.txt", predecessor_states={"a": {"path": str(a_state), "sha256": workflow.sha(a_state)}})
         state.baseline(self.repo, self.base, "c.txt")
         (self.repo / "c.txt").write_text("partial c\n")
         start = self.cap(["a.txt", "b.txt", "c.txt"])
@@ -2134,7 +2177,8 @@ class SliceLifecycleTests(unittest.TestCase):
             approved_at=datetime.now(timezone.utc).isoformat(), contract_sha256=workflow.sha(self.contract),
             schedule_sha256=workflow.sha(self.schedule), starting_slices=starting,
             start_manifest_path=start, start_manifest_sha256=workflow.sha(start),
-            partial_slices={"c": ["c.txt"]}, edit_paths={"a": ["a.txt"]}, recertify_slices=["b"]))
+            partial_slices={"c": ["c.txt"]},
+            edit_paths={"a": ["a.txt"], **({"b": ["b.txt"]} if edit_b else {})}, recertify_slices=["b"]))
 
     def integration_request(self, identifier, mode="repair"):
         from datetime import datetime, timezone
@@ -2156,6 +2200,8 @@ class SliceLifecycleTests(unittest.TestCase):
     def test_authorized_alignment_preserves_base_and_recertifies_unchanged_dependents(self):
         self.integration_fixture()
         original = workflow.history(self.run / "api/slices/a")[-1][2]
+        old_b = workflow.history(self.run / "api/slices/b")[-1][1]
+        old_b_hash = workflow.sha(old_b)
         checkpoint = self.save("alignment/a.json", self.integration_request("a"))
         (self.repo / "a.txt").write_text("a2\n")
         edited = self.move_slice("a", "edited-unverified", ["a.txt"], action="integration-fix",
@@ -2175,12 +2221,45 @@ class SliceLifecycleTests(unittest.TestCase):
                         pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(["b.txt"]))])
         self.move_slice("b", "reviewed", ["b.txt"], review_path=self.slice_review("b", ["b.txt"], 2))
         accepted = self.move_slice("b", "accepted", ["b.txt"])
+        a_state = workflow.history(self.run / "api/slices/a")[-1][1]
+        self.assertEqual({"path": str(a_state), "sha256": workflow.sha(a_state)}, accepted["predecessor_states"]["a"])
+        self.assertEqual(old_b_hash, workflow.sha(old_b))
         self.assertEqual(dependent["accepted_files"], accepted["accepted_files"])
         self.assertEqual(dependent["review_fix_count"], accepted["review_fix_count"])
         self.assertEqual(2, accepted["latest_review_round"])
         self.assertEqual({"a", "b"}, workflow.accepted_slices(self.contract, "api", {"a", "b"}))
         with self.assertRaisesRegex(ValueError, "Slice not accepted: c"):
             self.gate("still-partial.json")
+
+    def test_dependent_integration_repair_rebinds_predecessor(self):
+        self.integration_fixture(edit_b=True)
+        old_b = workflow.history(self.run / "api/slices/b")[-1]
+        old_a_path = workflow.history(self.run / "api/slices/a")[-1][1]
+        checkpoint = self.save("alignment/a.json", self.integration_request("a"))
+        (self.repo / "a.txt").write_text("a2\n")
+        self.move_slice("a", "edited-unverified", ["a.txt"], action="integration-fix", integration_path=checkpoint)
+        self.move_slice("a", "pre-review-passed", ["a.txt"],
+                        pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(["a.txt"]))])
+        self.move_slice("a", "reviewed", ["a.txt"], review_path=self.slice_review("a", ["a.txt"], 2))
+        self.move_slice("a", "accepted", ["a.txt"])
+        self.assertNotIn("b", workflow.accepted_slices(self.contract, "api", {"b"}))
+        request = self.integration_request("b")
+        checkpoint = self.save("alignment/b.json", request)
+        stale = self.save("alignment/b-stale.json", {
+            **request, "slice_states": {"a": {"path": str(old_a_path), "sha256": workflow.sha(old_a_path)}}})
+        (self.repo / "b.txt").write_text("b2\n")
+        with self.assertRaisesRegex(ValueError, "Predecessor state changed"):
+            self.move_slice("b", "edited-unverified", ["b.txt"], action="integration-fix")
+        with self.assertRaisesRegex(ValueError, "Integration sibling state changed"):
+            self.move_slice("b", "edited-unverified", ["b.txt"], action="integration-fix", integration_path=stale)
+        self.move_slice("b", "edited-unverified", ["b.txt"], action="integration-fix", integration_path=checkpoint)
+        self.move_slice("b", "pre-review-passed", ["b.txt"],
+                        pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(["b.txt"]))])
+        self.move_slice("b", "reviewed", ["b.txt"], review_path=self.slice_review("b", ["b.txt"], 2))
+        accepted = self.move_slice("b", "accepted", ["b.txt"])
+        a_path = workflow.history(self.run / "api/slices/a")[-1][1]
+        self.assertEqual(workflow.sha(a_path), accepted["predecessor_states"]["a"]["sha256"])
+        self.assertEqual(old_b[2]["base_manifest"], accepted["base_manifest"])
 
     def test_alignment_rejects_foreign_bindings_scope_drift_and_reuse(self):
         self.integration_fixture()
@@ -2975,6 +3054,19 @@ class ParallelBatchTests(unittest.TestCase):
     def write(self, name, text):
         state.baseline(self.repo, self.baselines, name)
         (self.repo / name).write_text(text)
+
+    def test_batch_refuses_two_owners_using_alternate_spellings(self):
+        if not (self.repo / "A.TXT").exists():
+            self.skipTest("filesystem distinguishes case")
+        schedule = state.load(self.schedule)
+        schedule["slices"][1]["write_scope"] = ["A.TXT"]
+        self.save("slices-approved.json", schedule)
+        self.c["slice_schedules"]["api"]["sha256"] = workflow.sha(self.schedule)
+        self.save("contract.json", self.c)
+        start = self.start()
+        self.write("A.TXT", "a1\n")
+        with self.assertRaisesRegex(ValueError, "several members own it"):
+            self.barrier(start)
 
     def test_two_writers_one_window_then_independent_slice_lifecycles(self):
         start = self.start()

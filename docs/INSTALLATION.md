@@ -163,6 +163,13 @@ make -C ~/ship-workflow install REF=v1.2.0 HOST=both PROJECT=/path/to/project
 The Make target invokes the same installer, so the tag verification and backup rules still apply. The shared
 workflow, skills, roles and platform metadata are replaced; per-project configuration is preserved.
 
+Existing runs keep their original state, manifests, baselines and review budgets. When upgrading to
+a snapshot that reconciles alternate path spellings, continue from the existing run directory.
+The helper can compare a historical manifest with a new capture when the checkout still confirms
+the spellings identify the same entry and the recorded states agree. If the entry has disappeared
+or the checkout moved to a filesystem with different filename rules, resolve any reported path or
+scope discrepancy before continuing.
+
 Use `make sync` after changing a role or model assignment, and `make check` to verify generated native files
 without writing:
 

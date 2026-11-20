@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.1 - 2026-11-20
+
+### Bug Fixes
+
+- Allow authorized integration checkpoints to bind dependent slices to newly accepted predecessor states.
+- Capture, compare and track confirmed alternate path spellings as one filesystem entry while preserving historical manifests and verified first-touch baselines.
+
 ## v1.3.0 - 2026-11-18
 
 ### New Features

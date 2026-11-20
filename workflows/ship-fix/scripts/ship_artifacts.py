@@ -62,8 +62,11 @@ def task_file(path):
 
 def require_readable(task, path):
     state.relative_path(path)
-    require(not any(path == p or path.startswith(p + "/") or p.startswith(path + "/")
-                    for p in task.get("read_excludes", [])), "Path intersects read_excludes")
+    root = Path(task["repo_path"]).resolve()
+    exclusion = task.get("read_excludes", [])
+    require(not state.PathNames(root).intersects(path, exclusion, include_ancestors=True),
+            "Path intersects read_excludes")
+    state.guard_excluded_path(root / path, root, exclusion)
 
 
 def next_free(base, suffix):
@@ -81,11 +84,12 @@ def backup_for(task, path):
 
 
 def begin_edit(task, paths):
-    root = Path(task["repo_path"])
+    root = Path(task["repo_path"]).resolve()
+    names = state.PathNames(root)
     touched = set(task["touched_list"])
     for path in paths:
         require_readable(task, path)
-        require(workflow.in_scope(path, task["write_scope"]), f"Outside write_scope: {path}")
+        require(workflow.in_scope(path, task["write_scope"], names), f"Outside write_scope: {path}")
         state.baseline(root, task["baseline_dir"], path)
         source = state.safe_path(root.resolve(), path)
         if source.is_file():
@@ -416,6 +420,7 @@ def scope_check(task):
         print("scope-check skipped: non-git source root")
         return
     events = workflow.history(Path(task["contract"]).resolve().parent / task["repo"])
+    names = state.PathNames(Path(task["repo_path"]).resolve(), task.get("read_excludes", []))
     changed = None
     if events:
         initial_path = events[0][2].get("initial_manifest")
@@ -425,15 +430,18 @@ def scope_check(task):
         scope = sorted(set(initial["files"]) | set(task["touched_list"]) | set(dependencies))
         current = state.capture(task["repo_path"], scope, excludes, task.get("read_excludes", []))
         require(initial["repo_path"] == current["repo_path"], "Initial manifest belongs to another repo")
-        changed = {p for p in set(initial["files"]) | set(current["files"])
-                   if initial["files"].get(p, {"kind": "missing"}) !=
-                   current["files"].get(p, {"kind": "missing"})}
+        path_keys = names.changed(initial, current, missing=state.MISSING)
+        spellings = names.spellings(initial["files"].keys() | current["files"].keys() | set(task["touched_list"]))
+        outside = sorted(p for p in path_keys
+                         if not any(workflow.in_scope(path, task["write_scope"], names) for path in spellings[p]))
+        unowned = sorted(path_keys - names.keys(task["touched_list"]))
+        changed = path_keys
     else:
         require(not task.get("read_excludes"), "scope-check requires initialized history with read_excludes")
         changed = git_changes(task["repo_path"])
+        outside = sorted(p for p in changed if not workflow.in_scope(p, task["write_scope"], names))
+        unowned = sorted(names.keys(changed) - names.keys(task["touched_list"]))
     touched = set(task["touched_list"])
-    outside = sorted(p for p in changed if not workflow.in_scope(p, task["write_scope"]))
-    unowned = sorted(changed - touched)
     print(f"changed={len(changed)} touched={len(touched)}")
     for path in outside:
         print(f"OUTSIDE write_scope: {path}")
@@ -492,16 +500,17 @@ def json_text(value):
 
 def since_capsule(task, capsule_file):
     value = state.load(capsule_file)
-    manifest = state.load(value["manifest_path"])
+    manifest = state.checked_manifest(value["manifest_path"])
+    require(manifest["fingerprint"] == value["source_fingerprint"], "Capsule fingerprint mismatch")
     base = state.load(task["scope_file"]) if task.get("scope_file") and not task.get("slice_id") else task["touched_list"]
     _, excludes = workflow.capture_policy(task["contract"], task["repo"])
     current = state.capture(task["repo_path"], sorted(set(base) | set(task["source_scope_list"])), excludes,
                             task.get("read_excludes", []))
-    if current["fingerprint"] == value["source_fingerprint"]:
+    read_excludes = task.get("read_excludes", [])
+    if state.same_source(manifest, current, read_excludes):
         print("no change since capsule")
         return
-    before, after = manifest["files"], current["files"]
-    changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+    changed = sorted(state.PathNames(current["repo_path"], read_excludes).changed(manifest, current))
     for path in changed:
         print(f"changed since capsule: {path}")
 

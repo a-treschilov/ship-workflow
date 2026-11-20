@@ -180,6 +180,19 @@ Capture uses two matching scans. Artifact checks use initialized source dependen
 captures. Same untracked generated-output exclusions must be used throughout;
 tracked/scoped source cannot be excluded. No blanket cache/source-directory exclusions.
 
+Capture records a single path when Git, the directory listing or explicit scope supply alternate
+spellings of the same filesystem entry. It prefers the Git index spelling for tracked paths and the
+directory spelling for other existing entries. Distinct entries remain separate, including hard links.
+Two index paths resolving to the same entry are rejected. Exact scope paths and directory prefixes
+can refer to an entry by either confirmed spelling. Globs keep their case-sensitive pattern matching.
+Batch ownership must still resolve to exactly one writer per changed entry.
+
+Historical manifests retain their stored paths and fingerprints. Live freshness and file ownership
+comparisons can reconcile alternate spellings while the current checkout confirms the entry and all
+recorded states agree. Conflicting records are rejected. If spelling identity cannot be confirmed,
+the paths are compared separately. Review, authorization and seal hashes are still checked against the
+artifacts that recorded them.
+
 Before first edit/delete/rename (both paths):
 `python3 -I -B HELPER_PATH baseline --repo REPO_PATH --baseline BASELINE_DIR --path RELATIVE_PATH`.
 Union every changed/deleted path into touched-files; never shrink it or overwrite baseline records.
@@ -459,6 +472,10 @@ new dependency hashes. It does not manufacture an edit or reset counters. Accept
 require recursively current predecessor source and dependency bindings; an old accepted status alone is
 insufficient. Whole-scope integration review and completion obligations are unchanged.
 
+When a slice previously recorded `predecessor_states`, a validated integration checkpoint supplies the
+current accepted bindings for dependencies it names. The next state records those bindings while retaining
+the original base and all earlier sealed states. Unnamed dependencies retain their previous bindings.
+
 If pre-review is blocked by an already checkpointed, unsubmitted partial slice, do not edit that frozen
 source or replace the checkpoint silently. A separate human-bound `resume_authorization_path`/SHA-256 on
 a new alignment authorization may permit an exact partial repair: schema/run/repo/slice, original author,
@@ -565,6 +582,11 @@ intersecting an exclusion is refused. This controls helper capture, not arbitrar
 would read a forbidden path. `ship_checks.py` binds these exclusions in its execution specification and applies
 them to both captures. An uninitialized scope-check refuses read exclusions rather than running an unrestricted
 Git status scan. Existing `excludes` retains its untracked-file meaning.
+An exclusion also applies to confirmed alternate spellings of the excluded entry.
+
+First-touch baseline lookup accepts another spelling of a source path when the filesystem identifies both
+spellings as the same directory entry and the existing marker and backup remain valid. An unrecorded backup
+or conflicting marker remains an error. Distinct directory entries retain separate baselines.
 
 When a task produces deliverable files, declare `deliverables` in the contract as a repo-to-list map; each
 entry has a unique `id`, absolute `path`, and nonempty `criterion_ids`. Once the files exist, snapshot them:
