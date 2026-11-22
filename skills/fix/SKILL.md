@@ -90,10 +90,11 @@ fix → fresh review → independent final gates. Prepare helper review packets 
 contract/brief, current/prior manifests, all prior findings/applied results. Validate coverage, fingerprints,
 proof and closed-finding dispositions. Review Suggestions too. Budgets and review numbering never reset.
 
-Before any review-fix/plan-gap repair preparation, run the standalone read-only precheck from the project
+Before preparing a review-fix, plan-gap or gate-fix repair, run the standalone read-only precheck from the project
 root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`.
-For an explicitly identified successor, declare and validate matching `successor_scopes` and
-`budget_continuity` in the contract before dispatch; follow the protocol's source and decision rules.
+For an identified repo successor, run `validate-history` on the predecessor before writing the contract. Include
+its latest state and history SHA-256 in `budget_continuity` with matching `successor_scopes`. Follow the protocol
+for recovery sources and per-slice decisions. Gate-fix requires a positive `gate_fix_budget.remaining_attempts`.
 Do this before repair telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, or author dispatch;
 show the reported limit, used passes, and open finding IDs. If already accepted integration repairs account
 for the source drift, follow "Recovering a repo review fix after slice acceptance" in the protocol. Record one
@@ -117,10 +118,11 @@ separate no-source-change `transition` request with `budget_grant_path` before r
 The helper validates and seals the grant. Ask again at each later exhaustion; grants accumulate (e.g. +1 then +1)
 and each is bound to the immediately preceding state. Choosing stop leaves the run stopped/capped. A grant is not a
 repair or a review round: normal author routing, proof, pre-review, fresh review, gates and acceptance all remain
-required. Gate-fix remains limited to 2 attempts.
+required.
 
 The completion certificate and final report state standard limit, each grant/count/reason, effective limit,
-passes used and any passes above 3; distinguish granted from consumed. Legacy runs without grants default to 3.
+passes used and any passes above 3. Distinguish granted from consumed. Legacy runs without grants default to 3.
+Report historical, current and cumulative gate-fix usage and remaining attempts.
 
 Gate failure uses GATE_FAILURE/GATE_ATTEMPT_DIR and original implementer; read result, return every edit to
 pre-review/fresh review/final gates, including previously green affected checks. Required unavailable checks

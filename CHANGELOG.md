@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v1.4.0 - 2026-11-23
+
+### Bug Fixes
+
+- Carry verified gate-fix usage across successor runs and report inherited, local and remaining attempts.
+  Honor existing review grant sources and verify every repository entry in completion certificates.
 
 ### New Features
 

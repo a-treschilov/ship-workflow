@@ -132,10 +132,12 @@ and all prior findings/applied files. Validate stable review and transition need
 same implementer for fixes; read its immutable results before transition. Every edit requires pre-review,
 fresh review and final gates again; counters never reset. Do not skip Suggestions or final review.
 
-Before preparing or dispatching every review-fix/plan-gap repair, run the standalone read-only budget check
+Before preparing or dispatching every review-fix, plan-gap or gate-fix repair, run the standalone read-only budget check
 from the project root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`.
-For an explicitly identified successor, declare and validate `successor_scopes` and `budget_continuity` in the contract before any
-dispatch, including per-slice decisions; follow the source, decision and accounting requirements in the protocol.
+For an identified repo successor, run `validate-history` on the predecessor before writing the contract. Include
+its latest state and history SHA-256 in `budget_continuity` with matching `successor_scopes`. Follow the protocol
+for recovery sources and per-slice decisions. For gate-fix, check `gate_fix_budget.remaining_attempts` and stop
+gate repair if it is zero.
 It must precede repair telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation and author dispatch;
 use its current repo/state result to show the limit, used passes and open finding IDs. If source differs from
 the latest state because the slice authors already completed authorized integration repairs, follow
@@ -158,11 +160,11 @@ plan-gap criterion IDs). Apply it with one `transition` carrying `budget_grant_p
 changing scope/author/review evidence, or starting a repair telemetry phase. The helper validates and seals it
 before any author dispatch. Ask again after each new exhaustion; grants accumulate (for example +1, then +1)
 and each binds to the immediately preceding state. If the user chooses stop, remain capped. A grant is not a review round;
-continue through normal repair proof, pre-review, fresh review, gates and acceptance. Gate-fix stays at 2.
+continue through normal repair proof, pre-review, fresh review, gates and acceptance.
 
 The completion certificate and final report must state standard limit, every granted amount and reason, effective
 limit, passes used and any passes used above 3. Distinguish granted from consumed. Historical runs without grants
-retain the default limit of 3.
+retain the default limit of 3. Report historical, current and cumulative gate-fix usage and remaining attempts.
 
 With --from-review there is no implementer to resume: hand findings/gate failures to the author's coding
 session through the host's author-handoff mechanism, record the handoff and stop, not a fabricated clean round. Continue

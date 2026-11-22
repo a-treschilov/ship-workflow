@@ -17,8 +17,8 @@ python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py validate-history 
 python3 -I -B .agents/workflows/ship-fix/scripts/ship_artifacts.py --task /absolute/run/tasks/task.json scope-check
 ```
 
-`validate-history` is read-only: it checks immutable lifecycle/grant chains and seals without recapturing
-historical source against today's checkout.
+`validate-history` is read-only. It checks immutable lifecycle and grant chains and seals without recapturing
+historical source against today's checkout. Its repo output includes the gate-fix budget and `history_sha256`.
 
 **Each workflow helper MUST be invoked in one direct shell invocation, and that shell invocation must contain only the helper invocation.**
 First ensure the shell working directory is the project root, then issue the helper call in a separate
@@ -283,12 +283,12 @@ files; each event saves their values. Generated outputs belong outside source or
 Run cheap checks and targeted tests at explicit pre-review stage before expensive independent review.
 Gate failures return through original implementer, pre-review, fresh review, full final gates; previously
 green affected gates rerun. No reset of counters. At most 3 review-fix passes (plan-gap repairs share this
-budget), plus final independent review; gate-fix has at most 2 attempts per repo across the run. After the
-last available fix, review findings of any severity mean capped until the user decides. Source edits invalidate
+budget), plus final independent review. Gate-fix has at most 2 attempts per repo across the work item's run
+history. After the last available review fix, review findings of any severity mean capped until the user decides. Source edits invalidate
 review/evidence; final independent review is required after every repair, including repairs beyond pass 3.
 Interrupted edits stay unverified.
 
-Before any repo-level review-fix or plan-gap repair preparation, the orchestrator runs
+Before preparing any repo-level review-fix, plan-gap or gate-fix, the orchestrator runs
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`
 as one standalone read-only command from the project root. This check is first: it precedes repair-phase
 telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, and author dispatch. It verifies the
@@ -296,7 +296,9 @@ immutable history and reports the exact latest state path/hash, current limit, u
 open finding IDs, full finding records, counts by severity, and whether current scoped source still matches that state. Never prepare a repair when
 `source_matches_state` is false. For already accepted, checkpointed slice repairs, follow the repo repair
 recovery procedure below. Resolve other source drift before preparing a repair. Repeat the
-check immediately before each subsequent repair, including after a grant is applied.
+check immediately before each subsequent repair, including after a grant is applied. For gate-fix use
+`gate_fix_budget.remaining_attempts`. If zero, report the historical, current and cumulative usage, record
+the failed gate and stop gate repair. A review-budget grant cannot add gate-fix attempts.
 For a slice add `--slice SLICE` to inspect its independent budget and findings.
 
 ### Explicit repo-level review-budget grants
@@ -312,7 +314,7 @@ histories and is not proof that the search is complete.
 If independent histories already omitted their carryover, reconcile them in a new successor, never by editing
 the old histories. A repo-level `budget_continuity` record may use `recovery_sources` instead of its single
 source. Each source contains `run_id`, absolute `contract_path` and `state_path`, their `contract_sha256` and
-`state_sha256`, and `used_passes`. Supply all related independent runs once. Each must pass `validate-history`
+`state_sha256`, `history_sha256`, and `used_passes`. Supply all related independent runs once. Each must pass `validate-history`
 and name its latest state and the same repository path. The record and its JSON decision contain the same
 `repo`, `work_item`, `approved_by: "user"`, `approval_question`, exact `user_authorization`, `approved_at`,
 `reason`, `additional_passes`, `used_passes`, `effective_limit`, and `recovery_sources`. The record additionally
@@ -340,9 +342,7 @@ source. Continue to slice acceptance or required gates and acceptance assessment
 review and a new decision if findings remain at exhaustion. Report all remaining findings by repo and slice,
 with severity, location, scenario and whether the user accepted them.
 
-For an explicitly identified successor run on the same approved work item, do not treat a new run directory as
-a budget reset. Before repair dispatch, validate each relevant prior run with `validate-history` and carry its
-review-fix usage in the new run's user-approved grant as `historical_budget_sources` plus
+Existing runs can record review-fix carryover in a user-approved grant as `historical_budget_sources` plus
 `historical_used_passes`. Each source names the absolute contract/state paths and their SHA-256 values, run ID,
 used passes and effective limit. The helper revalidates those prior immutable histories and hashes whenever it
 reads the grant. Historical runs are read-only. The effective allowance in the successor is
@@ -352,7 +352,7 @@ Assessment and completion reports distinguish carried-over usage, current-run us
 and remaining effective allowance. A grant cannot reduce historical usage, reference its own run, or cite a
 modified/invalid historical state. When no historical source is supplied, legacy per-run behavior is unchanged.
 
-A successor can instead declare `budget_continuity` in its contract as an array of scope records, one per repo
+A new repo successor declares `budget_continuity` before initialization. This is an array of scope records, one per repo
 or slice, and a matching `successor_scopes` array of `{repo, slice_id, work_item}` records (omit `slice_id` for
 a repo). Each continuity record contains `repo`, optional `slice_id`, `source_slice_id` for a slice, `work_item`,
 `source_contract_path`/`source_contract_sha256`, `source_state_path`/`source_state_sha256`, `used_passes`,
@@ -363,6 +363,37 @@ occurred. For example, 10 used out of 12 leaves two new-run repairs. The new run
 reports show historical and new usage separately. Keep the source history and decision immutable. Do not mix
 this mechanism with legacy historical sources in a grant. A later exhaustion needs a normal explicit grant.
 The same source cannot be imported twice, and cycles and reduction of recorded usage are refused.
+
+Before writing a repo successor contract, run `validate-history` for each predecessor. Copy its latest state
+path and SHA-256 and its `history_sha256`. Set `source_history_sha256` for a single predecessor or
+`history_sha256` on each entry in `recovery_sources`, including in the recovery decision. This applies even
+when the predecessor used zero gate-fix attempts. Stop using a predecessor's lifecycle once its state is
+selected for continuation. The helper checks each predecessor is still at its cited latest state.
+
+The history hash is SHA-256 over canonical JSON with keys `contract_sha256`, `states` (ordered
+`[filename, SHA-256]` pairs) and `sources` (sorted `[canonical absolute contract path, history_sha256]`
+pairs). Encode JSON with sorted keys, ASCII escaping, and no insignificant whitespace. Use the helper output
+when preparing a contract. The helper follows validated repo history links, including existing historical
+review grant sources. Related-run discovery counts sources from sealed applied grants as already carried
+forward. Every identified ancestor must match the successor's work item. The helper counts gate-fix events
+once per predecessor, rejects conflicting snapshots and cycles, and derives all counters from history.
+For single-source continuity, an absolute alias for the latest predecessor state must resolve to that file
+and match its SHA-256.
+Slice continuity accounts for slice review-fix only.
+
+New repo states seal their immediate predecessor and record `gate_fix_budget` and
+`gate_fix_sources_sha256` (SHA-256 of the canonical `sources` array). The budget object has integer fields
+`limit`, `historical_used_attempts`, `current_used_attempts`, `cumulative_used_attempts` and
+`remaining_attempts`. `gate_fix_count` remains the local counter, and gate-fix telemetry attempts are numbered
+within the current run. Gate-failure evidence uses the same normalized path spelling when sealing and
+checking files. Repo `review-budget`, `digest` and `validate-history` expose the same budget object.
+
+Initialized legacy runs can use their existing continuity or applied grants. The helper derives their usage
+from available verified histories and applies the remaining allowance immediately. It reports the actual
+cumulative count even if old runs together exceeded 2, with zero attempts remaining. Legacy contracts,
+states, seals and certificates are read-only. Older events may have incomplete hash coverage before their
+first full history snapshot. Use documented work item discovery to reconcile any older histories whose
+links were omitted.
 
 After a yes, write a unique JSON under `RUN_DIR/budget-grants/` with schema_version, run_id, workflow, repo,
 contract_sha256, additional_passes (positive int, bool is invalid), purpose (`review-fix` or `plan-gap`), reason,
@@ -383,7 +414,7 @@ time ordering, author/source/scope/base and review binding/finding set (or plan-
 per predecessor/reuse/copies, seals the artifact and derives the effective limit from applied immutable state
 events only. Caller-supplied contract/request/state limit values never grant budget. Each later approval binds to
 the immediately preceding immutable state; grants accumulate (e.g. +1 then +1) without resetting counters or
-latest_review_round. Both review-fix and plan-gap use `3 + sum(applied additional_passes)`; gate-fix stays 2.
+latest_review_round. Both review-fix and plan-gap use `3 + sum(applied additional_passes)`.
 Apply the ordinary repair proof, pre-review, fresh review, gates and acceptance afterward.
 
 An applied grant event is not a review result and must be omitted from review-round numbering, dispositions and
@@ -707,7 +738,11 @@ Invoke `complete --contract ... --out RUN_DIR/completion.json` only after every 
 recaptures all repos and revalidates gates/acceptance/dependency versions after later changes. Each repo's
 `review_budget` in the certificate records standard_limit, granted_additional_passes, effective_limit,
 used_passes, extra_passes_used and sealed grant summaries (amount, reason, approval role/time and review
-context); granted and consumed passes are distinct. The certificate records open findings and their acceptance
+context), with granted and consumed passes shown separately. Each repo also records `gate_fix_budget` and
+`gate_fix_history_sha256`. When a certificate exists, `validate-history` requires entries for all contract
+repos and verifies the contract and verified-state seals for the selected repo. The certificate must name
+the latest repo state it seals. The helper checks the gate-fix fields against the history at that state.
+The certificate records open findings and their acceptance
 decision for each repo and slice. Only this certificate permits scoped success; clean review
 alone is not completed verification. Don't offer Proceed past a blocker. Multi-repo checkpoint requires human
 Proceed; single-repo skips pause but prints status.

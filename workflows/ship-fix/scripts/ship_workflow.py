@@ -14,6 +14,7 @@ state = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(state)
 
 VERSION = 2
+GATE_FIX_LIMIT = 2
 # Why a phase ended; unknown is a legitimate answer and must never be inferred from duration.
 END_REASONS = {"done", "context", "api-error", "user-stop", "timeout", "unknown"}
 TERMINAL = {"blocked", "capped", "handoff", "preflight-blocked"}
@@ -382,8 +383,12 @@ def contract(path):
             value["_amendment"] = value["_amendments"][-1]
     value["_contract_path"] = str(path)
     for item in continuity:
-        budget_continuity(value, item["repo"], path, item.get("slice_id"))
-    for repo in work_items:
+        repo, slice_id = item["repo"], item.get("slice_id")
+        if slice_id is None and not history(path.parent / repo):
+            require(all(continuity_history_seals(item)), "New successor requires source history SHA-256")
+        budget_continuity(value, repo, path, slice_id)
+    related_repos = set(work_items) | {item["repo"] for item in continuity if item.get("slice_id") is None}
+    for repo in sorted(related_repos):
         check_related_budgets(value, repo, path)
     return value
 
@@ -633,7 +638,7 @@ def execution_binding(record):
     require(execution.get("log") in record.get("artifact_paths", []), "Execution log must be sealed")
 
 
-def proof(value, repo, path, final, identifier, producer=None, expected_status="passed"):
+def proof(value, repo, path, final, identifier, producer=None, expected_status="passed", *, historical_seals=None):
     record = state.load(absolute_file(path))
     bound(value, repo, record)
     claims = record.get("claims")
@@ -656,21 +661,42 @@ def proof(value, repo, path, final, identifier, producer=None, expected_status="
     for field in ("environment", "data_scope"):
         if expected.get(field):
             require(record.get(field) == expected[field], f"Wrong evidence {field}")
-    state.evidence(record, final, value.get("read_excludes", {}).get(repo, []))
+    state.evidence(record, final, value.get("read_excludes", {}).get(repo, []),
+                   historical=historical_seals is not None)
     paths = [path, record["before_manifest"], record["after_manifest"], *record["artifact_paths"]]
     hashes = record.get("artifact_hashes")
     require(isinstance(hashes, dict) and set(hashes) == set(paths[1:]), "Missing evidence artifact hashes")
-    check_seals(hashes)
+    if historical_seals is None:
+        check_seals(hashes)
+    else:
+        require(all(historical_seals.get(str(Path(p))) == digest for p, digest in hashes.items()),
+                "Historical evidence does not match its state seals")
     for dependency, dependency_path in record.get("dependency_manifests", {}).items():
         require(dependency in value["repos"], "Unknown evidence dependency")
         dep = manifest(value, dependency, dependency_path)
-        _, excludes = (capture_policy(value["_contract_path"], dependency)
-                       if value.get("_contract_path") else ([], []))
-        fresh(value, dependency, dependency_path, list(dep["files"]), excludes)
+        if historical_seals is None:
+            _, excludes = (capture_policy(value["_contract_path"], dependency)
+                           if value.get("_contract_path") else ([], []))
+            fresh(value, dependency, dependency_path, list(dep["files"]), excludes)
         paths.append(dependency_path)
     # A criterion spanning repositories must name the source versions it depends on.
     dependencies = set(expected.get("repos", [])) - {repo}
     require(dependencies <= set(record.get("dependency_manifests", {})), "Missing cross-repo source binding")
+    return paths
+
+
+def gate_failure_proof(value, repo, path, previous, *, historical_seals=None):
+    failure = state.load(absolute_file(path))
+    claims = failure.get("claims", [])
+    require(claims, "Gate fix needs recorded failed check")
+    identifier = claims[0]["id"]
+    allowed = {x["id"] for group in ("required_gates", "pre_review_checks") for x in value[group][repo]}
+    require(identifier in allowed, "Gate failure does not name a declared gate")
+    paths = proof(value, repo, path, event_manifest(value, repo, previous), identifier,
+                  "orchestrator", expected_status="failed", historical_seals=historical_seals)
+    if historical_seals is not None:
+        require({str(Path(path)) for path in paths} <= historical_seals.keys(),
+                "Historical gate failure proof is not sealed")
     return paths
 
 
@@ -923,7 +949,131 @@ def capture_policy(contract_path, repo):
     return initial.get("source_scope", []), initial.get("excludes", [])
 
 
-def historical_budget_sources(sources, repo, workflow, current_contract=None, visited_contracts=None):
+def continuity_history_seals(item):
+    if "recovery_sources" in item:
+        sources = item["recovery_sources"]
+        require(isinstance(sources, list) and sources and all(isinstance(source, dict) for source in sources),
+                "Budget recovery requires source histories")
+        seals = [history_seal(source, "history_sha256") for source in sources]
+        require(not any(seals) or all(seals), "Budget recovery has incomplete source history seals")
+        return seals
+    return [history_seal(item, "source_history_sha256")]
+
+
+class GateFixLineage:
+    """Collect validated predecessor histories for one repository and one operation."""
+
+    def __init__(self, value, repo, cache=None):
+        self.value = value
+        self.repo = repo
+        self.cache = {} if cache is None else cache
+        self.direct = {}
+        self.runs = {}
+
+    def audit(self, path, visited, *, work_item=None, expected=None):
+        resolved = path.resolve()
+        require(resolved not in visited, "Historical budget reference cycle/current-run ancestry detected")
+        repo = self.repo
+        root = self.value["repo_paths"][repo]
+        exclusions = tuple(sorted(self.value.get("read_excludes", {}).get(repo, [])))
+        state.guard_excluded_path(str(path), root, exclusions)
+        source = state.load(path)
+        require(Path(source.get("repo_paths", {}).get(repo, "")).resolve() == Path(root).resolve(),
+                "Gate-fix source repository mismatch")
+        work_item = work_item or self.value.get("budget_work_items", {}).get(repo)
+        source_items = {entry.get("work_item") for entry in source.get("budget_continuity", [])
+                        if entry.get("repo") == repo and entry.get("slice_id") is None}
+        source_item = source.get("budget_work_items", {}).get(repo)
+        if source_item:
+            source_items.add(source_item)
+        require(not work_item or not source_items or source_items == {work_item}, "Gate-fix source work item mismatch")
+        current_id = (self.value.get("workflow"), self.value.get("run_id"))
+        source_id = (source["workflow"], source["run_id"])
+        require(source_id != current_id, "Gate-fix source duplicates the current run")
+        key = (resolved, repo, exclusions)
+        if key not in self.cache:
+            ancestors = {}
+            snapshot = self.snapshot(path, repo)
+            audited = validate_history(path, repo, visited, read_excludes=exclusions,
+                                       lineage_cache=self.cache, lineage_out=ancestors)
+            require(snapshot == self.snapshot(path, repo), "Gate-fix source changed during audit")
+            self.cache[key] = audited, ancestors, snapshot
+        audited, ancestors, _ = self.cache[key]
+        require(not any(snapshot[0] in visited for snapshot in ancestors.values()),
+                "Historical budget reference cycle/current-run ancestry detected")
+        require(current_id not in ancestors, "Gate-fix ancestry duplicates the current run")
+        state.guard_excluded_path(audited["state_path"], root, exclusions)
+        history_hash = audited["history_sha256"]
+        if expected is not None:
+            require(history_hash == expected, "Gate-fix source history SHA-256 mismatch")
+        require(self.direct.setdefault(str(resolved), history_hash) == history_hash,
+                "Conflicting gate-fix source snapshots")
+        snapshot = (resolved, history_hash, audited["gate_fix_budget"]["current_used_attempts"],
+                    frozenset(source_items))
+        for identity, record in [*ancestors.items(), (source_id, snapshot)]:
+            _, _, _, recorded_items = record
+            require(not work_item or not recorded_items or recorded_items == {work_item},
+                    "Gate-fix source work item mismatch")
+            require(self.runs.setdefault(identity, record) == record, "Duplicate or conflicting gate-fix run import")
+        return audited
+
+    def summary(self, current):
+        historical = sum(snapshot[2] for snapshot in self.runs.values())
+        return {"limit": GATE_FIX_LIMIT, "historical_used_attempts": historical, "current_used_attempts": current,
+                "cumulative_used_attempts": historical + current,
+                "remaining_attempts": max(0, GATE_FIX_LIMIT - historical - current)}
+
+    def source_hash(self):
+        return state.digest(sorted(self.direct.items()))
+
+    def history_hash(self, contract_hash, states):
+        return state.digest({"contract_sha256": contract_hash, "states": states,
+                             "sources": sorted(self.direct.items())})
+
+    @staticmethod
+    def snapshot(path, repo):
+        return (sha(path), [(event_path.name, sha(event_path))
+                           for _, event_path, _ in history(path.parent / repo)])
+
+
+def check_gate_sources_current(cache):
+    for (path, repo, _), (_, _, snapshot) in cache.items():
+        require(GateFixLineage.snapshot(path, repo) == snapshot, "Gate-fix source changed during audit")
+
+
+def check_gate_budget_event(events, index, contract_seal, lineage, expect_budget):
+    sequence, path, event = events[index]
+    require(path.resolve().parent == path.parent.resolve(), "Gate-fix state is outside its repo history")
+    previous = events[index - 1][2] if index else {}
+    repair = event["status"] == "edited-unverified" and event.get("action") == "gate-fix"
+    if repair:
+        require(index > 0, "Gate fix needs a preceding lifecycle state")
+        gate_failure_proof(lineage.value, lineage.repo, event.get("gate_failure_path"), previous,
+                           historical_seals=event.get("artifact_hashes", {}))
+    current = event.get("gate_fix_count", 0)
+    require(type(current) is int and current == previous.get("gate_fix_count", 0) + int(repair),
+            "Historical gate-fix counter is not derived from repair events")
+    require(current <= GATE_FIX_LIMIT, "Historical local gate-fix budget exceeded")
+    budget = lineage.summary(current)
+    if expect_budget or "gate_fix_budget" in event or "gate_fix_sources_sha256" in event:
+        require(state.digest(event.get("gate_fix_budget")) == state.digest(budget)
+                and event.get("gate_fix_sources_sha256") == lineage.source_hash(),
+                "Historical gate-fix budget disagrees with audited history")
+        require(not repair or budget["cumulative_used_attempts"] <= GATE_FIX_LIMIT,
+                "Historical cumulative gate-fix budget exceeded")
+        if index:
+            previous_path = str(events[index - 1][1])
+            require(event.get("artifact_hashes", {}).get(previous_path) == sha(previous_path),
+                    "Missing or changed gate-fix predecessor seal")
+    contract_path, contract_hash = contract_seal
+    require(event.get("sequence") == sequence
+            and event.get("artifact_hashes", {}).get(contract_path) == contract_hash,
+            "Gate-fix history does not bind its sequence and contract")
+    return budget
+
+
+def historical_budget_sources(sources, repo, workflow, current_contract=None, visited_contracts=None,
+                              gate_lineage=None):
     """Revalidate prior-run counters cited to carry budget usage into this run."""
     require(isinstance(sources, list) and sources, "Historical budget needs source runs")
     seen, validated, total = set(), [], 0
@@ -932,6 +1082,8 @@ def historical_budget_sources(sources, repo, workflow, current_contract=None, vi
         contract_path = absolute_file(source.get("contract_path"))
         require(current_contract is None or contract_path.resolve() != Path(current_contract).resolve(),
                 "Historical budget cannot reference its current run")
+        require(contract_path.resolve() not in (visited_contracts or ()),
+                "Historical budget reference cycle/current-run ancestry detected")
         require(contract_path.resolve() not in seen, "Duplicate historical budget contract")
         seen.add(contract_path.resolve())
         require(sha(contract_path) == source.get("contract_sha256"),
@@ -949,8 +1101,10 @@ def historical_budget_sources(sources, repo, workflow, current_contract=None, vi
         require(prior_events and state_path.resolve() == prior_events[-1][1].resolve()
                 and sha(state_path) == source.get("state_sha256"),
                 "Historical budget state hash/path mismatch")
-        audited = validate_history(contract_path, repo, visited_contracts)
+        audited = (gate_lineage.audit(contract_path, visited_contracts or set()) if gate_lineage is not None
+                   else validate_history(contract_path, repo, visited_contracts))
         require(state_path.resolve() == Path(audited["state_path"]).resolve()
+                and audited["state_sha256"] == source.get("state_sha256")
                 and sha(state_path) == source.get("state_sha256"),
                 "Historical budget state hash/path mismatch")
         require(audited["run_id"] == source.get("run_id")
@@ -972,7 +1126,7 @@ def historical_budget_used(grants):
     return max((item.get("historical_used_passes", 0) for item in grants), default=0)
 
 
-def budget_continuity(value, repo, contract_path, slice_id=None):
+def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_contracts=(), gate_lineage=None):
     """Validate an explicitly approved carryover without changing historical counters."""
     entries = value.get("budget_continuity", [])
     require(isinstance(entries, list), "Invalid budget continuity")
@@ -982,8 +1136,9 @@ def budget_continuity(value, repo, contract_path, slice_id=None):
     if not matches:
         return None
     item = matches[0]
+    visited = set(visited_contracts) | {Path(contract_path).resolve()}
     if "recovery_sources" in item:
-        return recovery_continuity(value, repo, contract_path, item, slice_id)
+        return recovery_continuity(value, repo, item, slice_id, visited, gate_lineage)
     require(item.get("approved_by") == "user", "Budget continuity requires user approval")
     for key in ("work_item", "user_authorization", "reason"):
         state.text(item.get(key), key)
@@ -995,7 +1150,7 @@ def budget_continuity(value, repo, contract_path, slice_id=None):
     exclusions = value.get("read_excludes", {}).get(repo, [])
     state.guard_excluded_path(item.get("source_contract_path"), root, exclusions)
     source = absolute_file(item.get("source_contract_path"))
-    require(source.resolve() != Path(contract_path).resolve(), "Continuity cannot reference current run")
+    require(source.resolve() not in visited, "Budget continuity cycle/current run reference")
     require(sha(source) == item.get("source_contract_sha256"), "Continuity contract seal mismatch")
     old = state.load(source)
     require(old.get("workflow") == value["workflow"] and repo in old.get("repos", [])
@@ -1018,6 +1173,25 @@ def budget_continuity(value, repo, contract_path, slice_id=None):
     source_state = absolute_file(item.get("source_state_path"))
     require(source_state.resolve() == events[-1][1].resolve()
             and sha(source_state) == item.get("source_state_sha256"), "Continuity state seal mismatch")
+    state.guard_excluded_path(item.get("decision_path"), root, exclusions)
+    decision = absolute_file(item.get("decision_path"))
+    require(sha(decision) == item.get("decision_sha256"), "Continuity decision seal mismatch")
+    require(used >= events[-1][2].get("review_fix_count", 0), "Continuity cannot reduce recorded usage")
+    if source_slice is None:
+        prior = [entry for entry in old.get("budget_continuity", [])
+                 if entry.get("repo") == repo and entry.get("slice_id") is None]
+        require(len(prior) <= 1, "Duplicate prior continuity")
+        if prior:
+            require(prior[0].get("work_item") == item["work_item"], "Continuity work item mismatch")
+            require(used >= prior[0]["used_passes"] + events[-1][2].get("review_fix_count", 0),
+                    "Continuity cannot reduce cumulative usage")
+        lineage = gate_lineage if gate_lineage is not None else GateFixLineage(value, repo)
+        audited = lineage.audit(source, visited, work_item=item["work_item"],
+                                expected=history_seal(item, "source_history_sha256"))
+        require(Path(audited["state_path"]).resolve() == source_state.resolve()
+                and audited["state_sha256"] == item["source_state_sha256"],
+                "Continuity state seal mismatch")
+        return item
     inherited = {}
     prior_count = 0
     prior_status = None
@@ -1025,26 +1199,21 @@ def budget_continuity(value, repo, contract_path, slice_id=None):
         bound(old, repo, event)
         require(event.get("artifact_hashes", {}).get(str(source)) == item["source_contract_sha256"],
                 "Continuity history does not seal its contract")
-        if source_slice is not None:
-            require(event.get("slice_id") == source_slice, "Continuity slice mismatch")
-            status = event.get("status")
-            require((prior_status is None and status == "implemented") or
-                    (prior_status is not None and (status in SLICE_TRANSITIONS.get(prior_status, set())
-                                                   or status in {"blocked", "capped"}
-                                                   or (prior_status == "capped" and status == "needs-fix"
-                                                       and event.get("is_continuation") is True))),
-                    "Invalid continuity slice transition")
-            prior_status = status
-            if event.get("status") == "edited-unverified" and event.get("action") == "review-fix":
-                prior_count += 1
-            require(event.get("review_fix_count", 0) == prior_count,
-                    "Continuity slice counter is inconsistent with events")
+        require(event.get("slice_id") == source_slice, "Continuity slice mismatch")
+        status = event.get("status")
+        require((prior_status is None and status == "implemented") or
+                (prior_status is not None and (status in SLICE_TRANSITIONS.get(prior_status, set())
+                                               or status in {"blocked", "capped"}
+                                               or (prior_status == "capped" and status == "needs-fix"
+                                                   and event.get("is_continuation") is True))),
+                "Invalid continuity slice transition")
+        prior_status = status
+        if status == "edited-unverified" and event.get("action") == "review-fix":
+            prior_count += 1
+        require(event.get("review_fix_count", 0) == prior_count,
+                "Continuity slice counter is inconsistent with events")
         check_event_seals(old, repo, event, inherited)
         inherited = event.get("artifact_hashes", {})
-    state.guard_excluded_path(item.get("decision_path"), root, exclusions)
-    decision = absolute_file(item.get("decision_path"))
-    require(sha(decision) == item.get("decision_sha256"), "Continuity decision seal mismatch")
-    require(used >= events[-1][2].get("review_fix_count", 0), "Continuity cannot reduce recorded usage")
     # Reject cycles and repeated sources, including through earlier continuity declarations.
     seen = {Path(contract_path).resolve()}
     current = source
@@ -1074,14 +1243,21 @@ def budget_continuity(value, repo, contract_path, slice_id=None):
         require(events and str(events[-1][1]) == previous.get("source_state_path")
                 and sha(events[-1][1]) == previous.get("source_state_sha256"),
                 "Continuity ancestor state seal mismatch")
-    if item.get("source_slice_id") is None:
-        validate_history(source, repo, read_excludes=old_excludes[repo])
-    elif old.get("budget_continuity"):
-        budget_continuity(old, repo, source, item.get("source_slice_id"))
+    if old.get("budget_continuity"):
+        budget_continuity(old, repo, source, item.get("source_slice_id"), visited_contracts=visited)
     return item
 
 
-def recovery_continuity(value, repo, contract_path, item, slice_id):
+def history_seal(source, key):
+    if key not in source:
+        return None
+    digest = source[key]
+    require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest),
+            "Invalid gate-fix source history SHA-256")
+    return digest
+
+
+def recovery_continuity(value, repo, item, slice_id, visited, gate_lineage):
     """Reconcile independent, audited repo histories without rewriting their events."""
     require(slice_id is None, "Budget recovery supports repository histories only")
     require(item.get("approved_by") == "user", "Budget recovery requires user approval")
@@ -1091,7 +1267,7 @@ def recovery_continuity(value, repo, contract_path, item, slice_id):
     extra = item.get("additional_passes")
     require(type(extra) is int and extra > 0, "Budget recovery requires positive additional passes")
     sources = item.get("recovery_sources")
-    require(isinstance(sources, list) and sources, "Budget recovery requires source histories")
+    history_seals = continuity_history_seals(item)
     root = value["repo_paths"][repo]
     exclusions = value.get("read_excludes", {}).get(repo, [])
     state.text(item.get("decision_path"), "budget recovery decision path")
@@ -1103,12 +1279,12 @@ def recovery_continuity(value, repo, contract_path, item, slice_id):
                 "approved_at", "reason", "additional_passes", "recovery_sources", "used_passes", "effective_limit"):
         require(approved.get(key) == item.get(key), "Budget recovery decision does not match accounting")
     seen, used, prior_extra = set(), 0, 0
-    for source in sources:
-        require(isinstance(source, dict), "Invalid budget recovery source")
+    lineage = gate_lineage
+    for source, expected in zip(sources, history_seals):
         state.text(source.get("contract_path"), "budget recovery source path")
         source_path = absolute_file(state.guard_excluded_path(source.get("contract_path"), root, exclusions))
         resolved = source_path.resolve()
-        require(resolved != Path(contract_path).resolve() and resolved not in seen,
+        require(resolved not in visited and resolved not in seen,
                 "Duplicate or cyclic budget recovery source")
         seen.add(resolved)
         require(sha(source_path) == source.get("contract_sha256"), "Budget recovery contract seal mismatch")
@@ -1119,7 +1295,14 @@ def recovery_continuity(value, repo, contract_path, item, slice_id):
                 "Budget recovery work item mismatch")
         # A previously carried allowance cannot be safely summed with independent histories.
         require(not old.get("budget_continuity"), "Nested continuity requires separate accounting; recovery refused")
-        audited = validate_history(source_path, repo, read_excludes=exclusions)
+        if lineage is not None or expected is not None:
+            if lineage is None:
+                lineage = GateFixLineage(value, repo)
+            audited = lineage.audit(source_path, visited, work_item=item["work_item"], expected=expected)
+            require(not lineage.cache[(resolved, repo, tuple(sorted(exclusions)))][1],
+                    "Nested historical grants require separate accounting; recovery refused")
+        else:
+            audited = validate_history(source_path, repo, visited_contracts=visited, read_excludes=exclusions)
         require(audited["run_id"] == source.get("run_id")
                 and audited["state_path"] == source.get("state_path")
                 and audited["state_sha256"] == source.get("state_sha256")
@@ -1139,27 +1322,19 @@ def check_related_budgets(value, repo, contract_path):
     """Fail closed when a locally identified related run has not been carried forward."""
     work_item = value.get("budget_work_items", {}).get(repo)
     if not work_item:
+        work_item = next((item.get("work_item") for item in value.get("budget_continuity", [])
+                          if item.get("repo") == repo and item.get("slice_id") is None), None)
+    if not work_item:
         return
     root = Path(contract_path).parent.parent.parent
     current = Path(contract_path).resolve()
-    continuity = budget_continuity(value, repo, contract_path)
-    covered = set()
-    if continuity:
-        if "recovery_sources" in continuity:
-            covered.update(Path(source["contract_path"]).resolve() for source in continuity["recovery_sources"])
-        else:
-            pending = [Path(continuity["source_contract_path"]).resolve()]
-            while pending:
-                source = pending.pop()
-                require(source != current and source not in covered, "Budget continuity cycle")
-                covered.add(source)
-                prior = state.load(source)
-                for entry in prior.get("budget_continuity", []):
-                    if entry.get("repo") == repo and entry.get("slice_id") is None:
-                        if "recovery_sources" in entry:
-                            pending.extend(Path(item["contract_path"]).resolve() for item in entry["recovery_sources"])
-                        else:
-                            pending.append(Path(entry["source_contract_path"]).resolve())
+    lineage = GateFixLineage(value, repo)
+    events = history(Path(contract_path).parent / repo)
+    if any(event.get("budget_grant_applied") for _, _, event in events):
+        validate_history(contract_path, repo, lineage_cache=lineage.cache, lineage_out=lineage.runs)
+    else:
+        budget_continuity(value, repo, contract_path, gate_lineage=lineage)
+    covered = {snapshot[0] for snapshot in lineage.runs.values()}
     for run_group in (root / ".ship-runs", root / ".fix-runs"):
         state.guard_excluded_path(str(run_group.absolute()), value["repo_paths"][repo],
                                   value.get("read_excludes", {}).get(repo, []))
@@ -1178,24 +1353,34 @@ def check_related_budgets(value, repo, contract_path):
             if candidate.resolve() == current:
                 continue
             other = state.load(candidate)
+            other_work = dict(other.get("budget_work_items", {}))
+            for item in other.get("budget_continuity", []):
+                if item.get("slice_id") is None:
+                    other_work.setdefault(item["repo"], item["work_item"])
             related = any(identifier == work_item and
                           Path(other.get("repo_paths", {}).get(name, "")).resolve()
                           == Path(value["repo_paths"][repo]).resolve()
-                          for name, identifier in other.get("budget_work_items", {}).items())
+                          for name, identifier in other_work.items())
             if related:
                 require(candidate.resolve() in covered,
                         f"Related run is missing from budget continuity: {candidate}")
 
 
-def review_budget(events, contract_path=None, value=None, repo=None, visited_contracts=None):
+def review_budget(events, contract_path=None, value=None, repo=None, visited_contracts=None, *,
+                  gate_lineage=None, certificate=None):
     """Derive repo-level review budget only from grants applied in immutable states."""
     grants, seen_paths, predecessors = [], set(), set()
-    continuity = budget_continuity(value, repo, contract_path) if value is not None and contract_path else None
-    base_limit = (continuity["effective_limit"] - continuity["used_passes"]) if continuity else REVIEW_FIX_BUDGET
-    carried_over, carried_sources = 0, []
     active_contracts = set(visited_contracts or ())
     if contract_path:
         active_contracts.add(Path(contract_path).resolve())
+    continuity = (budget_continuity(value, repo, contract_path, visited_contracts=active_contracts,
+                                    gate_lineage=gate_lineage) if value is not None and contract_path else None)
+    base_limit = (continuity["effective_limit"] - continuity["used_passes"]) if continuity else REVIEW_FIX_BUDGET
+    carried_over, carried_sources = 0, []
+    expect_budget = bool(continuity and any(continuity_history_seals(continuity)))
+    certificate_checked = False
+    state_hashes = []
+    contract_seal = (str(contract_path), sha(contract_path)) if gate_lineage is not None else None
     run_root = Path(events[0][1]).parent.parent.resolve() if events else None
     for index, (_, event_path, event) in enumerate(events):
         grant = event.get("budget_grant")
@@ -1288,7 +1473,7 @@ def review_budget(events, contract_path=None, value=None, repo=None, visited_con
                 historical_used, validated_sources = historical_budget_sources(
                     historical_sources, repo,
                     value["workflow"] if value is not None else data["workflow"], contract_path,
-                    active_contracts)
+                    active_contracts, gate_lineage)
                 require(data.get("historical_used_passes") == historical_used,
                         "Historical budget usage total mismatch")
                 require(historical_sources == validated_sources,
@@ -1319,11 +1504,25 @@ def review_budget(events, contract_path=None, value=None, repo=None, visited_con
         if "review_fix_grants" in event:
             require(event["review_fix_grants"] == grants,
                     "Review-fix grant history disagrees with applied grants")
+        if gate_lineage is not None:
+            budget = check_gate_budget_event(events, index, contract_seal, gate_lineage, expect_budget)
+            expect_budget = expect_budget or "gate_fix_budget" in event
+            if certificate is not None:
+                state_hashes.append((event_path.name, sha(event_path)))
+                if certificate.get("state_path") == str(event_path):
+                    require(event["status"] == "verified"
+                            and state.digest(certificate.get("gate_fix_budget")) == state.digest(budget)
+                            and certificate.get("gate_fix_history_sha256") ==
+                            gate_lineage.history_hash(contract_seal[1], state_hashes),
+                            "Completion certificate gate-fix budget/history mismatch")
+                    certificate_checked = True
+    require(certificate is None or certificate_checked, "Missing gate-fix certificate state")
     return max(0, base_limit + sum(item["additional_passes"] for item in grants)
                - carried_over), grants
 
 
-def apply_budget_grant(contract_path, value, repo, request, events, previous, data, recovery_path=None):
+def apply_budget_grant(contract_path, value, repo, request, events, previous, data, recovery_path=None, *,
+                       gate_lineage=None):
     """Validate a user's one-time run-local grant and return its sealed summary."""
     require(events and (request.get("status") != "edited-unverified" or recovery_path),
             "Grant application needs an existing state")
@@ -1348,7 +1547,7 @@ def apply_budget_grant(contract_path, value, repo, request, events, previous, da
         require("slice_repair_recovery_sha256" not in grant, "Recovery grant needs a slice repair recovery")
     requested_historical, validated_sources = (historical_budget_sources(
         historical_sources, repo, value["workflow"], contract_path,
-        {Path(contract_path).resolve()}) if historical_sources else (0, []))
+        {Path(contract_path).resolve()}, gate_lineage) if historical_sources else (0, []))
     require(grant.get("historical_used_passes", 0) == requested_historical,
             "Historical budget usage total mismatch")
     require(historical_sources == validated_sources, "Historical budget source snapshot mismatch")
@@ -1721,13 +1920,14 @@ def transition(contract_path, repo, request_path, out):
         bound(value, repo, event)
         check_event_seals(value, repo, event, inherited_seals)
         inherited_seals = event.get("artifact_hashes", {})
-    budget_limit, applied_grants = review_budget(events, contract_path, value, repo)
+    lineage = GateFixLineage(value, repo)
+    budget_limit, applied_grants = review_budget(events, contract_path, value, repo, gate_lineage=lineage)
     request = state.load(absolute_file(request_path))
     require(isinstance(request, dict), "Transition request must be an object")
     protected = {"review_fingerprint", "artifact_hashes", "initial_manifest", "code_only", "schema_version",
                  "run_id", "repo", "sequence", "at", "current_author_agent_id", "review_fix_limit",
                  "review_fix_grants", "budget_grant", "amendment_sha256", "amendment_applied",
-                 "budget_grant_applied"}
+                 "budget_grant_applied", "gate_fix_budget", "gate_fix_sources_sha256"}
     require(not protected & set(request), "Request overrides certified lifecycle fields")
     status = request.get("status")
     require("original_agent_id" not in request
@@ -1899,7 +2099,7 @@ def transition(contract_path, repo, request_path, out):
         sealed.append(acceptance_path)
     for applied in value.get("_amendments", []):
         sealed.append(applied["path"])
-    if (policy or recovery_anchor) and events:
+    if events:
         sealed.append(str(events[-1][1]))
     if value["workflow"] == "ship":
         sealed.append(value["approved_snapshot"])
@@ -1930,7 +2130,7 @@ def transition(contract_path, repo, request_path, out):
         sealed += recovery_seals
     if is_grant_transition:
         target, grant_summary = apply_budget_grant(
-            contract_path, value, repo, request, events, previous, data, recovery_path)
+            contract_path, value, repo, request, events, previous, data, recovery_path, gate_lineage=lineage)
         require(status == target, "Grant transition status changed during validation")
         continuity = budget_continuity(value, repo, contract_path)
         base_limit = (continuity["effective_limit"] - continuity["used_passes"]) if continuity else REVIEW_FIX_BUDGET
@@ -2052,16 +2252,8 @@ def transition(contract_path, repo, request_path, out):
             require(data["review_fix_count"] < budget_limit, "Plan-gap repair budget exhausted")
             data["review_fix_count"] += 1
         if action == "gate-fix":
-            require(data["gate_fix_count"] < 2, "Gate-fix budget exhausted")
-            failure_path = request.get("gate_failure_path")
-            failure = state.load(absolute_file(failure_path))
-            claims = failure.get("claims", [])
-            require(claims, "Gate fix needs recorded failed check")
-            identifier = claims[0]["id"]
-            allowed = {x["id"] for group in ("required_gates", "pre_review_checks") for x in value[group][repo]}
-            require(identifier in allowed, "Gate failure does not name a declared gate")
-            sealed += proof(value, repo, failure_path, manifest(value, repo, previous["source_manifest"]),
-                            identifier, "orchestrator", expected_status="failed")
+            require(lineage.summary(data["gate_fix_count"])["remaining_attempts"] > 0, "Gate-fix budget exhausted")
+            sealed += gate_failure_proof(value, repo, request.get("gate_failure_path"), previous)
             data["gate_fix_count"] += 1
         for key in ("gate_evidence_paths", "assessment_path"):
             data.pop(key, None)
@@ -2102,10 +2294,13 @@ def transition(contract_path, repo, request_path, out):
         sealed += assessment(value, repo, request.get("assessment_path", data.get("assessment_path")), final, initial)
     if status in TERMINAL:
         state.text(request.get("reason"), "blocker/handoff reason")
+    data["gate_fix_budget"] = lineage.summary(data["gate_fix_count"])
+    data["gate_fix_sources_sha256"] = lineage.source_hash()
     data["artifact_hashes"] = {**previous.get("artifact_hashes", {}), **seal_files(sealed)}
     if recovery_path:
         fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
     # Scope is intentionally mutable; the event captures its values, not a mutable-file seal.
+    check_gate_sources_current(lineage.cache)
     state.write_once(out, data)
     return data
 
@@ -3226,7 +3421,44 @@ def slice_schedule(contract_path, repo, schedule_path):
     return {"groups": groups, "cross_slice_criteria": sorted(cross), "schedule_sha256": sha(path)}
 
 
-def validate_history(contract_path, repo, visited_contracts=None, read_excludes=()):
+def gate_budget_certificate(contract_path, value, repo, events):
+    certificate_path = contract_path.parent / "completion.json"
+    if not certificate_path.is_file():
+        return None
+    state.guard_excluded_path(str(certificate_path), value["repo_paths"][repo],
+                              value.get("read_excludes", {}).get(repo, []))
+    record = state.load(certificate_path)
+    require(isinstance(record, dict), "Invalid completion certificate")
+    require(record.get("schema_version") == VERSION and record.get("run_id") == value["run_id"]
+            and record.get("workflow") == value["workflow"] and record.get("status") == "completed",
+            "Invalid completion certificate identity")
+    repos = record.get("repos")
+    require(isinstance(repos, dict) and set(value["repos"]) <= repos.keys(),
+            "Completion certificate is missing a contract repository")
+    candidate = repos[repo]
+    require(isinstance(candidate, dict), "Invalid completion certificate repository")
+    certified_state = candidate.get("state_path")
+    require(isinstance(certified_state, str), "Completion certificate is missing its verified state")
+    anchor = next(((path, event) for _, path, event in events if str(path) == certified_state), None)
+    seals = record.get("artifact_hashes")
+    require(isinstance(seals, dict) and anchor is not None and anchor[1]["status"] == "verified"
+            and seals.get(certified_state) == sha(anchor[0]) and seals.get(str(contract_path)) == sha(contract_path),
+            "Completion certificate state/contract seal mismatch")
+    state_dir = anchor[0].parent
+    sealed_states = []
+    for path in map(Path, seals):
+        match = re.fullmatch(r"state-(\d+)\.json", path.name)
+        if match and path.parent == state_dir:
+            sealed_states.append((int(match[1]), str(path)))
+    require(max(sealed_states)[1] == certified_state,
+            "Completion certificate does not name its latest sealed repository state")
+    has_budget = ("gate_fix_budget" in candidate or "gate_fix_history_sha256" in candidate
+                  or "gate_fix_budget" in anchor[1])
+    return candidate if has_budget else None
+
+
+def validate_history(contract_path, repo, visited_contracts=None, read_excludes=(), *,
+                     lineage_cache=None, lineage_out=None):
     """Audit immutable lifecycle state and grant chains without recapturing today's source."""
     contract_file = absolute_file(contract_path)
     visited = set(visited_contracts or ())
@@ -3319,7 +3551,10 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
                     and event.get("applied_path") == references["applied"]
                     and set(seals) <= inherited.keys(),
                     "Historical slice repair recovery proof is not sealed")
-    limit, grants = review_budget(events, contract_path, value, repo, visited)
+    certificate = gate_budget_certificate(contract_file, value, repo, events)
+    lineage = GateFixLineage(value, repo, lineage_cache)
+    limit, grants = review_budget(events, contract_file, value, repo, visited,
+                                  gate_lineage=lineage, certificate=certificate)
     latest = events[-1][2]
     if latest.get("scope_amendment_path"):
         scope_amendment(contract_path, value, repo, latest["scope_amendment_path"], events,
@@ -3329,9 +3564,14 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
             "state_path": str(events[-1][1]), "state_sha256": sha(events[-1][1]),
             "granted_additional_passes": sum(item["additional_passes"] for item in grants),
             "grants": grants,
+            "gate_fix_budget": lineage.summary(expected_gate_fixes),
+            "history_sha256": lineage.history_hash(sha(contract_file),
+                                                   [(path.name, sha(path)) for _, path, _ in events]),
             "states": len(events), "status": "valid"}
     if historical_budget_used(grants):
         result["historical_used_passes"] = historical_budget_used(grants)
+    if lineage_out is not None:
+        lineage_out.update(lineage.runs)
     return result
 
 
@@ -3366,7 +3606,8 @@ def review_budget_status(contract_path, repo, slice_id=None):
                     "Slice history belongs to a different slice or schedule")
         check_event_seals(value, repo, event, inherited)
         inherited = event.get("artifact_hashes", {})
-    limit, grants = (review_budget(events, contract_file, value, repo) if slice_id is None
+    lineage = GateFixLineage(value, repo) if slice_id is None else None
+    limit, grants = (review_budget(events, contract_file, value, repo, gate_lineage=lineage) if slice_id is None
                      else (events[-1][2].get("review_fix_limit", SLICE_REVIEW_FIX_BUDGET), []))
     latest_path, latest = events[-1][1:]
     scope = (sorted(set(latest.get("scope", [])) | set(latest.get("source_scope", [])))
@@ -3404,6 +3645,8 @@ def review_budget_status(contract_path, repo, slice_id=None):
             "For authorized and reaccepted slice repairs, run slice-gate and submit slice_repair_recovery_path "
             "via transition. Follow the repo review fix recovery procedure in PROTOCOL.md."
             + (" A user-approved budget grant bound to the recovery is required." if used >= limit else ""))
+    if lineage is not None:
+        result["gate_fix_budget"] = lineage.summary(latest.get("gate_fix_count", 0))
     continuity = budget_continuity(value, repo, contract_file, slice_id)
     if continuity:
         result.update({"historical_used_passes": continuity["used_passes"],
@@ -3421,6 +3664,8 @@ def complete(contract_path, out):
     root = Path(contract_path).parent
     require(Path(out).resolve() == (root / "completion.json").resolve(), "Invalid completion path")
     repos = {}
+    lineages = {}
+    certified_state_hashes = {}
     paths = [contract_path]
     for applied in value.get("_amendments", []):
         paths.append(applied["path"])
@@ -3429,7 +3674,11 @@ def complete(contract_path, out):
         events = history(root / repo)
         require(events and events[-1][2]["status"] == "verified", f"Repo not verified: {repo}")
         latest = events[-1][2]
-        effective_limit, grants = review_budget(events, contract_path, value, repo)
+        audit = validate_history(contract_path, repo, lineage_cache=lineages)
+        require(audit["state_path"] == str(events[-1][1]) and audit["state_sha256"] == sha(events[-1][1]),
+                "Completion state changed during history audit")
+        certified_state_hashes[repo] = audit["state_sha256"]
+        effective_limit, grants = audit["review_fix_limit"], audit["grants"]
         inherited_seals = {}
         for _, _, event in events:
             check_event_seals(value, repo, event, inherited_seals)
@@ -3480,10 +3729,16 @@ def complete(contract_path, out):
                         open_findings.append({**finding, "scope": "slice/" + directory.name,
                                               "review_acceptance_path": slice_latest.get("review_acceptance_path")})
         repos[repo] = {"source_fingerprint": final["fingerprint"], "state_path": str(events[-1][1]),
-                       "review_budget": budget_summary, "open_findings": open_findings}
+                       "review_budget": budget_summary, "open_findings": open_findings,
+                       "gate_fix_budget": audit["gate_fix_budget"], "gate_fix_history_sha256": audit["history_sha256"]}
         paths += [str(events[-1][1]), *latest["artifact_hashes"]]
     if value.get("telemetry_policy", {}).get("run_local_seals"):
         require_run_local(value, root, paths)
+    for repo, entry in repos.items():
+        current = history(root / repo)
+        require(current and str(current[-1][1]) == entry["state_path"]
+                and sha(current[-1][1]) == certified_state_hashes[repo], "Completion state changed during checks")
+    check_gate_sources_current(lineages)
     state.write_once(out, {"schema_version": VERSION, "run_id": value["run_id"],
                           "workflow": value["workflow"], "status": "completed",
                           "amendment": value.get("_amendment"),
@@ -3687,6 +3942,12 @@ def phase_from_record(contract_path, record, out):
     repair = (value.get("telemetry_policy", {}).get("repair_phase_required", False)
               and record["phase"] in {"review-fix", "gate-fix"} and not value.get("from_review")
               and slice_id is None)
+    if record["phase"] == "gate-fix" and slice_id is None and record["event"] == "phase-start":
+        repo = record.get("repo")
+        require(repo in value["repos"], "Gate-fix phase requires a repo")
+        check_related_budgets(value, repo, contract_path)
+        audited = validate_history(contract_path, repo)
+        require(audited["gate_fix_budget"]["remaining_attempts"] > 0, "Gate-fix budget exhausted")
     if repair and record["event"] == "phase-start":
         repo = record.get("repo")
         require(repo in value["repos"], "Repair phase requires a repo")
@@ -3753,7 +4014,7 @@ def digest(contract_path, repo, verbose=False):
                "artifacts": {"contract": str(Path(contract_path).resolve()),
                              "state": None, "review": None, "assessment": None,
                              "telemetry_count": 0, "sealed_count": 0},
-               "checks": {}, "review_budget": None}
+               "checks": {}, "review_budget": None, "gate_fix_budget": None}
     errors = {}
     try:
         value = contract(contract_path)
@@ -3797,7 +4058,9 @@ def digest(contract_path, repo, verbose=False):
     status = latest.get("status") if latest else "uninitialized"
     summary["current_status"] = status
     try:
-        limit, grants = review_budget(events, contract_path, value, repo)
+        lineage = GateFixLineage(value, repo)
+        limit, grants = review_budget(events, contract_path, value, repo, gate_lineage=lineage)
+        summary["gate_fix_budget"] = lineage.summary((latest or {}).get("gate_fix_count", 0))
         used = latest.get("review_fix_count", 0) if latest else 0
         continuity = budget_continuity(value, repo, contract_path)
         carried_over = continuity["used_passes"] if continuity else historical_budget_used(grants)
@@ -3908,7 +4171,7 @@ def digest_all_repos(contract_path, verbose=False):
         else:
             result["repos"][repo] = {key: summary[key] for key in
                                      ("status", "current_status", "next_transitions",
-                                      "remaining_findings", "artifacts", "checks", "review_budget")
+                                      "remaining_findings", "artifacts", "checks", "review_budget", "gate_fix_budget")
                                      if key in summary}
             if "errors" in summary:
                 result["repos"][repo]["errors"] = summary["errors"]

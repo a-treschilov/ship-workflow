@@ -291,7 +291,7 @@ class LifecycleTests(unittest.TestCase):
         return self.save(name, state.capture(self.repo, ["source.txt"]))
 
     def artifact(self, **kwargs):
-        return {"schema_version": 2, "run_id": "run-1", "repo": "api", **kwargs}
+        return {"schema_version": 2, "run_id": self.run.name, "repo": "api", **kwargs}
 
     def evidence(self, identifier, kind="empirical", status="passed", source=None, producer="orchestrator"):
         self.counter += 1
@@ -1330,21 +1330,24 @@ class LifecycleTests(unittest.TestCase):
         self.move("needs-fix", review_path=review_path)
         previous = workflow.history(self.run / "api")[-1][1]
         prior_sources = []
-        expected = {}
-        for run_id, used in (("older-run", 1), ("successor-run", 2)):
-            historical = self.run / "historical" / run_id
-            historical.mkdir(parents=True, exist_ok=True)
-            contract_path = historical / "contract.json"
-            contract_path.write_text(json.dumps({"workflow": "fix", "run_id": run_id, "repos": ["api"]}))
-            state_path = historical / "api" / "state-1.json"
-            state_path.parent.mkdir(parents=True)
-            state_path.write_text(json.dumps({"run_id": run_id, "review_fix_count": used}))
-            source = {"run_id": run_id, "contract_path": str(contract_path),
-                      "contract_sha256": workflow.sha(contract_path), "state_path": str(state_path),
-                      "state_sha256": workflow.sha(state_path), "used_passes": used, "effective_limit": 3}
-            prior_sources.append(source)
-            expected[str(contract_path)] = {"run_id": run_id, "repo": "api", "state_path": str(state_path),
-                                            "review_fix_count": used, "review_fix_limit": 3}
+        original = self.run, self.scope, self.initial, self.base, self.c, self.contract, self.counter
+        original_source = self.source.read_text()
+        for run_id, used in (("older-run", 1), ("other-run", 2)):
+            self.new_budget_run(run_id)
+            self.ready()
+            self.implement()
+            self.record_gate_fix()
+            for number in range(used):
+                self.move("reviewed", review_path=self.review())
+                self.source.write_text(f"repair acceptance gap {number}")
+                self.move("edited-unverified", action="plan-gap")
+                self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+            audited = workflow.validate_history(self.contract, "api")
+            prior_sources.append({"run_id": run_id, "contract_path": self.contract,
+                                  "contract_sha256": workflow.sha(self.contract), "state_path": audited["state_path"],
+                                  "state_sha256": audited["state_sha256"], "used_passes": used, "effective_limit": 3})
+        self.run, self.scope, self.initial, self.base, self.c, self.contract, self.counter = original
+        self.source.write_text(original_source)
         grant_path = self.run / "budget-grants" / "carryover.json"
         grant_path.parent.mkdir(parents=True, exist_ok=True)
         grant_path.write_text(json.dumps(self.artifact(
@@ -1356,42 +1359,42 @@ class LifecycleTests(unittest.TestCase):
             review_path=review_path, review_sha256=workflow.sha(review_path), review_round=1,
             finding_ids=["api-1"], criterion_ids=[], historical_used_passes=3,
             historical_budget_sources=prior_sources)))
-        with patch.object(workflow, "validate_history", side_effect=lambda path, repo, *args: expected[str(Path(path))]):
-            approved = self.move("needs-fix", budget_grant_path=str(grant_path))
-            self.assertEqual((0, 1), (approved["review_fix_count"], approved["review_fix_limit"]))
-            status = workflow.review_budget_status(self.contract, "api")
-            self.assertEqual((1, 3, 1, True), (status["limit"], status["historical_used_passes"],
-                                               status["remaining_passes"], status["source_matches_state"]))
-            self.assertEqual(3, workflow.review_budget(
-                workflow.history(self.run / "api"), self.contract, self.c, "api")[1][0]["historical_used_passes"])
-            self.source.write_text("first authorized repair\n")
-            proof_path = self.evidence("fix.ac-1", kind="static")
-            proof_record = state.load(proof_path)
-            proof_record["claims"] = [{"id": "api-1", "assertion": "finding repair checked"}]
-            Path(proof_path).write_text(json.dumps(proof_record))
-            applied_path = self.save("carryover-applied.json", self.artifact(
-                round=1, applied=[{"id": "api-1", "verified": "source inspected",
-                "verification_kind": "static", "evidence_paths": [proof_path]}], failed=[], skipped=[]))
-            self.move("edited-unverified", action="review-fix", applied_path=applied_path)
-            self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
-            next_review = self.review([{**finding, "status": "recurring"}])
-            self.move("needs-fix", review_path=next_review)
-            next_previous = workflow.history(self.run / "api")[-1][1]
-            next_grant = self.run / "budget-grants" / "carryover-second.json"
-            next_grant.write_text(json.dumps(self.artifact(
-                workflow="fix", contract_sha256=workflow.sha(self.contract), additional_passes=1,
-                purpose="review-fix", reason="One more bounded repair after carryover is consumed",
-                approved_by="user", user_authorization="Grant one further pass",
-                approval_question="Grant one further pass?", approved_at=datetime.now(timezone.utc).isoformat(),
-                previous_state_path=str(next_previous), previous_state_sha256=workflow.sha(next_previous),
-                review_path=next_review, review_sha256=workflow.sha(next_review), review_round=2,
-                finding_ids=["api-1"], criterion_ids=[])))
-            with patch.object(workflow, "validate_history", side_effect=lambda path, repo, *args: expected[str(Path(path))]):
-                second = self.move("needs-fix", budget_grant_path=str(next_grant))
-                second_status = workflow.review_budget_status(self.contract, "api")
-            self.assertEqual((1, 2), (second["review_fix_count"], second["review_fix_limit"]))
-            self.assertEqual((2, 1, 4), (second_status["limit"], second_status["remaining_passes"],
-                                       second_status["cumulative_used_passes"]))
+        approved = self.move("needs-fix", budget_grant_path=str(grant_path))
+        self.assertEqual((0, 1), (approved["review_fix_count"], approved["review_fix_limit"]))
+        status = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual((1, 3, 1, True), (status["limit"], status["historical_used_passes"],
+                                           status["remaining_passes"], status["source_matches_state"]))
+        self.assertEqual(3, workflow.review_budget(
+            workflow.history(self.run / "api"), self.contract, self.c, "api")[1][0]["historical_used_passes"])
+        self.source.write_text("first authorized repair\n")
+        proof_path = self.evidence("fix.ac-1", kind="static")
+        proof_record = state.load(proof_path)
+        proof_record["claims"] = [{"id": "api-1", "assertion": "finding repair checked"}]
+        Path(proof_path).write_text(json.dumps(proof_record))
+        applied_path = self.save("carryover-applied.json", self.artifact(
+            round=1, applied=[{"id": "api-1", "verified": "source inspected",
+            "verification_kind": "static", "evidence_paths": [proof_path]}], failed=[], skipped=[]))
+        self.move("edited-unverified", action="review-fix", applied_path=applied_path)
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        next_review = self.review([{**finding, "status": "recurring"}])
+        self.move("needs-fix", review_path=next_review)
+        next_previous = workflow.history(self.run / "api")[-1][1]
+        next_grant = self.run / "budget-grants" / "carryover-second.json"
+        next_grant.write_text(json.dumps(self.artifact(
+            workflow="fix", contract_sha256=workflow.sha(self.contract), additional_passes=1,
+            purpose="review-fix", reason="One more bounded repair after carryover is consumed",
+            approved_by="user", user_authorization="Grant one further pass",
+            approval_question="Grant one further pass?", approved_at=datetime.now(timezone.utc).isoformat(),
+            previous_state_path=str(next_previous), previous_state_sha256=workflow.sha(next_previous),
+            review_path=next_review, review_sha256=workflow.sha(next_review), review_round=2,
+            finding_ids=["api-1"], criterion_ids=[], historical_used_passes=3,
+            historical_budget_sources=prior_sources)))
+        second = self.move("needs-fix", budget_grant_path=str(next_grant))
+        second_status = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual(2, second_status["gate_fix_budget"]["historical_used_attempts"])
+        self.assertEqual((1, 2), (second["review_fix_count"], second["review_fix_limit"]))
+        self.assertEqual((2, 1, 4), (second_status["limit"], second_status["remaining_passes"],
+                                   second_status["cumulative_used_passes"]))
 
     def test_historical_budget_source_rejects_changed_state_hash(self):
         hist = self.run / "historical" / "run-a"
@@ -1515,6 +1518,381 @@ class LifecycleTests(unittest.TestCase):
         self.source.write_text("third fix")
         with self.assertRaisesRegex(ValueError, "budget exhausted"):
             self.move("edited-unverified", action="gate-fix", gate_failure_path=failed)
+
+    def new_budget_run(self, run_id, *, predecessor=None, run_group=None):
+        self.run = (run_group or self.root) / run_id
+        self.run.mkdir(parents=True)
+        self.scope = self.save("scope.json", ["source.txt"])
+        self.initial = self.capture("initial.json")
+        self.base = self.run / "api/baselines"
+        state.baseline(self.repo, self.base, "source.txt")
+        self.counter = 0
+        self.c = copy.deepcopy(self.c)
+        self.c.update(run_id=run_id)
+        self.c.pop("successor_scopes", None)
+        self.c.pop("budget_continuity", None)
+        if predecessor:
+            audit = workflow.validate_history(predecessor, "api")
+            decision = self.save("decision.json", {"reason": "Continue approved work"})
+            item = {"repo": "api", "work_item": "work-1", "approved_by": "user",
+                    "user_authorization": "Continue approved work", "reason": "Continue the same work",
+                    "approved_at": "2026-01-01T00:00:00Z", "decision_path": decision,
+                    "decision_sha256": workflow.sha(decision), "source_contract_path": predecessor,
+                    "source_contract_sha256": workflow.sha(predecessor), "source_state_path": audit["state_path"],
+                    "source_state_sha256": audit["state_sha256"], "source_history_sha256": audit["history_sha256"],
+                    "used_passes": 0, "effective_limit": 3}
+            self.c["budget_continuity"] = [item]
+            self.c["successor_scopes"] = [{"repo": "api", "work_item": "work-1"}]
+        self.contract = self.save("contract.json", self.c)
+
+    def record_gate_fix(self):
+        self.move("reviewed", review_path=self.review())
+        failed = self.evidence("gate.tests", status="failed")
+        self.source.write_text(f"gate repair in {self.run.name} at {self.counter}\n")
+        event = self.move("edited-unverified", action="gate-fix", gate_failure_path=failed, gate_fix_count=0)
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        return event
+
+    def test_gate_fix_audits_aliased_failure_proof_paths(self):
+        self.ready()
+        self.implement()
+        self.move("reviewed", review_path=self.review())
+        proof_path = Path(self.evidence("gate.tests", status="failed"))
+        failure_path = f"{proof_path.parent}/./{proof_path.name}"
+        proof = state.load(proof_path)
+        log_path = Path(proof["artifact_paths"][0])
+        aliased_log = f"{log_path.parent}/./{log_path.name}"
+        proof["artifact_paths"] = [aliased_log]
+        proof["artifact_hashes"][aliased_log] = proof["artifact_hashes"].pop(str(log_path))
+        proof_path.write_text(json.dumps(proof))
+        self.source.write_text("gate repair with an aliased proof path")
+        result = self.move("edited-unverified", action="gate-fix", gate_failure_path=failure_path)
+        self.assertEqual(1, result["gate_fix_count"])
+        self.assertEqual(1, workflow.validate_history(self.contract, "api")["gate_fix_budget"]["current_used_attempts"])
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+
+    def test_gate_fix_successor_accepts_absolute_alias_to_latest_source(self):
+        self.ready()
+        self.implement()
+        self.record_gate_fix()
+        self.new_budget_run("successor", predecessor=self.contract)
+        item = self.c["budget_continuity"][0]
+        alias = self.run / "predecessor-state.json"
+        alias.symlink_to(item["source_state_path"])
+        item["source_state_path"] = str(alias)
+        self.save("contract.json", self.c)
+        self.ready()
+        self.assert_gate_budget(1, 0)
+
+    def record_budget_source(self):
+        self.ready()
+        self.implement()
+        self.record_gate_fix()
+        for index in range(3):
+            self.move("reviewed", review_path=self.review())
+            self.source.write_text(f"acceptance repair {index}")
+            self.move("edited-unverified", action="plan-gap")
+            self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        audit = workflow.validate_history(self.contract, "api")
+        return {"run_id": self.run.name, "contract_path": self.contract, "contract_sha256": workflow.sha(self.contract),
+                "state_path": audit["state_path"], "state_sha256": audit["state_sha256"],
+                "used_passes": audit["review_fix_count"], "effective_limit": audit["review_fix_limit"]}
+
+    def apply_historical_plan_gap_grant(self, source):
+        self.ready()
+        self.implement()
+        review_path = self.review()
+        self.move("reviewed", review_path=review_path)
+        previous = workflow.history(self.run / "api")[-1][1]
+        grant = self.save("budget-grants/carry.json", self.artifact(
+            workflow="fix", contract_sha256=workflow.sha(self.contract), additional_passes=1, purpose="plan-gap",
+            reason="Carry audited historical usage", approved_by="user", user_authorization="Approve one pass",
+            approval_question="Approve one pass?", approved_at=datetime.now(timezone.utc).isoformat(),
+            previous_state_path=str(previous), previous_state_sha256=workflow.sha(previous), review_path=review_path,
+            review_sha256=workflow.sha(review_path), review_round=1, criterion_ids=["fix.ac-1"],
+            historical_used_passes=source["used_passes"], historical_budget_sources=[source]))
+        self.move("reviewed", budget_grant_path=grant)
+
+    def test_gate_fix_legacy_grant_covers_discovered_predecessor(self):
+        self.ready()
+        self.new_budget_run("prior", predecessor=self.contract)
+        source = self.record_budget_source()
+        plans = self.root / "plans" / ".fix-runs"
+        self.new_budget_run("continued", run_group=plans)
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.save("contract.json", self.c)
+        self.apply_historical_plan_gap_grant(source)
+        # Discovery gains the predecessor after the grant has already sealed the reference.
+        (plans / source["run_id"]).symlink_to(Path(source["contract_path"]).parent, target_is_directory=True)
+        status = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual(3, status["historical_used_passes"])
+        self.assertEqual(1, status["gate_fix_budget"]["historical_used_attempts"])
+        self.source.write_text("the already-approved review repair")
+        self.assertEqual(1, self.move("edited-unverified", action="plan-gap")["review_fix_count"])
+
+    def test_gate_fix_rejects_transitive_source_for_different_work_item(self):
+        self.c["budget_work_items"] = {"api": "different-work"}
+        self.save("contract.json", self.c)
+        source = self.record_budget_source()
+        self.new_budget_run("unlabeled")
+        self.c.pop("budget_work_items")
+        self.save("contract.json", self.c)
+        self.apply_historical_plan_gap_grant(source)
+        self.new_budget_run("successor", predecessor=self.contract)
+        with self.assertRaisesRegex(ValueError, "Gate-fix source work item mismatch"):
+            self.move("initialized")
+
+    def assert_gate_budget(self, historical, current):
+        expected = {"limit": 2, "historical_used_attempts": historical, "current_used_attempts": current,
+                    "cumulative_used_attempts": historical + current,
+                    "remaining_attempts": max(0, 2 - historical - current)}
+        status = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual(expected, status["gate_fix_budget"])
+        self.assertEqual(expected, workflow.digest(self.contract, "api")["gate_fix_budget"])
+        self.assertEqual(expected, workflow.digest_all_repos(self.contract)["repos"]["api"]["gate_fix_budget"])
+        self.assertEqual(expected, workflow.validate_history(self.contract, "api")["gate_fix_budget"])
+        self.assertEqual(3, status["limit"])
+        return expected
+
+    def assert_gate_fix_exhausted(self):
+        self.move("reviewed", review_path=self.review())
+        failed = self.evidence("gate.tests", status="failed")
+        with self.assertRaisesRegex(ValueError, "Gate-fix budget exhausted"):
+            workflow.phase_from_flags(self.contract, str(self.run / "telemetry/repair-start.json"),
+                                      phase_id="repair", phase="gate-fix", event="phase-start", repo="api")
+        source = self.source.read_text()
+        self.source.write_text("refused gate repair\n")
+        with self.assertRaisesRegex(ValueError, "Gate-fix budget exhausted"):
+            self.move("edited-unverified", action="gate-fix", gate_failure_path=failed, gate_fix_count=0)
+        self.source.write_text(source)
+
+    def verify_budget_run(self):
+        self.move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests")])
+        assessment = self.save("assessment.json", self.artifact(
+            producer="orchestrator", requirements_match=True, criteria=[{
+                "criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                "reason": "the acceptance assertion passed", "evidence_paths": [self.evidence("fix.ac-1")]}]))
+        self.move("verified", assessment_path=assessment)
+
+    def test_gate_fix_successor_budget_spans_three_generations(self):
+        self.ready()
+        self.implement()
+        self.record_gate_fix()
+        self.new_budget_run("successor", predecessor=self.contract)
+        with self.assertRaisesRegex(ValueError, "overrides certified lifecycle fields"):
+            self.move("initialized", gate_fix_budget={"remaining_attempts": 2})
+        self.ready()
+        self.implement()
+        self.assert_gate_budget(1, 0)
+        self.assertEqual(1, self.record_gate_fix()["gate_fix_count"])
+        self.assert_gate_budget(1, 1)
+        self.assert_gate_fix_exhausted()
+        self.new_budget_run("next-successor", predecessor=self.contract)
+        self.ready()
+        self.implement()
+        self.assert_gate_budget(2, 0)
+        self.assert_gate_fix_exhausted()
+        for command in ("validate-history", "review-budget", "digest"):
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    ["python3", "-I", "-B", str(SCRIPT), command, "--contract", self.contract, "--repo", "api"],
+                    check=True, capture_output=True, text=True)
+                payload = result.stdout.removesuffix(f"OK: {command}\n")
+                self.assertEqual(2, json.loads(payload)["gate_fix_budget"]["historical_used_attempts"])
+
+    def test_gate_fix_exhausted_legacy_predecessor_and_certificate(self):
+        self.ready()
+        self.implement()
+        self.record_gate_fix()
+        self.record_gate_fix()
+        self.move("reviewed", review_path=self.review())
+        self.verify_budget_run()
+        predecessor = self.contract
+        legacy = workflow.history(self.run / "api")
+        state_paths = {str(path) for _, path, _ in legacy}
+        for _, path, event in legacy:
+            event.pop("gate_fix_budget")
+            event.pop("gate_fix_sources_sha256")
+            event["artifact_hashes"] = {k: v for k, v in event["artifact_hashes"].items() if k not in state_paths}
+            path.write_text(json.dumps(event))
+        legacy_head = str(legacy[-1][1])
+        legacy_certificate = self.save("completion.json", {
+            "schema_version": 2, "run_id": self.run.name, "workflow": "fix", "status": "completed",
+            "repos": {"api": {"state_path": legacy_head, "review_budget": {"used_passes": 0}}},
+            "artifact_hashes": workflow.seal_files([predecessor, legacy_head])})
+        immutable_paths = [path for _, path, _ in legacy] + [Path(legacy_certificate), Path(predecessor)]
+        immutable = {path: path.read_bytes() for path in immutable_paths}
+        self.new_budget_run("successor", predecessor=predecessor)
+        self.c["telemetry_policy"] = {"repair_phase_required": False, "run_local_seals": True}
+        self.save("contract.json", self.c)
+        self.ready()
+        self.implement()
+        expected = self.assert_gate_budget(2, 0)
+        self.assert_gate_fix_exhausted()
+        self.verify_budget_run()
+        previous_verified = workflow.validate_history(self.contract, "api")
+        self.move("verified")
+        certificate = self.run / "completion.json"
+        old_path = legacy[1][1]
+        old_path.write_bytes(immutable[old_path] + b" ")
+        with self.assertRaisesRegex(ValueError, "history SHA-256 mismatch"):
+            workflow.complete(self.contract, certificate)
+        self.assertFalse(certificate.exists())
+        old_path.unlink()
+        with self.assertRaisesRegex(ValueError, "Broken lifecycle event sequence"):
+            workflow.validate_history(self.contract, "api")
+        old_path.write_bytes(immutable[old_path])
+        workflow.complete(self.contract, certificate)
+        record = state.load(certificate)
+        self.assertEqual(expected, record["repos"]["api"]["gate_fix_budget"])
+        audit = workflow.validate_history(self.contract, "api")
+        self.assertEqual(audit["history_sha256"], record["repos"]["api"]["gate_fix_history_sha256"])
+        self.assertEqual(immutable, {path: path.read_bytes() for path in immutable})
+        stale = copy.deepcopy(record)
+        stale["repos"]["api"].update(state_path=previous_verified["state_path"],
+                                     gate_fix_history_sha256=previous_verified["history_sha256"])
+        certificate.write_text(json.dumps(stale))
+        with self.assertRaisesRegex(ValueError, "latest sealed repository state"):
+            workflow.validate_history(self.contract, "api")
+        record["repos"]["api"]["gate_fix_budget"]["historical_used_attempts"] = 0
+        certificate.write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, "certificate gate-fix budget/history mismatch"):
+            workflow.validate_history(self.contract, "api")
+        del record["repos"]["api"]
+        certificate.write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, "missing a contract repository"):
+            workflow.validate_history(self.contract, "api")
+
+    def test_gate_fix_successor_requires_exact_latest_source(self):
+        self.ready()
+        self.implement()
+        self.record_gate_fix()
+        origin = self.contract
+        self.new_budget_run("successor", predecessor=origin)
+        item = self.c["budget_continuity"][0]
+        original = copy.deepcopy(item)
+        item.pop("source_history_sha256")
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "requires source history SHA-256"):
+            self.move("initialized")
+        item.update(original)
+        item["source_contract_path"] = self.contract
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "cycle/current run"):
+            self.move("initialized")
+        item.update(original)
+        path = workflow.history(Path(origin).parent / "api")[-2][1]
+        item.update(source_state_path=str(path), source_state_sha256=workflow.sha(path))
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "Continuity state seal mismatch"):
+            self.move("initialized")
+        item.update(original)
+        item["source_history_sha256"] = "a" * 64
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "history SHA-256 mismatch"):
+            self.move("initialized")
+        item.update(original)
+        self.c["budget_continuity"].append(copy.deepcopy(item))
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "Duplicate budget continuity scope"):
+            self.move("initialized")
+        self.c["budget_continuity"].pop()
+        successor = self.save("contract.json", self.c)
+        self.new_budget_run("unrelated")
+        self.c["budget_work_items"] = {"api": "other-work"}
+        self.save("contract.json", self.c)
+        self.ready()
+        audit = workflow.validate_history(self.contract, "api")
+        item.update(source_contract_path=self.contract, source_contract_sha256=workflow.sha(self.contract),
+                    source_state_path=audit["state_path"], source_state_sha256=audit["state_sha256"],
+                    source_history_sha256=audit["history_sha256"])
+        draft = state.load(successor)
+        draft["budget_continuity"] = [item]
+        Path(successor).write_text(json.dumps(draft))
+        with self.assertRaisesRegex(ValueError, "source work item mismatch"):
+            workflow.contract(successor)
+
+    def test_gate_fix_recovery_counts_independent_runs_and_passes_budget_forward(self):
+        sources = []
+        for name in ("run-1", "independent"):
+            if name != self.run.name:
+                self.new_budget_run(name)
+            self.ready()
+            self.implement()
+            self.record_gate_fix()
+            audited = workflow.validate_history(self.contract, "api")
+            sources.append({"run_id": name, "contract_path": self.contract,
+                            "contract_sha256": workflow.sha(self.contract), "state_path": audited["state_path"],
+                            "state_sha256": audited["state_sha256"], "history_sha256": audited["history_sha256"],
+                            "used_passes": 0})
+        self.new_budget_run("recovery")
+        decision = {"repo": "api", "work_item": "work-1", "approved_by": "user",
+                    "user_authorization": "Reconcile both histories and approve one additional review pass",
+                    "approval_question": "Reconcile and approve a review pass?", "reason": "Reconcile histories",
+                    "approved_at": "2026-01-01T00:00:00Z", "additional_passes": 1,
+                    "used_passes": 0, "effective_limit": 4, "recovery_sources": sources}
+        decision_path = self.save("recovery.json", decision)
+        item = {**decision, "decision_path": decision_path, "decision_sha256": workflow.sha(decision_path)}
+        self.c["budget_continuity"] = [item]
+        self.c["successor_scopes"] = [{"repo": "api", "work_item": "work-1"}]
+        self.save("contract.json", self.c)
+        sources[1]["history_sha256"] = "b" * 64
+        self.save("recovery.json", decision)
+        item["decision_sha256"] = workflow.sha(decision_path)
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "source history SHA-256 mismatch"):
+            self.move("initialized")
+        sources[1]["history_sha256"] = audited["history_sha256"]
+        self.save("recovery.json", decision)
+        item["decision_sha256"] = workflow.sha(decision_path)
+        self.save("contract.json", self.c)
+        self.ready()
+        status = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual(4, status["limit"])
+        self.assertEqual(2, status["gate_fix_budget"]["historical_used_attempts"])
+        self.new_budget_run("after-recovery", predecessor=self.contract)
+        self.ready()
+        self.implement()
+        self.assert_gate_budget(2, 0)
+        self.assert_gate_fix_exhausted()
+
+    def test_gate_fix_over_budget_legacy_run_cannot_repair_after_upgrade(self):
+        self.ready()
+        self.implement()
+        self.record_gate_fix()
+        predecessor = self.contract
+        self.new_budget_run("legacy-successor")
+        self.ready()
+        self.implement()
+        self.record_gate_fix()
+        self.record_gate_fix()
+
+        # Build the format produced before gate-fix continuity existed, including its old local count.
+        legacy_events = workflow.history(self.run / "api")
+        self.c["budget_continuity"] = []
+        self.c["successor_scopes"] = [{"repo": "api", "work_item": "work-1"}]
+        audit = workflow.validate_history(predecessor, "api")
+        decision = self.save("decision.txt", {"approved": "Continue approved work"})
+        self.c["budget_continuity"].append({
+            "repo": "api", "work_item": "work-1", "approved_by": "user",
+            "user_authorization": "Continue approved work", "reason": "Continue work",
+            "approved_at": "2026-01-01T00:00:00Z", "decision_path": decision,
+            "decision_sha256": workflow.sha(decision), "source_contract_path": predecessor,
+            "source_contract_sha256": workflow.sha(predecessor), "source_state_path": audit["state_path"],
+            "source_state_sha256": audit["state_sha256"], "used_passes": 0, "effective_limit": 3})
+        self.save("contract.json", self.c)
+        state_paths = {str(path) for _, path, _ in legacy_events}
+        for _, path, event in legacy_events:
+            event.pop("gate_fix_budget")
+            event.pop("gate_fix_sources_sha256")
+            event["artifact_hashes"] = {k: v for k, v in event["artifact_hashes"].items() if k not in state_paths}
+            event["artifact_hashes"][self.contract] = workflow.sha(self.contract)
+            path.write_text(json.dumps(event))
+        immutable = {path: path.read_bytes() for _, path, _ in legacy_events}
+        self.assert_gate_budget(1, 2)
+        self.assert_gate_fix_exhausted()
+        self.assertEqual(immutable, {path: path.read_bytes() for path in immutable})
+        self.assert_gate_budget(1, 2)
 
     def test_plan_gap_budget_and_cap_cannot_reset(self):
         self.ready()

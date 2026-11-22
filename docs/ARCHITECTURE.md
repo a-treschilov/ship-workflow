@@ -115,7 +115,9 @@ environment, data scope, before/after manifests and bounded artifact paths. Hash
 proof; a matching manifest only shows that the evidence was captured against the current source.
 
 Optional contract read exclusions prune matching paths from helper capture and reject intersecting input snapshots.
-Successor budget continuity records bind prior states and explicit user decisions without rewriting history. Declared
+Successor budget continuity records bind the latest predecessor state, the SHA-256 of its audited history and
+the explicit user decision. The repo gate-fix budget follows these links and counts each predecessor's local
+repair events once. The combined allowance is two attempts. Declared
 deliverables use run-local snapshots, checked against the live published paths before review and completion.
 Declared check inputs can be snapshotted at execution; these bindings do not independently establish the
 semantic correctness of a claim or authenticate a process identity.
