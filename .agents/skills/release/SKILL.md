@@ -18,6 +18,8 @@ From the source repository root, run the publisher with the supplied version:
 python3 -I -B .agents/skills/release/scripts/publish.py vX.Y.Z
 ```
 
-The publisher runs the test suite, creates an annotated tag, verifies a scratch installation, pushes the tag,
-and publishes the GitHub Release with the tag as its exact title. Report the verified release URL and commit.
-If publication fails after a tag was created, retry from the same commit. Preserve published tags and releases.
+The publisher runs the test suite, creates an annotated tag, and verifies a scratch installation. It then
+fast-forwards GitHub `main` and pushes the tag in one atomic operation, verifies both refs point to the tested
+commit, and publishes the GitHub Release with the version as its exact title. Report the verified release URL
+and commit. If publication is interrupted, retry from the same commit. A rejected branch update stops
+publication. Preserve published tags and releases.

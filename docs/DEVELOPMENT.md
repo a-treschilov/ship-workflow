@@ -143,8 +143,10 @@ Git and GitHub CLI access.
 1. Move the entries from `Unreleased` into a dated `vX.Y.Z` section in `CHANGELOG.md`.
 2. Verify that the release contents contain no project-specific names or paths, then commit them.
 3. The publisher runs `make test`, creates an annotated tag, installs that tag in a scratch project,
-   and runs `agent_models.py check`. It then pushes the tag and publishes the GitHub Release using the
-   exact version `vX.Y.Z` as its title and the matching changelog section as its notes.
+   and runs `agent_models.py check`. It fast-forwards GitHub `main` and pushes the tag atomically, then
+   verifies both refs identify the tested commit. A rejected update stops publication.
+4. The publisher creates and verifies the GitHub Release with `vX.Y.Z` as its exact title and the
+   matching changelog section as its notes.
 
 For a prepared, clean commit, the same publisher runs from the source root:
 

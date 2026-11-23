@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+
+- Fast-forward GitHub `main` and push the annotated release tag atomically before creating the GitHub Release.
+
 ## v1.5.0 - 2026-11-23
 
 ### New Features

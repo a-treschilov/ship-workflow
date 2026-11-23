@@ -85,5 +85,5 @@ Tag releases with annotated semver tags (`vX.Y.Z`) after updating `CHANGELOG.md`
 move or rewrite a published tag. Install the new tag into a scratch project and run `agent_models.py check`
 there before announcing the release.
 
-Use the source checkout's `release` skill to publish the tag and GitHub Release. The release title is the
-version string `vX.Y.Z`. See [Development](docs/DEVELOPMENT.md#release).
+Use the source checkout's `release` skill to fast-forward GitHub `main` and push the tag atomically before
+publishing the GitHub Release. The release title is `vX.Y.Z`. See [Development](docs/DEVELOPMENT.md#release).

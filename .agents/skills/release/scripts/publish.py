@@ -28,14 +28,14 @@ def release_notes(version):
     return matches[0].strip() + "\n"
 
 
-def remote_tag(origin, ref):
-    lines = output("git", "ls-remote", "--tags", origin, ref, ref + "^{}").splitlines()
+def remote_refs(origin, *refs):
+    lines = output("git", "ls-remote", origin, *refs).splitlines()
     return {name: digest for digest, name in (line.split("\t") for line in lines)}
 
 
 def ensure_tag(version, origin, commit):
     ref = "refs/tags/" + version
-    remote = remote_tag(origin, ref)
+    remote = remote_refs(origin, ref, ref + "^{}")
     if remote:
         require(remote.get(ref + "^{}") == commit,
                 f"Remote {version} must be an annotated tag for {commit}.")
@@ -48,6 +48,22 @@ def ensure_tag(version, origin, commit):
             and output("git", "rev-parse", ref + "^{commit}") == commit,
             f"Local {version} must be an annotated tag for {commit}.")
     return ref, output("git", "rev-parse", ref)
+
+
+def publish_refs(origin, commit, tag_ref, tag_object):
+    main_ref = "refs/heads/main"
+    peeled_tag = tag_ref + "^{}"
+    expected = {main_ref: commit, tag_ref: tag_object, peeled_tag: commit}
+    remote = remote_refs(origin, *expected)
+    require(main_ref in remote, "The GitHub origin must already have a main branch.")
+    if tag_ref in remote:
+        require(remote[tag_ref] == tag_object and remote.get(peeled_tag) == commit,
+                "The published tag differs from the verified local tag.")
+    if remote != expected:
+        subprocess.run(["git", "push", "--atomic", "--no-follow-tags", origin,
+                        f"{commit}:{main_ref}", f"{tag_ref}:{tag_ref}"], check=True)
+        require(remote_refs(origin, *expected) == expected,
+                "GitHub main and the annotated tag must both identify the tested release commit.")
 
 
 def check_installation(root, version, commit, project):
@@ -88,12 +104,7 @@ def publish(version):
         check_installation(root, version, commit, directory / "project")
         notes_path = directory / "release-notes.md"
         notes_path.write_text(notes)
-        published_tag = remote_tag(origin, ref)
-        if not published_tag:
-            subprocess.run(["git", "push", origin, ref], check=True)
-            published_tag = remote_tag(origin, ref)
-        require(published_tag == {ref: tag_object, ref + "^{}": commit},
-                f"GitHub tag {version} differs from the verified local tag.")
+        publish_refs(origin, commit, ref, tag_object)
         create = subprocess.run(
             ["gh", "release", "create", version, "--repo", repository, "--verify-tag",
              "--title", version, "--notes-file", str(notes_path)],

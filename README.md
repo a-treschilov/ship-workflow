@@ -283,8 +283,8 @@ Releases are annotated semver tags (`vX.Y.Z`). Install a tag, not a moving branc
 snapshot. PATCH releases contain backward-compatible fixes and small corrections; MINOR releases add backward-
 compatible features; MAJOR releases contain incompatible changes. User-visible changes are recorded in
 [`CHANGELOG.md`](CHANGELOG.md) before tagging. From the source checkout, invoke `/release vX.Y.Z` in
-Claude Code or `$release vX.Y.Z` in Codex to publish a tag and GitHub Release. See
-[Development](docs/DEVELOPMENT.md#release) for the release procedure.
+Claude Code or `$release vX.Y.Z` in Codex to fast-forward GitHub `main`, push the tag and publish the
+GitHub Release. See [Development](docs/DEVELOPMENT.md#release) for the release procedure.
 
 ## License
 
