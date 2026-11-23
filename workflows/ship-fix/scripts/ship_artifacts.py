@@ -139,14 +139,18 @@ def run_check(contract, repo, identifier):
     raise ValueError(f"Unknown check: {identifier}")
 
 
-def run(task, name, argv, check):
+def run(task, name, argv, check, deliverable_manifest=None):
     run_name(name)
     evidence = Path(task["evidence_dir"])
     record = evidence / "runs" / f"{name}.json"
     log = evidence / "logs" / f"{name}.log"
     require(not record.exists() and not log.exists(), f"Run {name} already exists; choose a new name")
+    contract = state.load(task["contract"])
+    repo = task["repo"]
+    if contract.get("external_stores") or workflow.staged_deliverables(contract, repo) or deliverable_manifest:
+        contract = workflow.contract(task["contract"])
     if check:
-        argv = run_check(state.load(task["contract"]), task["repo"], check)
+        argv = run_check(contract, repo, check)
     require(argv, "Give --check ID or argv after --")
     dependencies, excludes = workflow.capture_policy(task["contract"], task["repo"])
     scope = sorted(set(task["touched_list"]) | set(task["source_scope_list"]) | set(dependencies))
@@ -154,21 +158,31 @@ def run(task, name, argv, check):
     before = state.capture(root, scope, excludes, task.get("read_excludes", []), policies=task.get("read_policy", ()))
     before_path = evidence / "runs" / f"{name}-before.json"
     state.write_once(before_path, before)
-    check_spec = spec_for(state.load(task["contract"]), task["repo"], check) if check else {}
-    inputs = workflow.snapshot_inputs(check_spec.get("input_paths", []), evidence / "inputs" / f"{name}-files",
-                                      root, task.get("read_excludes", []))
+    check_spec = spec_for(contract, repo, check) if check else {}
+    item, delivery = None, None
+    if deliverable_manifest:
+        slice_id = task.get("slice_id")
+        schedule = contract["slice_schedules"][repo]["path"] if slice_id else None
+        item = workflow.selected_slice(contract, repo, slice_id, schedule)
+        delivery, _ = workflow.deliverable_binding(contract, repo, deliverable_manifest, slice_item=item)
+    inputs, observed = workflow.before_check_inputs(contract, repo, check_spec, evidence / "inputs" / f"{name}-files")
     returncode, raw, timed_out = bounded_run(argv, root)
-    workflow.check_inputs_unchanged(inputs)
     log.parent.mkdir(parents=True, exist_ok=True)
     text = checks.sanitize(raw, truncated=timed_out or len(raw) >= checks.LIMIT)
     suffix = " (timeout)" if timed_out else ""
     log.write_text(text + f"\nEXIT={returncode}{suffix}\n", encoding="utf-8")
+    inputs, input_bindings = workflow.after_check_inputs(contract, check_spec, inputs, observed)
+    if deliverable_manifest:
+        require(delivery == workflow.deliverable_binding(contract, repo, deliverable_manifest, slice_item=item)[0],
+                "Deliverable version changed during execution")
+    references = workflow.execution_references(inputs, input_bindings, delivery)
     after = state.capture(root, scope, excludes, task.get("read_excludes", []), policies=task.get("read_policy", ()))
     after_path = evidence / "runs" / f"{name}-after.json"
     state.write_once(after_path, after)
     state.write_once(record, {"name": name, "producer": "implementer", "command": shlex.join(argv), "exit_code": returncode,
                               "before_manifest": str(before_path), "after_manifest": str(after_path),
-                              "log": str(log), "check": check, "timed_out": timed_out, "input_artifacts": inputs})
+                              "log": str(log), "check": check, "timed_out": timed_out, "input_artifacts": inputs,
+                              **({"check_id": check, **references} if references else {})})
     print(f"run {name}: exit={returncode} log={log}")
     for line in text.splitlines()[-20:]:
         print("  " + line)
@@ -234,7 +248,8 @@ def evidence_input(contract, repo, run_record, claims, environment, data_scope):
             "environment": env, "data_scope": scope,
             "claims": [{"id": i, "assertion": a} for i, a in claims],
             "before_manifest": run_record["before_manifest"], "after_manifest": run_record["after_manifest"],
-            "artifact_paths": [run_record["log"], *run_record.get("input_artifacts", [])]}
+            "artifact_paths": [run_record["log"], *run_record.get("input_artifacts", [])],
+            **{field: run_record[field] for field in ("input_bindings", "deliverable_binding") if field in run_record}}
 
 
 def record(task, name, claims, environment, data_scope):
@@ -593,6 +608,7 @@ def parser():
     sub = commands.add_parser("run")
     sub.add_argument("name")
     sub.add_argument("--check")
+    sub.add_argument("--deliverable-manifest")
     sub.add_argument("argv", nargs="*")
     sub = commands.add_parser("record")
     sub.add_argument("name")
@@ -631,7 +647,7 @@ def main(argv):
         check_file(task, args.paths)
     elif args.command == "run":
         command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
-        run(task, args.name, command, args.check)
+        run(task, args.name, command, args.check, args.deliverable_manifest)
     elif args.command == "record":
         record(task, args.name, args.claim, args.environment, args.data_scope)
     elif args.command == "matrix":

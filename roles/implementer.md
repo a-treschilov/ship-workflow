@@ -46,6 +46,8 @@ helper, including in resumes. The script prints short results and exits 2 on ref
 - If you stop mid-edit, restore the file from its backup before returning. Never leave a half-edited file.
 - Batch coherent fixes, then rerun the shared targeted checks; a later edit makes earlier proof stale.
 - For repairs inspect all open findings, effective amendments, prior matrix and selected published deliverables.
+  Use the declared STORE path for external deliverables and preserve pending status until their required stage.
+  Pass the selected manifest to declared runs when producing evidence about its versions.
   Preserve previously corrected rows and verify the actual published file, not only its replacement draft.
 - Read large files with offset and limit. Do not read whole test logs or whole review JSON; the task
   gives you the findings you need.

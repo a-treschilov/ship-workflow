@@ -77,12 +77,15 @@ def sanitize(raw, truncated=False):
 
 
 def describe(contract_path, repo, group, check_id, scope_path, attempt,
-             environment=None, data_scope=None, output_policy="suppress", excludes=()):
+             environment=None, data_scope=None, output_policy="suppress", excludes=(), *,
+             deliverable_manifest=None, slice_id=None, schedule=None):
     value = workflow.contract(contract_path)
     state.require(repo in value["repos"] and group in GROUPS, "Unknown repo/check group")
     entries = [c for c in value[group][repo] if c["id"] == check_id]
     state.require(len(entries) == 1, "Unknown check ID")
     check = entries[0]
+    item = workflow.selected_slice(value, repo, slice_id, schedule)
+    delivery = workflow.check_delivery(value, repo, group, deliverable_manifest, slice_item=item)
     argv = check.get("argv")
     state.require(check["kind"] == "empirical" and "command" not in check
                   and isinstance(argv, list) and argv
@@ -145,6 +148,13 @@ def describe(contract_path, repo, group, check_id, scope_path, attempt,
         "environment_policy": "inherited, not recorded; no overrides", "permission_notice": NOTICE,
         "cancellation_limit": "Local process group only; no Docker/remote/daemon cancellation guarantee",
     }
+    if check.get("input_paths"):
+        spec["input_paths"] = check["input_paths"]
+    if check.get("external_input_stores"):
+        spec["external_input_stores"] = check["external_input_stores"]
+    if delivery or deliverable_manifest or item:
+        spec.update(deliverable_manifest=deliverable_manifest, slice_id=slice_id, schedule=schedule,
+                    deliverable_binding=delivery)
     return {**spec, "spec_digest": state.digest(spec)}
 
 
@@ -267,7 +277,9 @@ def run(spec, expected_digest):
     # Check again immediately before claiming any output or launching the child.
     fresh = describe(spec["contract_path"], spec["repo"], spec["group"], spec["check_id"],
                      spec["scope_path"], Path(spec["output_dir"]).name, spec["environment"],
-                     spec["data_scope"], spec["output_policy"], spec["excludes"])
+                     spec["data_scope"], spec["output_policy"], spec["excludes"],
+                     deliverable_manifest=spec.get("deliverable_manifest"), slice_id=spec.get("slice_id"),
+                     schedule=spec.get("schedule"))
     state.require(fresh == spec, "Execution specification changed; describe again")
     output = Path(spec["output_dir"])
     state.require(output.resolve() == output, "Symlinked output path")
@@ -297,11 +309,17 @@ def run(spec, expected_digest):
         before = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"],
                                policies=policies)
         state.write_once(output / "before.json", before)
+        check = workflow.spec(value, repo, spec["check_id"])
+        inputs, observed = workflow.before_check_inputs(value, repo, check, output / "inputs")
         actual, streams = execute(spec)
         result.update(actual)
         result["process_outcome"] = actual["outcome"]
         for name, stream in streams.items():
             state.write_once(output / f"{name}.json", stream)
+        inputs, input_bindings = workflow.after_check_inputs(value, check, inputs, observed)
+        item = workflow.selected_slice(value, repo, spec.get("slice_id"), spec.get("schedule"))
+        delivery = workflow.check_delivery(value, repo, spec["group"], spec.get("deliverable_manifest"), slice_item=item)
+        state.require(delivery == spec.get("deliverable_binding"), "Deliverable version changed during execution")
         after = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"],
                               policies=policies)
         state.write_once(output / "after.json", after)
@@ -313,15 +331,25 @@ def run(spec, expected_digest):
             state.require(workflow.sha(contract_path) == spec["contract_sha256"], "Contract changed during execution")
             passed = result["child_returncode"] == 0
             status = "passed" if passed else "failed"
+            artifacts = [str(output / name) for name in ("stdout.json", "stderr.json", "execution-spec.json",
+                                                        "execution-result.json")] + inputs
+            references = workflow.execution_references(artifacts, input_bindings, delivery)
             evidence = {
                 "criterion_id": spec["check_id"], "claims": [{"id": spec["check_id"], "assertion": spec["verification"]}],
                 "kind": "empirical", "producer": "orchestrator", "status": status,
                 "command": spec["command"], "exit_code": result["child_returncode"],
                 "environment": spec["environment"], "data_scope": spec["data_scope"],
                 "before_manifest": str(output / "before.json"), "after_manifest": str(output / "after.json"),
-                "artifact_paths": [str(output / f"{name}.json") for name in ("stdout", "stderr")]
-                                  + [str(output / name) for name in ("execution-spec.json", "execution-result.json")],
+                "artifact_paths": artifacts, **references,
             }
+            if references:
+                execution = output / "execution.json"
+                state.write_once(execution, {"producer": "orchestrator", "command": spec["command"],
+                                             "exit_code": result["child_returncode"],
+                                             "log": str(output / "stdout.json"), "check_id": spec["check_id"],
+                                             **references})
+                evidence["execution_record"] = str(execution)
+                artifacts.append(str(execution))
             if not passed:
                 evidence["reason"] = "Declared check completed with a nonzero child return code"
             state.write_once(output / "evidence-input.json", evidence)
@@ -358,10 +386,14 @@ def main():
     parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--output-policy", choices=("suppress", "redact"), default="suppress")
     parser.add_argument("--expected-digest")
+    parser.add_argument("--deliverable-manifest")
+    parser.add_argument("--slice")
+    parser.add_argument("--schedule")
     args = parser.parse_args()
     try:
         spec = describe(args.contract, args.repo, args.group, args.check, args.scope, args.attempt,
-                        args.environment, args.data_scope, args.output_policy, args.exclude)
+                        args.environment, args.data_scope, args.output_policy, args.exclude,
+                        deliverable_manifest=args.deliverable_manifest, slice_id=args.slice, schedule=args.schedule)
         if args.action == "describe":
             print(json.dumps(spec, indent=2))
             return 0

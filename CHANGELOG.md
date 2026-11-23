@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.5.0 - 2026-11-23
+
+### New Features
+
+- Declare when deliverables become required for slice and whole-repository review, and report pending and stale versions in the run digest.
+- Bind large deliverables and check inputs in approved external stores with sealed streaming SHA-256 manifests and verify their published versions through completion.
+
 ## v1.4.2 - 2026-11-23
 
 ### Bug Fixes

@@ -110,6 +110,67 @@ class CheckTests(unittest.TestCase):
         for name in ("before.json", "after.json"):
             self.assertNotIn("secret/private.txt", self.load(spec, name)["files"])
 
+    def declare_external_check(self, code):
+        root = self.root / "store"
+        root.mkdir(exist_ok=True)
+        info = root.stat()
+        path = root / "input.bin"
+        path.write_bytes(b"declared bytes")
+        small = self.root / "small.txt"
+        small.write_text("local input")
+        self.contract["external_stores"] = {"data": {"path": str(root), "device": info.st_dev, "inode": info.st_ino}}
+        self.contract["required_gates"]["api"] = [{**self.entry("gate.tests", code(path)),
+            "input_paths": [str(path), str(small)], "external_input_stores": {str(path): "data"}}]
+        self.persist()
+        return path
+
+    def test_external_input_evidence_is_sealed_by_both_orchestrator_runners(self):
+        path = self.declare_external_check(lambda file: f"assert open({str(file)!r}, 'rb').read() == b'declared bytes'")
+        spec, (code, result) = self.run_check()
+        self.assertEqual(0, code)
+        out = self.run_dir / "group"
+        results = runner.run_group(str(self.path), self.contract, "api", self.scope, out, "required_gates", set(), False)
+        self.assertEqual(0, results["gate.tests"][0])
+        value = workflow.contract(self.path)
+        for evidence_path in (result["evidence_path"], str(out / "gate.tests-record.json")):
+            with self.subTest(evidence=evidence_path):
+                record = state.load(evidence_path)
+                binding = record["input_bindings"]
+                before, after = [state.load(binding[key]["path"]) for key in ("before", "after")]
+                self.assertEqual(before["inputs"], after["inputs"])
+                self.assertEqual(workflow.sha(path), before["inputs"][0]["sha256"])
+                self.assertTrue(all(ref["path"] in record["artifact_hashes"] for ref in binding.values()))
+                self.assertEqual(1, len(list(Path(binding["before"]["path"]).parent.glob("*.input"))))
+                final = state.load(record["after_manifest"])
+                workflow.proof(value, "api", evidence_path, final, "gate.tests", "orchestrator")
+                with self.assertRaisesRegex(ValueError, "input bindings"):
+                    workflow.prepare_evidence_record(self.path, "api", {k: v for k, v in record.items()
+                                                                        if k != "input_bindings"})
+                forged = copy.deepcopy(record)
+                forged["input_bindings"]["after"] = binding["before"]
+                with self.assertRaisesRegex(ValueError, "bindings differ"):
+                    workflow.prepare_evidence_record(self.path, "api", forged)
+        self.assertEqual(workflow.sha(path), self.load(spec, "inputs/external-before.json")["inputs"][0]["sha256"])
+        path.write_bytes(b"updated bytes")
+        record = state.load(result["evidence_path"])
+        with self.assertRaisesRegex(ValueError, "input is stale"):
+            workflow.proof(value, "api", result["evidence_path"], state.load(record["after_manifest"]), "gate.tests")
+        workflow.proof(value, "api", result["evidence_path"], state.load(record["after_manifest"]), "gate.tests",
+                       historical_seals=record["artifact_hashes"])
+
+    def test_external_input_mutation_keeps_diagnostics_and_refuses_evidence(self):
+        self.declare_external_check(lambda file: f"open({str(file)!r}, 'wb').write(b'changed bytes')")
+        spec, (code, result) = self.run_check()
+        self.assertEqual((3, 0, None), (code, result["child_returncode"], result["evidence_path"]))
+        self.assertNotEqual(self.load(spec, "inputs/external-before.json")["inputs"],
+                            self.load(spec, "inputs/external-after.json")["inputs"])
+        out = self.run_dir / "group"
+        self.declare_external_check(lambda file: f"open({str(file)!r}, 'wb').write(b'changed bytes')")
+        with self.assertRaisesRegex(ValueError, "input changed during execution"):
+            runner.run_group(str(self.path), self.contract, "api", self.scope, out, "required_gates", set(), False)
+        self.assertEqual("0\n", (out / "gate.tests.exit").read_text())
+        self.assertFalse((out / "gate.tests-record.json").exists())
+
     def test_failed_child_is_not_cli_exit_code(self):
         self.setup_code("import sys; sys.exit(17)")
         spec, (code, result) = self.run_check()

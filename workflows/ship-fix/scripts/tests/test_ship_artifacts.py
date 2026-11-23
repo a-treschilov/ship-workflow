@@ -82,6 +82,30 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("Outside write_scope", result.stderr)
         self.assertEqual(json.loads(self.touched.read_text()), [])
 
+    def test_declared_store_input_is_bound_by_implementer_run_and_record(self):
+        directory = self.root.resolve() / "store"
+        directory.mkdir()
+        info = directory.stat()
+        path = directory / "input.bin"
+        path.write_bytes(b"fixture input")
+        value = json.loads(self.contract.read_text())
+        value["external_stores"] = {"data": {"path": str(directory), "device": info.st_dev, "inode": info.st_ino}}
+        check = value["pre_review_checks"]["repo"][0]
+        check.update(argv=[sys.executable, "-c", f"assert open({str(path)!r}, 'rb').read() == b'fixture input'"],
+                     input_paths=[str(path)], external_input_stores={str(path): "data"})
+        self.contract.write_text(json.dumps(value))
+        result = self.cli("run", "input", "--check", "c1-check")
+        self.assertEqual(0, result.returncode, result.stderr)
+        result = self.cli("record", "input", "--claim", "c1=read fixture", "--environment", "scratch",
+                          "--data-scope", "fixture")
+        self.assertEqual(0, result.returncode, result.stderr)
+        record = artifacts.state.load(self.evidence / "records/input.json")
+        bindings = record["input_bindings"]
+        rows = [artifacts.state.load(bindings[key]["path"])["inputs"] for key in ("before", "after")]
+        self.assertEqual(rows[0], rows[1])
+        self.assertEqual(artifacts.workflow.sha(path), rows[0][0]["sha256"])
+        self.assertNotIn(str(path), record["artifact_hashes"])
+
     def test_begin_edit_baselines_backs_up_and_tracks_touched(self):
         self.assertEqual(self.cli("begin-edit", "src/a.txt").returncode, 0)
         self.assertEqual(json.loads(self.touched.read_text()), ["src/a.txt"])

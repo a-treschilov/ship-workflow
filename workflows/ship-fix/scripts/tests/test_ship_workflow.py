@@ -7,7 +7,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -2041,6 +2043,101 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed during execution"):
             workflow.check_inputs_unchanged(paths)
 
+    def declare_store(self, directory):
+        directory.mkdir()
+        info = directory.stat()
+        self.c["external_stores"] = {"data": {"path": str(directory), "device": info.st_dev, "inode": info.st_ino}}
+
+    def external_delivery(self):
+        directory = self.root.resolve() / "store"
+        self.declare_store(directory)
+        path = directory / "output.bin"
+        self.c["deliverables"] = {"api": [{"id": "output", "path": str(path), "store": "data",
+                                              "criterion_ids": ["fix.ac-1"], "required_at": {"scope": "repo"}}]}
+        self.save("contract.json", self.c)
+        return path
+
+    def test_large_store_snapshot_streams_and_preserves_legacy_local_copy(self):
+        path = self.external_delivery()
+        size = 64 * 1024 * 1024
+        with path.open("wb") as handle:
+            handle.truncate(size)
+        small = self.root / "small.txt"
+        small.write_text("local")
+        self.c["deliverables"]["api"].append({"id": "small", "path": str(small), "criterion_ids": ["fix.ac-1"]})
+        self.save("contract.json", self.c)
+        out = self.run / "streamed"
+        tracemalloc.start()
+        try:
+            manifest = workflow.snapshot_deliverables(self.contract, "api", str(out))
+            value = workflow.contract(self.contract)
+            workflow.validate_deliverables(value, "api", manifest)
+            self.assertLess(tracemalloc.get_traced_memory()[1], 8 * 1024 * 1024)
+        finally:
+            tracemalloc.stop()
+        external, local = state.load(manifest)["deliverables"]
+        self.assertEqual((size, workflow.sha(path)), (external["size"], external["sha256"]))
+        self.assertNotIn("snapshot", external)
+        self.assertEqual(b"local", Path(local["snapshot"]).read_bytes())
+        self.assertEqual({"manifest.json", "1.snapshot"}, {file.name for file in out.iterdir()})
+        self.assertLess(Path(manifest).stat().st_size, 2048)
+
+    def test_store_rejects_replacement_disappearance_and_root_change(self):
+        path = self.external_delivery()
+        path.write_bytes(b"same bytes")
+        result = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "snapshot"))
+        value = workflow.contract(self.contract)
+        swap = path.with_suffix(".new")
+        swap.write_bytes(path.read_bytes())
+        swap.replace(path)
+        with self.assertRaisesRegex(ValueError, "differs"):
+            workflow.validate_deliverables(value, "api", result)
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "Cannot open STORE file"):
+            workflow.validate_deliverables(value, "api", result)
+        path.parent.rename(path.parent.with_name("old-store"))
+        path.parent.mkdir()
+        path.write_bytes(b"same bytes")
+        with self.assertRaisesRegex(ValueError, "root identity changed"):
+            workflow.validate_deliverables(value, "api", result)
+
+    def test_store_rejects_traversal_links_exclusions_and_mid_read_swap(self):
+        path = self.external_delivery()
+        outside = self.root / "outside.txt"
+        outside.write_bytes(b"outside")
+        entry = self.c["deliverables"]["api"][0]
+        entry["path"] = str(path.parent) + "/../outside.txt"
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "traversal"):
+            workflow.contract(self.contract)
+        entry["path"] = str(path)
+        self.save("contract.json", self.c)
+        path.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "regular"):
+            workflow.snapshot_deliverables(self.contract, "api", str(self.run / "snapshot"))
+        path.unlink()
+        os.link(outside, path)
+        with self.assertRaisesRegex(ValueError, "one link"):
+            workflow.snapshot_deliverables(self.contract, "api", str(self.run / "snapshot"))
+        path.unlink()
+        path.write_bytes(b"initial bytes")
+        value = workflow.with_read_policy(workflow.contract(self.contract), [(str(path.parent), [path.name])])
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            workflow.store_file(value, str(path), "data")
+        read = os.read
+        replacement = path.with_suffix(".new")
+        replacement.write_bytes(path.read_bytes())
+
+        def replace_during_read(fd, size):
+            if replacement.exists():
+                replacement.replace(path)
+            return read(fd, size)
+
+        with patch.object(workflow.store.os, "read", side_effect=replace_during_read):
+            with self.assertRaisesRegex(ValueError, "changed while reading"):
+                workflow.snapshot_deliverables(self.contract, "api", str(self.run / "snapshot"))
+        self.assertFalse((self.run / "snapshot").exists())
+
     def test_execution_binding_rejects_wrong_producer(self):
         log = self.run / "execution.log"
         log.write_text("ok")
@@ -2544,6 +2641,210 @@ class SliceLifecycleTests(unittest.TestCase):
         workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo,
                             self.cap(["a.txt", "b.txt"]), str(out))
         return str(out)
+
+    def reviewed_artifact(self, path, manifest_path):
+        record = state.load(path)
+        record["deliverable_binding"] = workflow.artifact_reference(manifest_path)
+        if "artifact_paths" in record:
+            record["artifact_paths"].append(manifest_path)
+            record["artifact_hashes"][manifest_path] = workflow.sha(manifest_path)
+        return self.save(Path(path).name, record)
+
+    def whole_repo_move(self, status, **kwargs):
+        events = workflow.history(self.run / "api")
+        self.counter += 1
+        request = self.save(f"repo-request-{self.counter}.json", {
+            "status": status, "source_manifest": self.cap(["a.txt", "b.txt"]),
+            "scope_path": self.repo_scope, "baseline_dir": str(self.base), **kwargs})
+        return workflow.transition(self.contract, "api", request, str(self.run / "api" / f"state-{len(events) + 1}.json"))
+
+    def test_late_deliverable_requires_final_review_gates_and_completion(self):
+        directory = self.root.resolve() / "store"
+        LifecycleTests.declare_store(self, directory)
+        output = directory / "summary.txt"
+        self.c["deliverables"] = {"api": [{"id": "summary", "path": str(output), "store": "data",
+                                              "criterion_ids": ["fix.ac-1"], "required_at": {"scope": "repo"}}]}
+        check = self.c["required_gates"]["api"][0]
+        check.pop("command")
+        check.update(argv=[sys.executable, "-I", "-B", "-c",
+                           f"assert open({str(output)!r}).read() == 'second version'"],
+                     input_paths=[str(output)], external_input_stores={str(output): "data"})
+        self.save("contract.json", self.c)
+        self.whole_repo_move("initialized")
+        preflight = self.evidence("env.runtime", "static", source=self.cap(["a.txt", "b.txt"]))
+        self.whole_repo_move("ready", preflight_path=self.save("preflight.json", self.artifact(
+            status="passed", evidence_paths=[preflight])))
+        cli = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "snapshot-deliverables", "--contract", self.contract,
+                              "--repo", "api", "--out-dir", str(self.run / "early"), "--slice", "a", "--schedule", self.schedule],
+                             capture_output=True, text=True, check=True)
+        early = state.load(cli.stdout.splitlines()[0])
+        self.assertEqual((["summary"], []), (early["pending"], early["deliverables"]))
+        self.accept("a", "a.txt")
+        self.accept("b", "b.txt")
+        self.assertEqual("pending", workflow.digest(self.contract, "api")["slices"]["a"]["deliverables"][0]["status"])
+        gate = self.gate()
+        matrix = self.save("matrix-whole.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "both parts", "assertion": "whole output",
+            "status": "unverified", "reason": "whole criterion pending", "evidence_paths": []}]))
+        self.whole_repo_move("implemented", matrix_path=matrix, slice_gate_path=gate,
+                             slice_authors={"a": "author-a", "b": "author-b"})
+        self.source_state = self.cap(["a.txt", "b.txt"])
+        proof = self.evidence("early.tests", source=self.source_state)
+        with self.assertRaisesRegex(ValueError, "Missing required deliverable manifest"):
+            self.whole_repo_move("pre-review-passed", pre_review_evidence_paths=[proof])
+        with self.assertRaisesRegex(ValueError, "Cannot open STORE file"):
+            workflow.snapshot_deliverables(self.contract, "api", str(self.run / "whole-missing"))
+        output.write_text("first version")
+        one = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "whole-one"))
+        with self.assertRaisesRegex(ValueError, "Proof does not bind"):
+            self.whole_repo_move("pre-review-passed", deliverable_manifest_path=one, pre_review_evidence_paths=[proof])
+        self.whole_repo_move("pre-review-passed", deliverable_manifest_path=one,
+                             pre_review_evidence_paths=[self.reviewed_artifact(proof, one)])
+        output.write_text("second version")
+        with self.assertRaisesRegex(ValueError, "differs"):
+            self.whole_repo_move("reviewed", review_path=self.slice_review("a", ["a.txt", "b.txt"], 1))
+        self.assertEqual("stale", workflow.digest(self.contract, "api")["deliverables"][0]["status"])
+        repaired = self.whole_repo_move("edited-unverified", action="binding-recheck")
+        self.assertEqual(0, repaired["review_fix_count"])
+        two = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "whole-two"))
+        proof = self.reviewed_artifact(self.evidence("early.tests", source=self.source_state), two)
+        self.whole_repo_move("pre-review-passed", deliverable_manifest_path=two, pre_review_evidence_paths=[proof])
+        candidate = self.slice_review("a", ["a.txt", "b.txt"], 1)
+        with self.assertRaisesRegex(ValueError, "Proof does not bind"):
+            self.whole_repo_move("reviewed", review_path=candidate)
+        self.whole_repo_move("reviewed", review_path=self.reviewed_artifact(candidate, two))
+        out = self.run / "gates"
+        result = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT.with_name("ship_run_checks.py")), "gates",
+                                 "--contract", self.contract, "--repo", "api", "--scope", self.repo_scope,
+                                 "--out-dir", str(out), "--phase-id", "gates-1"], capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        gate_proof = str(out / "gate.tests-record.json")
+        self.whole_repo_move("gates-passed", gate_evidence_paths=[gate_proof])
+        accepted = self.reviewed_artifact(self.evidence("fix.ac-1", source=self.source_state), two)
+        assessment = self.save("assessment.json", self.artifact(producer="orchestrator", requirements_match=True,
+            criteria=[{"criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                       "reason": "original scenario checked", "evidence_paths": [accepted]}]))
+        self.whole_repo_move("verified", assessment_path=self.reviewed_artifact(assessment, two))
+        certificate = self.run / "completion.json"
+        confirm = workflow.confirm_completion_versions
+
+        def replace_before_certificate(value, summaries):
+            output.write_text("late concurrent change")
+            confirm(value, summaries)
+
+        with patch.object(workflow, "confirm_completion_versions", side_effect=replace_before_certificate):
+            with self.assertRaisesRegex(ValueError, "STORE path changed during completion"):
+                workflow.complete(self.contract, str(certificate))
+        self.assertFalse(certificate.exists())
+
+        # Restoring the original bytes still requires a new certification cycle.
+        output.write_text("second version")
+        self.whole_repo_move("edited-unverified", action="binding-recheck")
+        two = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "whole-final"))
+        proof = self.reviewed_artifact(self.evidence("early.tests", source=self.source_state), two)
+        self.whole_repo_move("pre-review-passed", deliverable_manifest_path=two, pre_review_evidence_paths=[proof])
+        review = self.reviewed_artifact(self.slice_review("a", ["a.txt", "b.txt"], 2), two)
+        self.whole_repo_move("reviewed", review_path=review)
+        final_gates = self.run / "gates-final"
+        result = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT.with_name("ship_run_checks.py")), "gates",
+                                 "--contract", self.contract, "--repo", "api", "--scope", self.repo_scope,
+                                 "--out-dir", str(final_gates), "--phase-id", "gates-2"], capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.whole_repo_move("gates-passed", gate_evidence_paths=[str(final_gates / "gate.tests-record.json")])
+        final_assessment = state.load(assessment)
+        final_assessment["criteria"][0]["evidence_paths"] = [self.reviewed_artifact(
+            self.evidence("fix.ac-1", source=self.source_state), two)]
+        assessment = self.save("assessment-final.json", final_assessment)
+        self.whole_repo_move("verified", assessment_path=self.reviewed_artifact(assessment, two))
+        workflow.complete(self.contract, str(certificate))
+        record = state.load(certificate)
+        self.assertEqual(workflow.sha(output), record["repos"]["api"]["deliverables"][0]["version"]["sha256"])
+        self.assertEqual(workflow.sha(output), record["repos"]["api"]["check_inputs"][0]["inputs"][0]["sha256"])
+        self.assertNotIn(str(output), record["artifact_hashes"])
+        output.unlink()
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        with self.assertRaisesRegex(ValueError, "Cannot open STORE file"):
+            workflow.complete(self.contract, str(certificate))
+
+    def test_slice_deliverable_stales_accepted_slice_until_rechecked(self):
+        output = self.root / "slice.txt"
+        self.c["deliverables"] = {"api": [{"id": "slice", "path": str(output), "criterion_ids": ["fix.ac-1"],
+                                              "required_at": {"scope": "slice", "slice_id": "b"}}]}
+        self.save("contract.json", self.c)
+        for command in (["init", "-q"], ["add", "-A"],
+                        ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]):
+            subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
+        self.initial_repo = self.cap(["a.txt", "b.txt"])
+        self.bases = {identifier: self.cap([identifier + ".txt"]) for identifier in ("a", "b")}
+        self.accept("a", "a.txt")
+        self.bases["b"] = self.cap(["b.txt"])
+        (self.repo / "b.txt").write_text("b1\n")
+        self.move_slice("b", "implemented", ["b.txt"], author_agent_id="author-b", matrix_path=self.slice_matrix("b"))
+        value = workflow.contract(self.contract)
+        item = workflow.selected_slice(value, "api", "b", self.schedule)
+        proof = self.evidence("early.tests", source=self.cap(["b.txt"]))
+        with self.assertRaisesRegex(ValueError, "Missing required deliverable manifest"):
+            self.move_slice("b", "pre-review-passed", ["b.txt"], pre_review_evidence_paths=[proof])
+        output.write_text("first")
+        snapshot = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "slice-b"), slice_item=item)
+        self.move_slice("b", "pre-review-passed", ["b.txt"], deliverable_manifest_path=snapshot,
+                        pre_review_evidence_paths=[self.reviewed_artifact(proof, snapshot)])
+        output.write_text("second")
+        with self.assertRaisesRegex(ValueError, "differs"):
+            self.move_slice("b", "reviewed", ["b.txt"], review_path=self.slice_review("b", ["b.txt"], 1))
+        self.move_slice("b", "edited-unverified", ["b.txt"], action="binding-recheck")
+        snapshot = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "slice-b-2"), slice_item=item)
+        proof = self.reviewed_artifact(self.evidence("early.tests", source=self.cap(["b.txt"])), snapshot)
+        self.move_slice("b", "pre-review-passed", ["b.txt"], deliverable_manifest_path=snapshot,
+                        pre_review_evidence_paths=[proof])
+        review = self.reviewed_artifact(self.slice_review("b", ["b.txt"], 1), snapshot)
+        self.move_slice("b", "reviewed", ["b.txt"], review_path=review)
+        self.move_slice("b", "accepted", ["b.txt"])
+        self.gate("current-gate.json")
+        output.write_text("third")
+        self.assertEqual({"a"}, workflow.accepted_slices(self.contract, "api", {"a", "b"}))
+        with self.assertRaisesRegex(ValueError, "differs"):
+            self.gate("stale-gate.json")
+        start = self.cap(["a.txt", "b.txt"])
+        starting = {}
+        for identifier in ("a", "b"):
+            _, path, event = workflow.history(self.run / "api" / "slices" / identifier)[-1]
+            starting[identifier] = {"state_path": str(path), "state_sha256": workflow.sha(path),
+                                    "author_agent_id": event["author_agent_id"]}
+        self.integration_auth = self.save("alignment/authorization.json", self.artifact(
+            user_authorization="Approve republished slice deliverable",
+            approved_at=datetime.now(timezone.utc).isoformat(), contract_sha256=workflow.sha(self.contract),
+            schedule_sha256=workflow.sha(self.schedule), starting_slices=starting,
+            start_manifest_path=start, start_manifest_sha256=workflow.sha(start),
+            partial_slices={}, edit_paths={}, recertify_slices=["b"]))
+        checkpoint = self.integration_request("b", "dependency-recheck")
+        checkpoint["partial_slices"] = {}
+        checkpoint.update(start_manifest=start, start_manifest_sha256=workflow.sha(start))
+        checkpoint_path = self.save("alignment/b.json", checkpoint)
+        snapshot = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "slice-b-3"), slice_item=item)
+        proof = self.reviewed_artifact(self.evidence("early.tests", source=self.cap(["b.txt"])), snapshot)
+        self.move_slice("b", "pre-review-passed", ["b.txt"], action="dependency-recheck",
+                        integration_path=checkpoint_path, deliverable_manifest_path=snapshot,
+                        pre_review_evidence_paths=[proof])
+        review = self.reviewed_artifact(self.slice_review("b", ["b.txt"], 2), snapshot)
+        self.move_slice("b", "reviewed", ["b.txt"], review_path=review)
+        accepted = self.move_slice("b", "accepted", ["b.txt"])
+        self.assertEqual(0, accepted["review_fix_count"])
+        self.gate("fresh-gate.json")
+
+    def test_contract_rejects_unknown_slice_and_shared_check_using_pending_file(self):
+        output = str(self.root / "slice.txt")
+        entry = {"id": "slice", "path": output, "criterion_ids": ["fix.ac-1"],
+                 "required_at": {"scope": "slice", "slice_id": "missing"}}
+        self.c["deliverables"] = {"api": [entry]}
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "slice must exist"):
+            workflow.contract(self.contract)
+        entry["required_at"] = {"scope": "repo"}
+        self.c["pre_review_checks"]["api"][0]["input_paths"] = [output]
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "pending deliverable"):
+            workflow.slice_schedule(self.contract, "api", self.schedule)
 
     def test_slices_accept_in_order_and_gate_covers_every_change(self):
         with self.assertRaisesRegex(ValueError, "predecessors are not accepted"):

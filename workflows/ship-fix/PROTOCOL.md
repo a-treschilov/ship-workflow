@@ -686,24 +686,94 @@ First-touch baseline lookup accepts another spelling of a source path when the f
 spellings as the same directory entry and the existing marker and backup remain valid. An unrecorded backup
 or conflicting marker remains an error. Distinct directory entries retain separate baselines.
 
-When a task produces deliverable files, declare `deliverables` in the contract as a repo-to-list map; each
-entry has a unique `id`, absolute `path`, and nonempty `criterion_ids`. Once the files exist, snapshot them:
-`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py snapshot-deliverables --contract CONTRACT --repo REPO --out-dir RUN_DIR/UNIQUE_DIR`.
-The resulting immutable manifest identifies the published bytes and run-local copies. Pass its path as
-`--deliverable-manifest` to `validate-submission` and as `deliverable_manifest_path` to repo pre-review.
-Pre-review and completion compare the live files with the selected snapshots. After an authorized change,
-create a new snapshot directory and follow the normal repair/review lifecycle. A snapshot is only a byte
-binding; it does not prove a command was safe or that a criterion was satisfied.
-For slice review, add `--slice ID --schedule SCHEDULE` when snapshotting and validating; the slice manifest
-contains only deliverables associated with that slice's criteria. Bind it in the slice pre-review request.
+### Published deliverables and check inputs
 
-Contract checks may declare `input_paths` as absolute file paths. The check runners snapshot these files
-before executing, require unchanged bytes immediately afterward and seal the snapshots and registry in
-the evidence. Declare all relevant inputs; a snapshot created later cannot prove historical input bytes.
-Before sealing a contract, compare each declared command's working directory and input paths with the
-selected run and deliverable paths. After a later-produced input becomes available, verify its exact path
-and, when safe and authorized, run the declared check before review; never execute a destructive check as
-a preflight substitute. A missing future input remains pending until its producing operation completes.
+Declare `deliverables` as a repo-to-list map. Each entry has a unique `id`, absolute `path`, and nonempty
+`criterion_ids` linked to that repo. For staged delivery set `required_at` to `{"scope":"repo"}` for whole-repo
+pre-review or `{"scope":"slice","slice_id":"cli"}` for a slice's pre-review. The slice must belong to the approved
+schedule and contribute to at least one linked criterion. Omitted `required_at` preserves the existing slice
+selection by shared criteria. Whole-repo pre-review and every later certification require all repo deliverables.
+
+The approved plan or fix brief authorizes each external STORE. Freeze its named root in the contract:
+
+```json
+{
+  "external_stores": {
+    "results": {"path": "/data/workflow-results", "device": 16777220, "inode": 245899}
+  },
+  "deliverables": {
+    "cli": [{
+      "id": "result",
+      "path": "/data/workflow-results/result.bin",
+      "criterion_ids": ["result-verified"],
+      "required_at": {"scope": "repo"},
+      "store": "results"
+    }]
+  }
+}
+```
+
+Use the actual values from the canonical directory's `os.stat()` fields `st_dev` and `st_ino` when freezing the
+contract. Setup validates the approved schedule and opens the declared STORE roots. Roots must be disjoint from
+one another, from repository trees, and from the run. STORE entries require exact canonical absolute paths
+strictly beneath their named root. New staged deliverables also use canonical absolute paths. A STORE path must
+use explicit external binding, including when declared as an input. A file without `store` uses the existing
+run-local snapshot format.
+
+Publish the files due for the selected scope, then run
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py snapshot-deliverables --contract CONTRACT --repo REPO --out-dir RUN_DIR/UNIQUE_DIR`.
+Pass the immutable manifest as `--deliverable-manifest` to `validate-submission` and as
+`deliverable_manifest_path` to the pre-review transition. Add `--slice ID --schedule SCHEDULE` to both helpers
+for a slice. Staged manifests name the scope and enumerate pending IDs. A slice with only pending deliverables
+can advance without a snapshot. Pending paths are omitted from file observations. A missing due file blocks
+validation and progress. The slice gate verifies current accepted slice versions and the repo manifest must
+agree with all slice versions.
+
+For a stage with due staged-contract deliverables, include `"deliverable_binding":{"path":"ABSOLUTE_MANIFEST",
+"sha256":"MANIFEST_SHA256"}` in independent pre-review and gate evidence as applicable, the review result and
+the repo assessment. Proof for a linked criterion in the repo assessment uses the same binding. Evidence lists
+the manifest in `artifact_paths`. Pass `--deliverable-manifest` to the declared check runners for pre-review,
+along with the slice selectors for a slice. Final `gates` uses the manifest from current whole-repo review.
+Implementer `run` accepts `--deliverable-manifest` for evidence about the selected version. A shared pre-review
+check must be runnable on each slice and at the repo boundary. Put a check that consumes a later deliverable
+in `required_gates`.
+
+For an empirical `argv` check, list all inputs in `input_paths` and map each STORE input's absolute path to its
+STORE name in `external_input_stores`, for example
+`"input_paths":["/data/workflow-results/result.bin"],"external_input_stores":{"/data/workflow-results/result.bin":"results"}`.
+Runners save small input snapshots as before. For STORE inputs, they save distinct run-local before and after
+observations. The execution record and evidence reference both by path and hash in `input_bindings`. Both
+observations must agree for valid evidence. A command can produce a real exit result even when its proof is
+refused because inputs changed. At live evidence validation, the validators check the complete declared input
+binding and reobserve each external input. Boundary observations establish versions around the command.
+The declared command remains responsible for reading those paths and asserting the required behavior.
+
+The helper streams STORE files in chunks of at most 1 MiB. The run-local manifest contains path, byte count,
+SHA-256, device, inode, timestamps and directory identities. Deliverable rows also carry the deliverable ID.
+Only the manifest enters the run's artifact seals. The helper opens each path component by descriptor, guards
+it with the full `read_excludes` policy, and refuses traversal, symlinks, filesystem changes beneath the
+declared root, non-regular files and files with multiple hard links. It checks root and file identity, size,
+modification and change times, compares the directory chain, and reopens the path before accepting the hash.
+Input observations also compare directory metadata across command execution. Unrelated writes in a shared
+STORE directory can invalidate an in-progress observation. Use a stable publication directory and keep the
+file and STORE available through completion. These checks rely on filesystem identities and timestamps.
+Keep check logs limited to observations and assertions when STORE contents must remain external.
+Use an OS sandbox if a command must be prevented from opening other paths or a privileged writer can move
+protected objects into an allowed name.
+
+A new file version requires a fresh manifest, affected pre-review checks, independent review, gates and
+assessment. For an already accepted slice, use an approved integration checkpoint with
+`action: dependency-recheck`, re-accept affected dependent slices, then produce a new slice gate. At a clean
+pre-review or reviewed boundary before slice acceptance, `edited-unverified` with `action: binding-recheck`
+requires a stale binding and the same source, scope and base. The same action can reopen a clean repo
+pre-review, reviewed, gates-passed or verified boundary. It retains history and counters. Resolve open
+findings through the usual repair lifecycle.
+
+`digest` shows pending, byte-verified and stale deliverables and recorded external check input versions.
+A new completion certificate records verified deliverable versions and external input bindings. Historical
+audits read sealed artifacts and can succeed when the published file has changed since certification.
+Live certification requires the published files. Earlier contracts, artifacts and certificates retain their
+formats and seals.
 
 For matrix repairs, `python3 -I -B .agents/workflows/ship-fix/scripts/ship_artifacts.py --task TASK_PATH matrix ROWS.json --base OLD_MATRIX` copies the
 previous rows and applies explicit replacements. Each replacement names its old `replaces_evidence_paths`;

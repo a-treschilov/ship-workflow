@@ -12,11 +12,15 @@ import importlib.util
 _spec = importlib.util.spec_from_file_location("workflow_state_helpers", Path(__file__).with_name("ship_state.py"))
 state = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(state)
+_spec = importlib.util.spec_from_file_location("workflow_store", Path(__file__).with_name("ship_store.py"))
+store = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(store)
 
 VERSION = 2
 GATE_FIX_LIMIT = 2
 # Why a phase ended; unknown is a legitimate answer and must never be inferred from duration.
 END_REASONS = {"done", "context", "api-error", "user-stop", "timeout", "unknown"}
+UNSPECIFIED_DELIVERY = object()
 TERMINAL = {"blocked", "capped", "handoff", "preflight-blocked"}
 EDITS = {"implement", "review-fix", "gate-fix", "plan-gap"}
 TRANSITIONS = {
@@ -39,7 +43,8 @@ TRANSITIONS = {
 
 
 def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def require(value, message):
@@ -85,8 +90,69 @@ def guard_path(path, value, *, scope=False):
 def absolute_file(path, value=None):
     require(isinstance(path, (str, Path)) and Path(path).is_absolute(), f"Missing absolute file: {path}")
     path = guard_path(path, value)
+    if value and value.get("external_stores"):
+        require_local_mode(path, value)
     require(path.is_file(), f"Missing absolute file: {path}")
     return path
+
+
+def require_local_mode(path, value):
+    declarations = value.get("external_stores", {})
+    if not declarations:
+        return
+    resolved = Path(path).absolute().resolve()
+    for declaration in declarations.values():
+        root = Path(declaration["path"])
+        require(len(resolved.parts) < len(root.parts) or not state.same_path_prefix(resolved, root, pinned=True),
+                "STORE files must use an explicit external binding")
+
+
+def excluded_guard(value):
+    names = state.policy_tables(read_policy(value), pinned=True)
+    return lambda path: state.check_path_exclusions(path, names)
+
+
+def store_file(value, path, name):
+    require(isinstance(name, str) and name in value.get("external_stores", {}), "Unknown external STORE")
+    declaration = value["external_stores"][name]
+    source = store.absolute_path(path)
+    root = store.absolute_path(declaration["path"])
+    require(root in source.parents, "File is outside its declared STORE")
+    excluded_guard(value)(source)
+    return declaration
+
+
+def validate_store_declarations(value, run):
+    declarations = value.get("external_stores", {})
+    require(isinstance(declarations, dict), "Invalid external_stores")
+    if not declarations:
+        return
+    protected = [run.resolve(), *(Path(path).resolve() for path in value["repo_paths"].values())]
+    for name, declaration in declarations.items():
+        require(re.fullmatch(r"[A-Za-z0-9_-]+", name), "Invalid STORE name")
+        require(isinstance(declaration, dict) and set(declaration) == {"path", "device", "inode"}
+                and type(declaration["device"]) is int and declaration["device"] >= 0
+                and type(declaration["inode"]) is int and declaration["inode"] > 0, "Invalid STORE declaration")
+        root = store.absolute_path(declaration["path"])
+        require(not any(state.same_path_prefix(root, other, pinned=True) for other in protected),
+                "STORE roots must not overlap each other, a repository, or the run")
+        excluded_guard(value)(root)
+        protected.append(root)
+
+
+def validate_store_roots(value):
+    if value.get("external_stores"):
+        guard = excluded_guard(value)
+        for declaration in value["external_stores"].values():
+            store.inspect_root(declaration, guard)
+
+
+def delivery_scope(entry):
+    return entry.get("required_at")
+
+
+def staged_deliverables(value, repo):
+    return any("required_at" in entry for entry in value.get("deliverables", {}).get(repo, []))
 
 
 def scope_input(path, value, *, optional=False):
@@ -329,6 +395,7 @@ def contract(path):
     guard_path(path, value)
     for repo in repos:
         require(guard_path(value["repo_paths"][repo], value).is_dir(), f"Missing absolute repo path: {repo}")
+    validate_store_declarations(value, path.parent)
     continuity, work_items = continuity_declarations(value)
     deliverables = value.get("deliverables", {})
     require(isinstance(deliverables, dict) and set(deliverables) <= set(repos), "Invalid deliverables")
@@ -339,6 +406,20 @@ def contract(path):
             deliverable_path = entry.get("path")
             require(isinstance(deliverable_path, str) and Path(deliverable_path).is_absolute(), "Deliverable needs an absolute path")
             paths.append(deliverable_path)
+            if "required_at" in entry:
+                required_at = entry["required_at"]
+                require(isinstance(required_at, dict) and (required_at == {"scope": "repo"}
+                        or (set(required_at) == {"scope", "slice_id"} and required_at["scope"] == "slice")),
+                        "Invalid deliverable required_at")
+                if required_at["scope"] == "slice":
+                    state.relative_path(required_at["slice_id"])
+                store.absolute_path(deliverable_path)
+            if "store" in entry:
+                require("required_at" in entry, "STORE deliverable needs explicit required_at")
+                store_file(value, deliverable_path, entry["store"])
+            elif value.get("external_stores") or "required_at" in entry:
+                guard_path(deliverable_path, value)
+                require_local_mode(deliverable_path, value)
             criteria = entry.get("criterion_ids")
             require(isinstance(criteria, list) and criteria and len(criteria) == len(set(criteria)),
                     "Deliverable needs unique criterion IDs")
@@ -376,10 +457,22 @@ def contract(path):
                 require(entry.get("kind") in {"static", "empirical"}, "Invalid check kind")
                 state.text(entry.get("verification"), "check verification")
                 inputs = entry.get("input_paths", [])
-                require(isinstance(inputs, list) and len(inputs) == len(set(inputs)), "Invalid check input_paths")
+                require(isinstance(inputs, list), "Invalid check input_paths")
                 for input_path in inputs:
                     require(isinstance(input_path, str) and Path(input_path).is_absolute(),
                             "Check input path must be absolute")
+                require(len(inputs) == len(set(inputs)), "Duplicate check input_paths")
+                external = entry.get("external_input_stores", {})
+                require(isinstance(external, dict) and set(external) <= set(inputs), "Invalid external_input_stores")
+                if external:
+                    require(entry["kind"] == "empirical" and "argv" in entry,
+                            "STORE check inputs require an empirical argv check")
+                for input_path, name in external.items():
+                    store_file(value, input_path, name)
+                if value.get("external_stores"):
+                    for input_path in set(inputs) - external.keys():
+                        guard_path(input_path, value)
+                        require_local_mode(input_path, value)
                 if entry["kind"] == "empirical":
                     require(("command" in entry) != ("argv" in entry), "Check needs exactly one of command or argv")
                     if "argv" in entry:
@@ -455,6 +548,12 @@ def contract(path):
         if value["_amendments"]:
             value["_amendment"] = value["_amendments"][-1]
     value["_contract_path"] = str(path)
+    for repo in repos:
+        entries = value.get("deliverables", {}).get(repo, [])
+        if any(delivery_scope(entry) and delivery_scope(entry)["scope"] == "slice" for entry in entries):
+            declaration = value.get("slice_schedules", {}).get(repo)
+            require(isinstance(declaration, dict), "Slice deliverable needs an approved slice schedule")
+            checked_slice_schedule(value, repo, declaration.get("path"))
     for item in continuity:
         repo, slice_id = item["repo"], item.get("slice_id")
         if slice_id is None and not history(path.parent / repo, value):
@@ -525,66 +624,149 @@ def review_source_matches(value, repo, previous, events, final):
     return False
 
 
-def snapshot_deliverables(contract_path, repo, out_dir, criterion_ids=None):
-    value = contract(contract_path)
+def deliverable_selection(value, repo, slice_item=None, criterion_ids=None):
+    require(repo in value["repos"], "Unknown deliverable repo")
     entries = value.get("deliverables", {}).get(repo, [])
-    if criterion_ids is not None:
-        entries = [e for e in entries if set(e["criterion_ids"]) & set(criterion_ids)]
-    require(entries, "No deliverables declared")
-    root = Path(contract_path).resolve().parent
-    output = Path(out_dir)
-    require(output.is_absolute() and output.resolve().is_relative_to(root), "Snapshots must be run-local")
+    if slice_item is None and criterion_ids is None:
+        return entries, []
+    require(slice_item is not None or not staged_deliverables(value, repo),
+            "Staged deliverables need an approved slice")
+    criteria = ({entry["criterion_id"] for entry in slice_item["contributions"]}
+                if slice_item is not None else set(criterion_ids))
+    selected, pending = [], []
+    for entry in entries:
+        scope = delivery_scope(entry)
+        due = (scope == {"scope": "slice", "slice_id": slice_item["id"]} if scope
+               else bool(criteria.intersection(entry["criterion_ids"])))
+        if due:
+            selected.append(entry)
+        else:
+            pending.append(entry["id"])
+    return selected, pending
+
+
+def deliverable_scope_record(slice_item):
+    return ({"scope": "repo"} if slice_item is None
+            else {"scope": "slice", "slice_id": slice_item["id"]})
+
+
+def run_local_path(value, path, *, file=False):
+    require(isinstance(path, (str, Path)) and Path(path).is_absolute(), "Expected absolute run-local path")
+    path = Path(path)
+    guarded = state.guard_excluded_paths(path, read_policy(value), pinned=bool(read_policy(value)))
+    root = Path(value["_contract_path"]).parent.resolve()
+    require(guarded.resolve().is_relative_to(root), "Artifact must be run-local")
+    if file:
+        require(path.is_file(), f"Missing run-local file: {path}")
+    return path
+
+
+def checked_local_artifact(value, raw):
+    path = run_local_path(value, raw, file=True)
+    canonical_run_artifact(value, path)
+    return path
+
+
+def canonical_run_artifact(value, path):
+    declared = Path(value["_contract_path"]).parent
+    root = declared.resolve()
+    if path.is_relative_to(declared):
+        candidate = root / path.relative_to(declared)
+    else:
+        candidate = path
+    require(candidate.is_relative_to(root) and candidate.resolve() == candidate,
+            "Bound artifact cannot be a symlink or non-canonical path")
+    return candidate
+
+
+def local_snapshot_source(raw, value):
+    path = Path(raw)
+    policies = read_policy(value)
+    source = state.guard_excluded_paths(path, policies, pinned=bool(policies))
+    if value.get("external_stores") and not policies:
+        source = source.parent.resolve() / source.name
+    require(not path.is_symlink(), f"Snapshot source cannot be a symlink: {path}")
+    require_local_mode(source, value)
+    require(source.is_file(), f"Missing absolute file: {path}")
+    return source
+
+
+def snapshot_reads_pinned(value):
+    return bool(read_policy(value) or value.get("external_stores"))
+
+
+def local_digest(raw, value):
+    source = local_snapshot_source(raw, value)
+    if snapshot_reads_pinned(value):
+        with state.capture_open(source) as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    return sha(source)
+
+
+def snapshot_deliverables(contract_path, repo, out_dir, criterion_ids=None, *, slice_item=None):
+    value = contract(contract_path)
+    entries, pending = deliverable_selection(value, repo, slice_item, criterion_ids)
+    staged = staged_deliverables(value, repo)
+    require(entries or (staged and pending), "No deliverables declared")
+    output = run_local_path(value, out_dir)
+    if staged:
+        output = canonical_run_artifact(value, output)
     require(not output.exists(), "Snapshot directory already exists")
     payload = []
     for entry in entries:
-        state.guard_excluded_path(entry["path"], value["repo_paths"][repo],
-                                  value.get("read_excludes", {}).get(repo, []))
-        source = absolute_file(entry["path"])
-        require(not source.is_symlink(), "Deliverable cannot be a symlink")
-        try:
-            relative = source.resolve().relative_to(Path(value["repo_paths"][repo]).resolve()).as_posix()
-        except ValueError:
-            relative = None
-        if relative is not None:
-            require(not any(relative == p or relative.startswith(p + "/")
-                            for p in value.get("read_excludes", {}).get(repo, [])),
-                    "Deliverable intersects read_excludes")
-        data = source.read_bytes()
-        require(data == source.read_bytes(), "Deliverable changed while snapshotting")
-        payload.append((entry, data))
-    output.mkdir(parents=True)
+        row = {"id": entry["id"], "path": entry["path"]}
+        if "store" in entry:
+            name = entry["store"]
+            row.update(store=name, **store.observe(entry["path"], store_file(value, entry["path"], name),
+                                                   excluded_guard(value)))
+            payload.append((row, None))
+        else:
+            source = local_snapshot_source(entry["path"], value)
+            read = state.capture_bytes if snapshot_reads_pinned(value) else Path.read_bytes
+            data = read(source)
+            require(data == read(source), "Deliverable changed while snapshotting")
+            row["sha256"] = hashlib.sha256(data).hexdigest()
+            payload.append((row, data))
+    if staged:
+        with state.open_directory(output.parent, create=True) as parent:
+            os.mkdir(output.name, dir_fd=parent)
+    else:
+        output.mkdir(parents=True)
     rows = []
-    for index, (entry, data) in enumerate(payload):
-        snapshot = output / f"{index}.snapshot"
-        with snapshot.open("xb") as handle:
-            handle.write(data)
-        rows.append({"id": entry["id"], "path": entry["path"], "snapshot": str(snapshot),
-                     "sha256": hashlib.sha256(data).hexdigest()})
+    for index, (row, data) in enumerate(payload):
+        if data is not None:
+            snapshot = output / f"{index}.snapshot"
+            if staged:
+                with state.open_directory(output) as parent:
+                    fd = os.open(snapshot.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o666, dir_fd=parent)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+            else:
+                with snapshot.open("xb") as handle:
+                    handle.write(data)
+            row["snapshot"] = str(snapshot)
+        rows.append(row)
     result = {"schema_version": VERSION, "run_id": value["run_id"], "repo": repo, "deliverables": rows}
-    state.write_once(output / "manifest.json", result)
+    if staged:
+        result.update(scope=deliverable_scope_record(slice_item), pending=pending)
+    state.write_once(output / "manifest.json", result, pinned=staged)
     return str(output / "manifest.json")
 
 
-def snapshot_inputs(paths, out_dir, repo_root, read_excludes):
+def snapshot_inputs(paths, out_dir, repo_root, read_excludes, *, value=None):
     if not paths:
         return []
     output = Path(out_dir)
     require(not output.exists(), "Input snapshot directory already exists")
     payload = []
     for item in paths:
-        state.guard_excluded_path(item, repo_root, read_excludes)
-        source = absolute_file(item)
-        require(not source.is_symlink(), "Input cannot be a symlink")
-        try:
-            relative = source.resolve().relative_to(Path(repo_root).resolve()).as_posix()
-        except ValueError:
-            relative = None
-        if relative is not None:
-            require(not any(relative == p or relative.startswith(p + "/") for p in read_excludes),
-                    "Input intersects read_excludes")
-        data = source.read_bytes()
-        require(data == source.read_bytes(), "Check input changed while snapshotting")
-        payload.append((str(source), data))
+        policy = value or {"_read_policy": ((repo_root, read_excludes),) if read_excludes else ()}
+        source = local_snapshot_source(item, policy)
+        read = state.capture_bytes if snapshot_reads_pinned(policy) else Path.read_bytes
+        data = read(source)
+        require(data == read(source), "Check input changed while snapshotting")
+        payload.append((str(Path(item)), data))
     output.mkdir(parents=True)
     rows = []
     for index, (source, data) in enumerate(payload):
@@ -597,49 +779,191 @@ def snapshot_inputs(paths, out_dir, repo_root, read_excludes):
     return [str(registry), *[row["snapshot"] for row in rows]]
 
 
-def check_inputs_unchanged(paths):
+def check_inputs_unchanged(paths, value=None):
     if not paths:
         return
     for row in state.load(paths[0]):
-        require(sha(absolute_file(row["path"])) == row["sha256"], "Check input changed during execution")
+        require(local_digest(row["path"], value or {}) == row["sha256"],
+                "Check input changed during execution")
 
 
-def validate_deliverables(value, repo, path, criterion_ids=None):
-    entries = value.get("deliverables", {}).get(repo, [])
-    if criterion_ids is not None:
-        entries = [e for e in entries if set(e["criterion_ids"]) & set(criterion_ids)]
-    if not entries:
-        return []
-    manifest_path = absolute_file(path)
-    root = Path(value["_contract_path"]).parent.resolve()
-    require(manifest_path.resolve().is_relative_to(root), "Deliverable manifest must be run-local")
+def external_input_rows(value, check, *, command_input):
+    guard = excluded_guard(value)
+    return [{"path": path, "store": name, **store.observe(path, store_file(value, path, name), guard,
+                                                         command_input=command_input)}
+            for path, name in sorted(check.get("external_input_stores", {}).items())]
+
+
+def artifact_reference(path):
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def before_check_inputs(value, repo, check, out_dir):
+    external = check.get("external_input_stores", {})
+    if external:
+        out_dir = run_local_path(value, str(out_dir))
+        out_dir = canonical_run_artifact(value, out_dir)
+    paths = snapshot_inputs([path for path in check.get("input_paths", []) if path not in external],
+                            out_dir, value["repo_paths"][repo], repo_read_excludes(value, repo), value=value)
+    if not external:
+        return paths, None
+    before = {"schema_version": VERSION, "run_id": value["run_id"], "repo": repo,
+              "check_id": check["id"], "boundary": "before",
+              "inputs": external_input_rows(value, check, command_input=True)}
+    path = Path(out_dir) / "external-before.json"
+    state.write_once(path, before, pinned=True)
+    return paths, (artifact_reference(path), before)
+
+
+def after_check_inputs(value, check, paths, observation):
+    check_inputs_unchanged(paths, value)
+    if observation is None:
+        return paths, None
+    reference, before = observation
+    require(reference == artifact_reference(reference["path"]), "External input observation changed")
+    rows = external_input_rows(value, check, command_input=True)
+    after = Path(reference["path"]).with_name("external-after.json")
+    state.write_once(after, {**before, "boundary": "after", "inputs": rows}, pinned=True)
+    require(rows == before["inputs"], "External check input changed during execution")
+    return [*paths, reference["path"], str(after)], {"before": reference, "after": artifact_reference(after)}
+
+
+def checked_reference(value, reference):
+    require(isinstance(reference, dict) and set(reference) == {"path", "sha256"}, "Invalid artifact binding")
+    path = checked_local_artifact(value, reference["path"])
+    require(reference == artifact_reference(path), "Bound artifact hash changed")
+    return path
+
+
+def validate_input_binding(value, repo, record, *, historical=False):
+    checks = {check["id"]: check for group in ("preflight_checks", "pre_review_checks", "required_gates")
+              for check in value.get(group, {}).get(repo, []) if check.get("external_input_stores")}
+    claimed = {claim["id"] for claim in record["claims"]}.intersection(checks)
+    binding = record.get("input_bindings")
+    if binding is None and not claimed:
+        return
+    require(isinstance(binding, dict) and set(binding) == {"before", "after"},
+            "External check needs input bindings before and after execution")
+    execution_path = checked_local_artifact(value, record.get("execution_record"))
+    require(str(execution_path) in record["artifact_paths"], "External input execution record must be sealed")
+    execution = state.load(execution_path)
+    check_id = execution.get("check_id")
+    require(check_id in checks and claimed <= {check_id}, "Evidence has the wrong external input check")
+    check = checks[check_id]
+    require(record.get("command") == check_command(check), "Wrong command for external check inputs")
+    by_boundary = {}
+    for boundary, reference in binding.items():
+        path = checked_reference(value, reference)
+        require(str(path) in record["artifact_paths"], "External input manifest must be sealed")
+        observation = state.load(path)
+        bound(value, repo, observation)
+        require(observation.get("check_id") == check_id and observation.get("boundary") == boundary,
+                "Wrong external input check or observation boundary")
+        by_boundary[boundary] = observation.get("inputs")
+    rows = by_boundary["before"]
+    require(isinstance(rows, list) and rows == by_boundary["after"], "External input observations differ")
+    require(all(isinstance(row, dict) for row in rows)
+            and [(row.get("path"), row.get("store")) for row in rows] == sorted(check["external_input_stores"].items()),
+            "Missing or unexpected external check inputs")
+    if not historical:
+        persistent = [{**row, "directories": [entry[:2] for entry in row["directories"]]} for row in rows]
+        require(persistent == external_input_rows(value, check, command_input=False), "External check input is stale")
+    local = [path for path in check["input_paths"] if path not in check["external_input_stores"]]
+    if local:
+        registry = checked_local_artifact(value, str(Path(binding["before"]["path"]).with_name("manifest.json")))
+        require(str(registry) in record["artifact_paths"], "Local input registry must be sealed")
+        snapshots = state.load(registry)
+        require([row["path"] for row in snapshots] == local, "Missing or unexpected local check inputs")
+        for row in snapshots:
+            path = checked_local_artifact(value, row["snapshot"])
+            require(str(path) in record["artifact_paths"] and sha(path) == row["sha256"],
+                    "Local input snapshot must match its seal")
+        if not historical:
+            check_inputs_unchanged([registry], value)
+
+
+def read_deliverable_manifest(value, repo, path, *, slice_item=None, criterion_ids=None):
+    entries, pending = deliverable_selection(value, repo, slice_item, criterion_ids)
+    staged = staged_deliverables(value, repo)
+    if not entries and (not path or not staged):
+        return None, []
+    require(path, "Missing required deliverable manifest for " + ", ".join(entry["id"] for entry in entries))
+    manifest_path = (checked_local_artifact(value, path) if staged
+                     else run_local_path(value, path, file=True))
     record = state.load(manifest_path)
     bound(value, repo, record)
+    if staged:
+        require(record.get("scope") == deliverable_scope_record(slice_item)
+                and record.get("pending") == pending, "Wrong deliverable scope or pending IDs")
     rows = record.get("deliverables")
-    require(isinstance(rows, list) and len(rows) == len(entries), "Incomplete deliverable manifest")
-    indexed = {row.get("id"): row for row in rows}
-    require(len(indexed) == len(rows) and set(indexed) == {e["id"] for e in entries}, "Wrong deliverable IDs")
+    unique_ids(rows, "deliverable manifest")
+    indexed = {row["id"]: row for row in rows}
+    require(set(indexed) == {e["id"] for e in entries}, "Incomplete deliverable manifest or wrong IDs")
+    return manifest_path, [(entry, indexed[entry["id"]]) for entry in entries]
+
+
+def validate_deliverable_row(value, entry, row, *, historical=False):
+    require(row.get("path") == entry["path"], "Wrong deliverable path")
+    if "store" in entry:
+        name = entry["store"]
+        require(row.get("store") == name and "snapshot" not in row, "Wrong STORE deliverable mode")
+        if not historical:
+            actual = store.observe(entry["path"], store_file(value, entry["path"], name), excluded_guard(value))
+            require(row == {"id": entry["id"], "path": entry["path"], "store": name, **actual},
+                    f"Published deliverable differs from snapshot: {entry['id']}")
+        return []
+    require("store" not in row, "Wrong local deliverable mode")
+    snapshot = run_local_path(value, row.get("snapshot"), file=True)
+    require(sha(snapshot) == row.get("sha256"), "Deliverable snapshot changed")
+    if not historical:
+        require(local_digest(entry["path"], value) == row["sha256"], "Published deliverable differs from snapshot")
+    return [str(snapshot)]
+
+
+def validate_deliverables(value, repo, path, criterion_ids=None, *, slice_item=None, historical=False):
+    manifest_path, rows = read_deliverable_manifest(value, repo, path, slice_item=slice_item,
+                                                    criterion_ids=criterion_ids)
+    if manifest_path is None:
+        return []
     sealed = [str(manifest_path)]
-    for entry in entries:
-        row = indexed[entry["id"]]
-        require(row.get("path") == entry["path"], "Wrong deliverable path")
-        snapshot = absolute_file(row.get("snapshot"))
-        require(snapshot.resolve().is_relative_to(root), "Deliverable snapshot must be run-local")
-        require(sha(snapshot) == row.get("sha256"), "Deliverable snapshot changed")
-        state.guard_excluded_path(entry["path"], value["repo_paths"][repo],
-                                  value.get("read_excludes", {}).get(repo, []))
-        actual = absolute_file(entry["path"])
-        try:
-            relative = actual.resolve().relative_to(Path(value["repo_paths"][repo]).resolve()).as_posix()
-        except ValueError:
-            relative = None
-        if relative is not None:
-            require(not any(relative == p or relative.startswith(p + "/")
-                            for p in value.get("read_excludes", {}).get(repo, [])),
-                    "Deliverable intersects read_excludes")
-        require(not actual.is_symlink() and sha(actual) == row["sha256"], "Published deliverable differs from snapshot")
-        sealed.append(str(snapshot))
+    for entry, row in rows:
+        sealed += validate_deliverable_row(value, entry, row, historical=historical)
     return sealed
+
+
+def deliverable_binding(value, repo, path, *, slice_item=None):
+    paths = validate_deliverables(value, repo, path, slice_item=slice_item)
+    selected, _ = deliverable_selection(value, repo, slice_item)
+    reference = artifact_reference(paths[0]) if selected and staged_deliverables(value, repo) else None
+    return reference, paths
+
+
+def validate_delivery_reference(value, repo, record, *, historical=False):
+    reference = record.get("deliverable_binding")
+    if reference is None:
+        return
+    path = checked_reference(value, reference)
+    require(str(path) in record["artifact_paths"], "Deliverable manifest must be sealed in evidence")
+    scope = state.load(path).get("scope")
+    require(isinstance(scope, dict), "Evidence needs a staged deliverable manifest")
+    item = None
+    if scope.get("scope") == "slice":
+        item = selected_slice(value, repo, scope.get("slice_id"), value["slice_schedules"][repo]["path"])
+    validate_deliverables(value, repo, str(path), slice_item=item, historical=historical)
+
+
+def match_delivery_reference(record, expected):
+    require(record.get("deliverable_binding") == expected, "Proof does not bind the current deliverable manifest")
+
+
+def execution_references(artifacts, inputs, delivery):
+    fields = {}
+    if inputs is not None:
+        fields["input_bindings"] = inputs
+    if delivery is not None:
+        artifacts.append(delivery["path"])
+        fields["deliverable_binding"] = delivery
+    return fields
 
 
 def bound(value, repo, record):
@@ -648,8 +972,20 @@ def bound(value, repo, record):
             and record.get("repo") == repo, "Wrong artifact version/run/repo")
 
 
-def seal_files(paths):
-    return {str(absolute_file(p)): sha(p) for p in paths}
+def seal_files(paths, value=None):
+    return {str(absolute_file(p, value)): sha(p) for p in paths}
+
+
+def extend_seals(value, previous, paths, delivery):
+    additions = seal_files(paths, value if value.get("external_stores") else None)
+    if delivery is not None:
+        require(additions.get(delivery["path"]) == delivery["sha256"], "Deliverable manifest changed during validation")
+    prior = previous.get("artifact_hashes", {})
+    if value.get("external_stores") or staged_deliverables(value, previous.get("repo")):
+        root = Path(value["_contract_path"]).parent
+        require(all(prior.get(path, digest) == digest for path, digest in additions.items()
+                    if Path(path).is_relative_to(root)), "Previously sealed run artifact changed during validation")
+    return {**prior, **additions}
 
 
 def check_seals(seals, value=None):
@@ -707,10 +1043,15 @@ def execution_binding(record, value=None):
     execution = state.load(execution_path)
     for field in ("producer", "command", "exit_code"):
         require(execution.get(field) == record.get(field), "Execution record differs: " + field)
+    if "input_bindings" in execution or "input_bindings" in record:
+        require(execution.get("input_bindings") == record.get("input_bindings"), "Execution input bindings differ")
+    if "deliverable_binding" in execution or "deliverable_binding" in record:
+        match_delivery_reference(record, execution.get("deliverable_binding"))
     require(execution.get("log") in record.get("artifact_paths", []), "Execution log must be sealed")
 
 
-def proof(value, repo, path, final, identifier, producer=None, expected_status="passed", *, historical_seals=None):
+def proof(value, repo, path, final, identifier, producer=None, expected_status="passed", *, historical_seals=None,
+          delivery=UNSPECIFIED_DELIVERY):
     record = state.load(absolute_file(path, value))
     bound(value, repo, record)
     claims = record.get("claims")
@@ -743,6 +1084,13 @@ def proof(value, repo, path, final, identifier, producer=None, expected_status="
     else:
         require(all(historical_seals.get(str(Path(p))) == digest for p, digest in hashes.items()),
                 "Historical evidence does not match its state seals")
+    validate_input_binding(value, repo, record, historical=historical_seals is not None)
+    if delivery is not UNSPECIFIED_DELIVERY:
+        match_delivery_reference(record, delivery)
+        if delivery is not None:
+            require(hashes.get(delivery["path"]) == delivery["sha256"], "Deliverable manifest must be sealed in evidence")
+    else:
+        validate_delivery_reference(value, repo, record, historical=historical_seals is not None)
     for dependency, dependency_path in record.get("dependency_manifests", {}).items():
         require(dependency in value["repos"], "Unknown evidence dependency")
         dep = manifest(value, dependency, dependency_path)
@@ -791,6 +1139,10 @@ def finding_proof(value, repo, path, final, identifier, kind, historical_seals=N
     else:
         require(all(historical_seals.get(p) == digest for p, digest in hashes.items()),
                 "Historical finding proof does not match its state seals")
+    if "input_bindings" in record or "deliverable_binding" in record:
+        execution_binding(record, value)
+        validate_input_binding(value, repo, record, historical=historical_seals is not None)
+        validate_delivery_reference(value, repo, record, historical=historical_seals is not None)
     return [path, *paths]
 
 
@@ -810,19 +1162,91 @@ def applied_findings(value, repo, path, review_path, final, historical_seals=Non
     return result, sealed
 
 
-def check_set(value, repo, group, paths, final):
+def check_set(value, repo, group, paths, final, *, delivery=UNSPECIFIED_DELIVERY):
     require(isinstance(paths, list), f"Missing {group} evidence")
     sealed = []
     for item in value[group][repo]:
         matches = [p for p in paths if item["id"] in
-                   {x.get("id") for x in state.load(absolute_file(p)).get("claims", [])}]
+                   {x.get("id") for x in state.load(absolute_file(p, value)).get("claims", [])}]
         require(matches, f"Missing check: {item['id']}")
-        sealed += proof(value, repo, matches[-1], final, item["id"], "orchestrator")
+        sealed += proof(value, repo, matches[-1], final, item["id"], "orchestrator", delivery=delivery)
     return sealed
 
 
+def has_bound_pre_review(value, repo):
+    return staged_deliverables(value, repo) or any(
+        check.get("external_input_stores") for check in value["pre_review_checks"][repo])
+
+
+def has_bound_gates(value, repo):
+    return has_bound_pre_review(value, repo) or any(
+        check.get("external_input_stores") for check in value["required_gates"][repo])
+
+
+def recheck_pre_review(value, repo, event, final, delivery):
+    if has_bound_pre_review(value, repo):
+        return check_set(value, repo, "pre_review_checks", event.get("pre_review_evidence_paths"), final,
+                         delivery=delivery)
+    return []
+
+
+def stale_binding(value, repo, event, *, slice_item=None):
+    if not (has_bound_pre_review(value, repo) if slice_item is not None else has_bound_gates(value, repo)):
+        return False
+    try:
+        delivery, _ = deliverable_binding(value, repo, event.get("deliverable_manifest_path"), slice_item=slice_item)
+        recheck_pre_review(value, repo, event, event_manifest(value, repo, event), delivery)
+        if slice_item is None:
+            check_slice_delivery(value, repo, event.get("slice_gate_path"), event.get("deliverable_manifest_path"))
+            for proof_path in event.get("gate_evidence_paths", []):
+                proof_record = state.load(absolute_file(proof_path, value))
+                validate_input_binding(value, repo, proof_record)
+    except (OSError, ValueError):
+        return True
+    return False
+
+
+def recorded_binding_recheck(value, repo, event, previous, *, slice=False):
+    if event.get("status") != "edited-unverified" or event.get("action") != "binding-recheck":
+        return False
+    allowed = {"pre-review-passed", "reviewed"} if slice else {"pre-review-passed", "reviewed", "gates-passed", "verified"}
+    require(previous.get("status") in allowed and not previous.get("review_acceptance_path")
+            and (has_bound_pre_review(value, repo) if slice else has_bound_gates(value, repo)),
+            "Invalid historical binding recheck boundary")
+    require(state.same_source(event_manifest(value, repo, previous), event_manifest(value, repo, event),
+                              repo_read_excludes(value, repo)), "Historical binding recheck changed source")
+    return True
+
+
+def check_delivery(value, repo, group, path=None, *, slice_item=None):
+    if group == "preflight_checks":
+        require(path is None and slice_item is None, "Preflight has no deliverable scope")
+        return None
+    if group == "required_gates":
+        require(slice_item is None, "Required gates apply to the whole repo")
+        if has_bound_pre_review(value, repo):
+            events = history(Path(value["_contract_path"]).parent / repo, value)
+            require(events and events[-1][2]["status"] in {"reviewed", "reviewed-with-findings", "gates-passed"},
+                    "Required gates need current whole-repo review")
+            latest = events[-1][2]
+            expected = latest.get("deliverable_manifest_path")
+            require(path is None or path == expected, "Required gates need the reviewed deliverable manifest")
+            checked = state.load(absolute_file(latest["review_path"], value))
+            reference, _ = deliverable_binding(value, repo, expected)
+            if reference is not None:
+                match_delivery_reference(checked, reference)
+                require(latest.get("artifact_hashes", {}).get(expected) == reference["sha256"],
+                        "Reviewed deliverable manifest seal changed")
+            recheck_pre_review(value, repo, latest, event_manifest(value, repo, latest), reference)
+            check_slice_delivery(value, repo, latest.get("slice_gate_path"), expected)
+            return reference
+    if path is not None or staged_deliverables(value, repo):
+        return deliverable_binding(value, repo, path, slice_item=slice_item)[0]
+    return None
+
+
 def preflight(value, repo, path, initial):
-    result = state.load(absolute_file(path))
+    result = state.load(absolute_file(path, value))
     bound(value, repo, result)
     require(result.get("status") in {"passed", "blocked"}, "Invalid preflight status")
     sealed = [path]
@@ -844,7 +1268,7 @@ def criteria_for(value, repo):
 
 
 def matrix(value, repo, path, final):
-    record = state.load(absolute_file(path))
+    record = state.load(absolute_file(path, value))
     bound(value, repo, record)
     entries = record.get("criteria")
     require(isinstance(entries, list), "Missing completion matrix")
@@ -862,7 +1286,7 @@ def matrix(value, repo, path, final):
         if entry["status"] == "verified":
             require(entry["evidence_paths"], "Verified matrix row lacks proof")
         for evidence_path in entry["evidence_paths"]:
-            evidence_status = state.load(absolute_file(evidence_path)).get("status")
+            evidence_status = state.load(absolute_file(evidence_path, value)).get("status")
             if entry["status"] == "verified":
                 evidence_status = "passed"
             require(evidence_status in {"passed", "failed", "unverified"}, "Invalid evidence status")
@@ -871,7 +1295,7 @@ def matrix(value, repo, path, final):
 
 
 def submission_evidence_errors(value, repo, path, final, key):
-    record = state.load(absolute_file(path))
+    record = state.load(absolute_file(path, value))
     bound(value, repo, record)
     entries = record.get(key)
     require(isinstance(entries, list), "Missing matrix rows")
@@ -888,7 +1312,7 @@ def submission_evidence_errors(value, repo, path, final, key):
             continue
         for path in paths:
             try:
-                status = state.load(absolute_file(path)).get("status")
+                status = state.load(absolute_file(path, value)).get("status")
                 if entry.get("status") == "verified":
                     status = "passed"
                 require(status in {"passed", "failed", "unverified"}, "Invalid evidence status")
@@ -899,9 +1323,9 @@ def submission_evidence_errors(value, repo, path, final, key):
 
 
 def review(value, repo, path, final, scope, prior_paths, run_root=None, evidence_seals=None):
-    result = state.load(absolute_file(path))
+    result = state.load(absolute_file(path, value))
     bound(value, repo, result)
-    prior = [state.load(absolute_file(p)) for p in prior_paths]
+    prior = [state.load(absolute_file(p, value)) for p in prior_paths]
     state.findings(result, repo, result.get("round"), final, prior)
     require(result.get("accepted") is True, "Review was not accepted on stable source")
     coverage = result["coverage"]
@@ -957,9 +1381,13 @@ def review(value, repo, path, final, scope, prior_paths, run_root=None, evidence
     return result, sealed
 
 
-def assessment(value, repo, path, final, initial=None):
-    result = state.load(absolute_file(path))
+def assessment(value, repo, path, final, initial=None, *, delivery=None):
+    result = state.load(absolute_file(path, value))
     bound(value, repo, result)
+    if delivery is not None:
+        match_delivery_reference(result, delivery)
+    delivered_criteria = {identifier for entry in value.get("deliverables", {}).get(repo, [])
+                          for identifier in entry["criterion_ids"]}
     allowed = {"checker"} if value["workflow"] == "ship" else {"checker", "orchestrator"}
     require(result.get("producer") in allowed, "Acceptance cannot be self-certified by implementer")
     require(result.get("requirements_match") is True, "Approved requirements not semantically confirmed")
@@ -981,7 +1409,8 @@ def assessment(value, repo, path, final, initial=None):
             if value["workflow"] == "fix" and row["criterion_id"] in value["acceptance"]["criterion_ids"]:
                 require(state.load(absolute_file(p)).get("scenario") == value["acceptance"]["original_scenario"],
                         "Acceptance check exercised a different original scenario")
-            sealed += proof(value, repo, p, final, row["criterion_id"])
+            sealed += proof(value, repo, p, final, row["criterion_id"], delivery=(
+                delivery if delivery is not None and row["criterion_id"] in delivered_criteria else UNSPECIFIED_DELIVERY))
     if value["workflow"] == "fix" and value["acceptance"]["mode"] == "reproduced-bug":
         baseline_path = value["acceptance"].get("before_evidence", {}).get(repo)
         if any(c["id"] in value["acceptance"]["criterion_ids"] for c in criteria_for(value, repo)):
@@ -1268,7 +1697,7 @@ def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_cont
     inherited = {}
     prior_count = 0
     prior_status = None
-    for _, _, event in events:
+    for index, (_, _, event) in enumerate(events):
         bound(old, repo, event)
         require(event.get("artifact_hashes", {}).get(str(source)) == item["source_contract_sha256"],
                 "Continuity history does not seal its contract")
@@ -1277,6 +1706,7 @@ def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_cont
         require((prior_status is None and status == "implemented") or
                 (prior_status is not None and (status in SLICE_TRANSITIONS.get(prior_status, set())
                                                or status in {"blocked", "capped"}
+                                               or recorded_binding_recheck(old, repo, event, events[index - 1][2], slice=True)
                                                or (prior_status == "capped" and status == "needs-fix"
                                                    and event.get("is_continuation") is True))),
                 "Invalid continuity slice transition")
@@ -1973,6 +2403,11 @@ def transition(contract_path, repo, request_path, out):
                  "budget_grant_applied", "gate_fix_budget", "gate_fix_sources_sha256"}
     require(not protected & set(request), "Request overrides certified lifecycle fields")
     status = request.get("status")
+    if has_bound_pre_review(value, repo):
+        require("pre_review_evidence_paths" not in request or status == "pre-review-passed",
+                "Pre-review evidence can change only before review")
+        require("slice_gate_path" not in request or status in {"implemented", "pre-review-passed", "edited-unverified"},
+                "Slice gate cannot change after pre-review")
     require("original_agent_id" not in request
             or (status == "implemented" and "original_agent_id" not in previous),
             "Request overrides original implementer agent ID")
@@ -1994,6 +2429,14 @@ def transition(contract_path, repo, request_path, out):
     if "deliverable_manifest_path" in request:
         require(status == "pre-review-passed", "Deliverable manifest can change only before review")
     before = previous.get("status")
+    binding_recheck = status == "edited-unverified" and request.get("action") == "binding-recheck"
+    if binding_recheck:
+        require(before in {"pre-review-passed", "reviewed", "gates-passed", "verified"}
+                and not previous.get("review_acceptance_path")
+                and set(request) <= {"status", "action", "source_manifest", "scope_path", "baseline_dir"}
+                and all(request.get(key, previous.get(key)) == previous.get(key)
+                        for key in ("scope_path", "baseline_dir"))
+                and stale_binding(value, repo, previous), "Binding recheck needs a stale binding and a clean boundary")
     sliced = repo in value.get("slice_schedules", {})
     recovery_path = request.get("slice_repair_recovery_path")
     if "slice_repair_recovery_path" in request:
@@ -2051,7 +2494,7 @@ def transition(contract_path, repo, request_path, out):
         require("gate_correction_reason" not in request, "Gate correction reason requires gate correction")
     accepting = before == "capped" and status == "reviewed-with-findings"
     require("review_acceptance_path" not in request or accepting, "Unexpected acceptance path")
-    require(gate_correction or valid_grant_transition or accepting or is_requirement_amendment or identity_correction
+    require(gate_correction or valid_grant_transition or accepting or is_requirement_amendment or identity_correction or binding_recheck
             or status in TERMINAL
             or status in TRANSITIONS.get(before, set()),
             f"Illegal transition: {before} -> {status}")
@@ -2076,6 +2519,10 @@ def transition(contract_path, repo, request_path, out):
     dependency_scope = scope_input(dependency_scope_path, value)
     require(set(previous.get("scope", [])) <= set(scope), "Touched scope must not shrink")
     final = fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
+    if binding_recheck:
+        require(scope == previous["scope"] and dependency_scope == previous["source_scope"]
+                and state.same_source(final, event_manifest(value, repo, previous), repo_read_excludes(value, repo)),
+                "Binding recheck cannot change repository source")
     if sliced and before == "needs-fix" and status in {"reviewed", "capped"}:
         previous_source = event_manifest(value, repo, previous)
         require(state.same_source(final, previous_source, value.get("read_excludes", {}).get(repo, [])),
@@ -2205,6 +2652,9 @@ def transition(contract_path, repo, request_path, out):
                     "First-touch baseline differs from run start; resolve concurrent edits")
     if status == "initialized":
         require(not events and not changed, "Initialization must precede implementation")
+        validate_store_roots(value)
+        if sliced and has_bound_pre_review(value, repo):
+            checked_slice_schedule(value, repo, value["slice_schedules"][repo]["path"])
     if status in {"ready", "preflight-blocked"}:
         require(state.same_source(final, initial, names.read_excludes), "Preflight must precede source edits")
         pre, paths = preflight(value, repo, request.get("preflight_path"), initial)
@@ -2226,6 +2676,7 @@ def transition(contract_path, repo, request_path, out):
         if status == "implemented":
             require(request.get("slice_authors") == gate["slice_authors"],
                     "slice_authors must equal the authors recorded by the accepted slices")
+            sealed += check_slice_delivery(value, repo, gate_path)
         if recovery_anchor and status == "pre-review-passed":
             if gate_path != recovery_anchor["slice_gate_path"]:
                 schedule = value["slice_schedules"][repo]["path"]
@@ -2247,7 +2698,11 @@ def transition(contract_path, repo, request_path, out):
             data["code_only"] = True
             sealed.append(request["code_only_authorization"])
         sealed += matrix(value, repo, request.get("matrix_path"), final)
-    if status == "edited-unverified":
+    if binding_recheck:
+        for key in ("deliverable_manifest_path", "pre_review_evidence_paths", "review_fingerprint",
+                    "gate_evidence_paths", "assessment_path"):
+            data.pop(key, None)
+    elif status == "edited-unverified":
         data.pop("review_acceptance_path", None)
         action = request.get("action")
         require(action in EDITS - {"implement"}, "Missing edit cause")
@@ -2304,42 +2759,55 @@ def transition(contract_path, repo, request_path, out):
             for key in ("pre_review_evidence_paths", "repair_phase_id", "slice_id", "capsule_handoff",
                         "phase_binding_recovery_path", "author_identity_recovery_path"):
                 data.pop(key, None)
+    delivery = None
     if status == "pre-review-passed":
         check_paths = request.get("pre_review_evidence_paths")
         if recovery_anchor and isinstance(check_paths, list):
             require(not {sha(absolute_file(path)) for path in check_paths} & set(inherited_seals.values()),
                     "Slice repair recovery requires fresh repo pre-review check evidence")
         sealed += matrix(value, repo, request.get("matrix_path", previous.get("matrix_path")), final)
-        sealed += validate_deliverables(value, repo, request.get("deliverable_manifest_path", previous.get("deliverable_manifest_path")))
-        sealed += check_set(value, repo, "pre_review_checks", check_paths, final)
+        delivery, paths = deliverable_binding(value, repo, data.get("deliverable_manifest_path"))
+        sealed += paths
+        sealed += check_slice_delivery(value, repo, data.get("slice_gate_path"), data.get("deliverable_manifest_path"))
+        sealed += check_set(value, repo, "pre_review_checks", check_paths, final, delivery=delivery)
     if status in {"needs-fix", "reviewed"} and not is_grant_transition and not identity_correction:
         if recovery_anchor:
             require(sha(absolute_file(request.get("review_path"))) not in inherited_seals.values(),
                     "Slice repair recovery needs a fresh independent repo review")
-        sealed += validate_deliverables(value, repo, previous.get("deliverable_manifest_path"))
+        delivery, paths = deliverable_binding(value, repo, previous.get("deliverable_manifest_path"))
+        sealed += paths + recheck_pre_review(value, repo, previous, final, delivery)
+        sealed += check_slice_delivery(value, repo, data.get("slice_gate_path"), data.get("deliverable_manifest_path"))
         prior_paths = [e[2]["review_path"] for e in events
                        if e[2]["status"] in {"needs-fix", "reviewed"} and not e[2].get("budget_grant_applied")]
         result, paths = review(value, repo, request.get("review_path"), final, scope, prior_paths,
                                Path(contract_path).parent.resolve(), previous.get("artifact_hashes", {}))
+        if delivery is not None:
+            match_delivery_reference(result, delivery)
         require(result["round"] == data["latest_review_round"] + 1, "Review rounds must increase by one")
         require(bool(result["findings"]) == (status == "needs-fix"), "Findings/status mismatch")
         data["latest_review_round"] = result["round"]
         data["review_fingerprint"] = final["fingerprint"]
         sealed += paths
-    if status in {"gates-passed", "verified"}:
-        sealed += validate_deliverables(value, repo, previous.get("deliverable_manifest_path"))
+    if status in {"gates-passed", "verified"} or (accepting and has_bound_pre_review(value, repo)):
+        delivery, paths = deliverable_binding(value, repo, previous.get("deliverable_manifest_path"))
+        sealed += paths + recheck_pre_review(value, repo, previous, final, delivery)
+        sealed += check_slice_delivery(value, repo, data.get("slice_gate_path"), data.get("deliverable_manifest_path"))
         require(review_source_matches(value, repo, previous, events, final), "Review is stale")
-        require(not state.load(absolute_file(data["review_path"]))["findings"]
-                or data.get("review_acceptance_path"), "Review has open findings")
-        sealed += check_set(value, repo, "required_gates", data.get("gate_evidence_paths"), final)
+        accepted_review = state.load(absolute_file(data["review_path"], value))
+        if delivery is not None:
+            match_delivery_reference(accepted_review, delivery)
+        require(not accepted_review["findings"] or data.get("review_acceptance_path"), "Review has open findings")
+        if not accepting:
+            sealed += check_set(value, repo, "required_gates", data.get("gate_evidence_paths"), final, delivery=delivery)
     if status == "verified":
         require(not data.get("code_only"), "Code-only authorization cannot certify completion")
-        sealed += assessment(value, repo, request.get("assessment_path", data.get("assessment_path")), final, initial)
+        sealed += assessment(value, repo, request.get("assessment_path", data.get("assessment_path")), final, initial,
+                             delivery=delivery)
     if status in TERMINAL:
         state.text(request.get("reason"), "blocker/handoff reason")
     data["gate_fix_budget"] = lineage.summary(data["gate_fix_count"])
     data["gate_fix_sources_sha256"] = lineage.source_hash()
-    data["artifact_hashes"] = {**previous.get("artifact_hashes", {}), **seal_files(sealed)}
+    data["artifact_hashes"] = extend_seals(value, previous, sealed, delivery)
     if recovery_path:
         fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
     # Scope is intentionally mutable; the event captures its values, not a mutable-file seal.
@@ -2410,7 +2878,7 @@ def in_scope(path, patterns, names=None):
 
 
 def slice_matrix(value, repo, item, path, final):
-    record = state.load(absolute_file(path))
+    record = state.load(absolute_file(path, value))
     bound(value, repo, record)
     entries = record.get("rows")
     require(isinstance(entries, list), "Missing slice matrix rows")
@@ -2715,11 +3183,20 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
                  "latest_review_round", "review_fix_limit", "is_continuation", "historical_used_passes"}
     status = request.get("status")
     require(not protected & set(request), "Request overrides certified slice fields")
+    if has_bound_pre_review(value, repo):
+        require("pre_review_evidence_paths" not in request or status == "pre-review-passed",
+                "Slice pre-review evidence can change only before review")
     if "deliverable_manifest_path" in request:
         require(status == "pre-review-passed", "Deliverable manifest can change only before review")
     require("capsule_handoff" not in request or request.get("status") == "edited-unverified",
             "Capsule handoff requires edited-unverified")
     before = previous.get("status")
+    binding_recheck = status == "edited-unverified" and request.get("action") == "binding-recheck"
+    if binding_recheck:
+        require(before in {"pre-review-passed", "reviewed"} and not previous.get("review_acceptance_path")
+                and set(request) <= {"status", "action", "source_manifest", "base_manifest", "touched"}
+                and stale_binding(value, repo, previous, slice_item=item),
+                "Binding recheck needs a stale binding and a clean slice boundary")
     accepting = before == "capped" and status == "reviewed-with-findings"
     require("review_acceptance_path" not in request or accepting, "Unexpected acceptance path")
     continuation_path = request.get("continuation_path")
@@ -2755,7 +3232,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     if status in {"blocked", "capped"}:
         require(events, "Nothing to block yet")
         state.text(request.get("reason"), "blocker reason")
-    elif continuation_limit is None and not dependency_recheck and not accepting:
+    elif continuation_limit is None and not dependency_recheck and not accepting and not binding_recheck:
         require(status in SLICE_TRANSITIONS.get(before, set()), f"Illegal slice transition: {before} -> {status}")
     require(before not in {"blocked", "capped"} or continuation_limit is not None or accepting,
             "Exhausted slice needs explicit human continuation")
@@ -2788,6 +3265,10 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     outside = [p for p in touched if not in_scope(p, item["write_scope"], names)]
     require(not outside, "Touched file outside slice write_scope: " + ", ".join(outside))
     final = fresh(value, repo, request.get("source_manifest"), touched)
+    if binding_recheck:
+        require(touched == previous["touched"] and base_path == previous["base_manifest"]
+                and state.same_source(final, event_manifest(value, repo, previous), repo_read_excludes(value, repo)),
+                "Binding recheck cannot change slice scope, base, or source")
     if accepting:
         require(set(request) <= {"status", "source_manifest", "base_manifest", "touched", "review_acceptance_path"},
                 "Acceptance cannot change slice context")
@@ -2864,7 +3345,10 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         sealed += slice_matrix(value, repo, item, request.get("matrix_path"), final)
     elif status not in {"blocked", "capped"}:
         data["author_agent_id"] = previous["author_agent_id"]
-    if status == "edited-unverified":
+    if binding_recheck:
+        for key in ("deliverable_manifest_path", "pre_review_evidence_paths", "review_fingerprint"):
+            data.pop(key, None)
+    elif status == "edited-unverified":
         data.pop("review_acceptance_path", None)
         action = request.get("action")
         require(action in {"review-fix", "integration-fix"}, "Missing slice edit cause")
@@ -2898,18 +3382,21 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
             require(before in {"accepted", "reviewed"}, "Integration fix applies to a reviewed or accepted slice")
         for key in ("accepted_files", "dependency_states", "review_fingerprint"):
             data.pop(key, None)
+    delivery = None
     if status == "pre-review-passed":
         sealed += slice_matrix(value, repo, item, request.get("matrix_path", previous.get("matrix_path")), final)
-        sealed += validate_deliverables(value, repo, request.get("deliverable_manifest_path", previous.get("deliverable_manifest_path")),
-                                       {c["criterion_id"] for c in item["contributions"]})
-        sealed += check_set(value, repo, "pre_review_checks", request.get("pre_review_evidence_paths"), final)
+        delivery, paths = deliverable_binding(value, repo, data.get("deliverable_manifest_path"), slice_item=item)
+        sealed += paths + check_set(value, repo, "pre_review_checks", request.get("pre_review_evidence_paths"),
+                                    final, delivery=delivery)
     if status in {"needs-fix", "reviewed"} and continuation_limit is None:
-        sealed += validate_deliverables(value, repo, previous.get("deliverable_manifest_path"),
-                                       {c["criterion_id"] for c in item["contributions"]})
+        delivery, paths = deliverable_binding(value, repo, previous.get("deliverable_manifest_path"), slice_item=item)
+        sealed += paths + recheck_pre_review(value, repo, previous, final, delivery)
         prior_paths = [e[2]["review_path"] for e in events
                        if e[2]["status"] in {"needs-fix", "reviewed"} and not e[2].get("is_continuation")]
         result, paths = review(value, repo, request.get("review_path"), final, touched, prior_paths,
                                Path(contract_path).parent.resolve(), previous.get("artifact_hashes", {}))
+        if delivery is not None:
+            match_delivery_reference(result, delivery)
         contributions = {c["criterion_id"] for c in item["contributions"]}
         for applied in value.get("_amendments", []):
             if applied["criterion_id"] not in contributions:
@@ -2921,11 +3408,17 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         data["latest_review_round"] = result["round"]
         data["review_fingerprint"] = final["fingerprint"]
         sealed += paths
-    if status == "accepted":
+    if status == "accepted" or (accepting and has_bound_pre_review(value, repo)):
+        delivery, paths = deliverable_binding(value, repo, previous.get("deliverable_manifest_path"), slice_item=item)
+        sealed += paths + recheck_pre_review(value, repo, previous, final, delivery)
         require(review_source_matches(value, repo, previous, events, final), "Slice review is stale")
         accepted_review = state.load(absolute_file(previous["review_path"]))
-        require(not accepted_review["findings"] or previous.get("review_acceptance_path"),
-                "Slice review has open findings")
+        if delivery is not None:
+            match_delivery_reference(accepted_review, delivery)
+        if not accepting:
+            require(not accepted_review["findings"] or previous.get("review_acceptance_path"),
+                    "Slice review has open findings")
+    if status == "accepted":
         contributions = {c["criterion_id"] for c in item["contributions"]}
         for applied in value.get("_amendments", []):
             if applied["criterion_id"] not in contributions:
@@ -2940,15 +3433,137 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
             dep_events = history(Path(contract_path).parent / repo / "slices" / dep)
             require(dep_events and dep_events[-1][2]["status"] == "accepted", f"Predecessor not accepted: {dep}")
             data["dependency_states"][dep] = sha(dep_events[-1][1])
-    data["artifact_hashes"] = {**previous.get("artifact_hashes", {}), **seal_files([p for p in sealed if p])}
+    data["artifact_hashes"] = extend_seals(value, previous, [p for p in sealed if p], delivery)
     state.write_once(out, data)
     return data
+
+
+def check_accepted_delivery(value, repo, item, event):
+    delivery, paths = deliverable_binding(value, repo, event.get("deliverable_manifest_path"), slice_item=item)
+    paths += recheck_pre_review(value, repo, event, event_manifest(value, repo, event), delivery)
+    seals = event.get("artifact_hashes", {})
+    require(all(seals.get(path) == sha(absolute_file(path, value)) for path in paths),
+            "Slice acceptance is missing a current artifact seal")
+    if delivery is not None:
+        match_delivery_reference(state.load(absolute_file(event["review_path"], value)), delivery)
+    return paths
+
+
+def check_slice_delivery(value, repo, gate_path, manifest_path=None):
+    declaration = value.get("slice_schedules", {}).get(repo)
+    if declaration is None or not has_bound_pre_review(value, repo):
+        return []
+    schedule, plan = checked_slice_schedule(value, repo, declaration["path"])
+    gate_path = run_local_path(value, gate_path, file=True)
+    gate = state.load(gate_path)
+    bound(value, repo, gate)
+    require(gate.get("schedule_sha256") == plan["schedule_sha256"], "Slice gate has the wrong schedule")
+    require(set(gate.get("slices", {})) == {item["id"] for item in schedule["slices"]}, "Slice gate omits slices")
+    rows = {} if manifest_path is None else {
+        row["id"]: row for row in state.load(run_local_path(value, manifest_path, file=True))["deliverables"]}
+    sealed = [str(gate_path)]
+    for item in schedule["slices"]:
+        identifier = item["id"]
+        events = history(Path(value["_contract_path"]).parent / repo / "slices" / identifier, value)
+        require(events and events[-1][2]["status"] == "accepted", f"Slice not accepted: {identifier}")
+        _, path, event = events[-1]
+        require(gate["slices"][identifier] == sha(path) == gate["artifact_hashes"].get(str(path)),
+                f"Slice {identifier} changed after slice-gate; run slice-gate again")
+        require(event.get("schedule_sha256") == plan["schedule_sha256"] and event.get("slice_id") == identifier,
+                "Slice state has the wrong schedule or scope")
+        sealed += [str(path), *check_accepted_delivery(value, repo, item, event)]
+        for dep, expected in event["dependency_states"].items():
+            require(gate["slices"].get(dep) == expected, f"Slice {identifier} has a stale predecessor")
+        if rows and event.get("deliverable_manifest_path"):
+            recorded = state.load(run_local_path(value, event["deliverable_manifest_path"], file=True))
+            for row in recorded["deliverables"]:
+                require(row["id"] in rows and {k: v for k, v in row.items() if k != "snapshot"}
+                        == {k: v for k, v in rows[row["id"]].items() if k != "snapshot"},
+                        f"Repo deliverable differs from accepted slice {identifier}: {row['id']}")
+    return sealed
+
+
+def delivery_status(value, repo, event, *, slice_item=None, recheck=True):
+    entries = value.get("deliverables", {}).get(repo, [])
+    if not entries:
+        return []
+    current = event or {}
+    path = current.get("deliverable_manifest_path")
+    selected, _ = deliverable_selection(value, repo, slice_item)
+    due = {entry["id"] for entry in selected}
+    result = {entry["id"]: {"id": entry["id"], "path": entry["path"],
+                            "required_at": delivery_scope(entry), "status": "pending"} for entry in entries}
+    if not path:
+        return list(result.values())
+    try:
+        path = str(run_local_path(value, path, file=True))
+        reference = artifact_reference(path)
+        require(current.get("artifact_hashes", {}).get(path) == reference["sha256"], "Deliverable manifest seal changed")
+        _, rows = read_deliverable_manifest(value, repo, path, slice_item=slice_item)
+    except (ValueError, OSError, TypeError, KeyError) as error:
+        for identifier in due:
+            result[identifier].update(status="stale", error=str(error))
+        return list(result.values())
+    for entry, version in rows:
+        row = result[entry["id"]]
+        row.update(status="verified", manifest=reference,
+                   version={key: val for key, val in version.items() if key != "id"})
+        if recheck:
+            try:
+                validate_deliverable_row(value, entry, version)
+            except (ValueError, OSError, TypeError, KeyError) as error:
+                row.update(status="stale", error=str(error))
+    return list(result.values())
+
+
+def check_input_status(value, repo, event):
+    result = []
+    paths = [*event.get("pre_review_evidence_paths", []), *event.get("gate_evidence_paths", [])]
+    if event.get("assessment_path"):
+        report = state.load(absolute_file(event["assessment_path"], value))
+        paths.extend(path for row in report["criteria"] for path in row["evidence_paths"])
+    for path in dict.fromkeys(paths):
+        record = state.load(absolute_file(path, value))
+        binding = record.get("input_bindings")
+        if not binding:
+            continue
+        manifest_path = checked_reference(value, binding["before"])
+        observation = state.load(manifest_path)
+        item = {"check_id": observation["check_id"], "evidence_path": path, "bindings": binding,
+                "inputs": observation["inputs"], "status": "verified"}
+        try:
+            require(event.get("artifact_hashes", {}).get(path) == sha(path), "Check evidence seal changed")
+            validate_input_binding(value, repo, record)
+        except (ValueError, OSError) as error:
+            item.update(status="stale", error=str(error))
+        result.append(item)
+    return result
+
+
+def confirm_completion_versions(value, summaries):
+    """Check paths again after building the seal map for every repo."""
+    guard = excluded_guard(value)
+    for repo in summaries.values():
+        deliveries = [item["version"] for item in repo.get("deliverables", []) if "store" in item["version"]]
+        checks = [*repo.get("check_inputs", []),
+                  *(row for rows in repo.get("slice_check_inputs", {}).values() for row in rows)]
+        inputs = [row for check in checks for row in check["inputs"]]
+        for row in deliveries + inputs:
+            path, name = row["path"], row["store"]
+            actual = store.observe(path, store_file(value, path, name), guard, hash_contents=False)
+            expected = {key: row[key] for key in actual}
+            expected["directories"] = [entry[:2] for entry in expected["directories"]]
+            require(actual == expected, f"STORE path changed during completion: {path}")
 
 
 def accepted_slices(contract_path, repo, ids):
     value = contract(contract_path)
     root = Path(value["repo_paths"][repo]).resolve()
     memo = {}
+    items = {}
+    if ids and has_bound_pre_review(value, repo) and repo in value.get("slice_schedules", {}):
+        schedule, _ = checked_slice_schedule(value, repo, value["slice_schedules"][repo]["path"])
+        items = {item["id"]: item for item in schedule["slices"]}
 
     def current(identifier, visiting):
         if identifier in memo:
@@ -2962,6 +3577,11 @@ def accepted_slices(contract_path, repo, ids):
         event = events[-1][2]
         valid = all(state.file_state(state.safe_path(root, name)) == recorded
                     for name, recorded in event["accepted_files"].items())
+        if valid and identifier in items:
+            try:
+                check_accepted_delivery(value, repo, items[identifier], event)
+            except (ValueError, OSError):
+                valid = False
         for dep, expected in event["dependency_states"].items():
             dep_events = history(Path(contract_path).parent / repo / "slices" / dep)
             valid = (valid and bool(dep_events) and sha(dep_events[-1][1]) == expected
@@ -3006,6 +3626,8 @@ def prepare_slice_gate(contract_path, repo, schedule_path, initial_path, source_
             require(accepted_review.get("amendment_sha256") in suffix,
                     "Amended slice requires current review and acceptance")
         latest[item["id"]] = events[-1]
+        if has_bound_pre_review(value, repo):
+            sealed += check_accepted_delivery(value, repo, item, events[-1][2])
         touched |= set(events[-1][2]["touched"])
         authors[item["id"]] = events[-1][2]["author_agent_id"]
         sealed += [str(events[-1][1]), *immutable_paths]
@@ -3218,6 +3840,7 @@ def slice_repair_recovery(contract_path, value, repo, events, recovery_path, sou
             require(timestamp(checkpoint.get("at")) <= boundary, "Integration checkpoint postdates its slice state")
             status, prior_status = event["status"], prior["status"]
             require(status in SLICE_TRANSITIONS.get(prior_status, set())
+                    or recorded_binding_recheck(value, repo, event, prior, slice=True)
                     or (prior_status == "accepted" and status == "pre-review-passed"
                         and event.get("action") == "dependency-recheck")
                     or (prior_status == "capped" and status == "needs-fix" and event.get("is_continuation"))
@@ -3389,6 +4012,17 @@ def slice_schedule(contract_path, repo, schedule_path):
     return plan
 
 
+def selected_slice(value, repo, slice_id=None, schedule_path=None):
+    if slice_id is None:
+        require(schedule_path is None, "--schedule needs --slice")
+        return None
+    require(schedule_path, "--slice needs --schedule")
+    schedule, _ = checked_slice_schedule(value, repo, schedule_path)
+    item = next((entry for entry in schedule["slices"] if entry["id"] == slice_id), None)
+    require(item is not None, "Unknown slice")
+    return item
+
+
 def checked_slice_schedule(value, repo, schedule_path):
     """Validate the sealed schedule in the caller's contract and read policy."""
     require(repo in value["repos"], "Unknown slice repo")
@@ -3441,6 +4075,20 @@ def checked_slice_schedule(value, repo, schedule_path):
             state.text(check.get("verification"), "slice check verification")
     require(mandatory <= set(contributors), "Mandatory criteria without any slice contribution: "
             + ", ".join(sorted(mandatory - set(contributors))))
+    for deliverable in value.get("deliverables", {}).get(repo, []):
+        scope = delivery_scope(deliverable)
+        if scope and scope["scope"] == "slice":
+            identifier = scope["slice_id"]
+            require(identifier in ids and any(identifier in contributors.get(criterion, [])
+                                               for criterion in deliverable["criterion_ids"]),
+                    "Deliverable slice must exist and contribute to a linked criterion")
+    for item in items:
+        _, pending = deliverable_selection(value, repo, item)
+        pending_paths = {entry["path"] for entry in value.get("deliverables", {}).get(repo, [])
+                         if entry["id"] in pending and delivery_scope(entry)}
+        require(not any(pending_paths.intersection(check.get("input_paths", []))
+                        for check in value["pre_review_checks"][repo]),
+                "Shared pre-review check uses a pending deliverable; use a required gate")
     cross = {cid for cid, owners in contributors.items() if len(owners) > 1}
     require(set(schedule.get("cross_slice_criteria", [])) == cross,
             "cross_slice_criteria must list exactly the criteria that several slices contribute to: "
@@ -3540,6 +4188,7 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
                                 and index >= 2 and status == events[index - 2][2].get("status"))
         gate_correction = (status == prior_status == "gates-passed"
                            and bool(event.get("gate_correction_reason")))
+        binding_recheck = index and recorded_binding_recheck(value, repo, event, events[index - 1][2])
         requirement_registration = (status == prior_status == "ready" and event.get("amendment_applied") is True
                                     and event.get("amendment_path") and event.get("source_fingerprint") ==
                                     events[index - 1][2].get("source_fingerprint"))
@@ -3556,14 +4205,14 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
             require(status in TRANSITIONS.get(prior_status, set()) or status in TERMINAL
                     or (prior_status == "capped" and status == "reviewed-with-findings"
                         and event.get("review_acceptance_path"))
-                    or grant_same_state or grant_resumes_capped or gate_correction or requirement_registration,
+                    or grant_same_state or grant_resumes_capped or gate_correction or requirement_registration or binding_recheck,
                     "Invalid historical lifecycle transition")
         if status == "reviewed-with-findings" and not event.get("budget_grant_applied"):
             path = accept_review_findings(contract_file, value, repo, events[:index], event,
                                           manifest(value, repo, event["source_manifest"]))
             require(event.get("artifact_hashes", {}).get(path) == sha(path),
                     "Historical review acceptance is not sealed")
-        if status == "edited-unverified":
+        if status == "edited-unverified" and not binding_recheck:
             action = event.get("action")
             require(action in {"review-fix", "plan-gap", "gate-fix"},
                     "Invalid historical repair action")
@@ -3744,9 +4393,14 @@ def complete(contract_path, out):
         final = fresh(value, repo, latest["source_manifest"],
                       sorted(set(latest["scope"]) | set(latest["source_scope"])), latest["excludes"])
         # Revalidate prior repos after all consumers and checker activity.
-        check_set(value, repo, "required_gates", latest["gate_evidence_paths"], final)
-        assessment(value, repo, latest["assessment_path"], final, manifest(value, repo, latest["initial_manifest"]))
-        paths += validate_deliverables(value, repo, latest.get("deliverable_manifest_path"))
+        delivery, delivery_paths = deliverable_binding(value, repo, latest.get("deliverable_manifest_path"))
+        paths += delivery_paths + recheck_pre_review(value, repo, latest, final, delivery)
+        paths += check_slice_delivery(value, repo, latest.get("slice_gate_path"), latest.get("deliverable_manifest_path"))
+        if delivery is not None:
+            match_delivery_reference(state.load(absolute_file(latest["review_path"], value)), delivery)
+        paths += check_set(value, repo, "required_gates", latest["gate_evidence_paths"], final, delivery=delivery)
+        paths += assessment(value, repo, latest["assessment_path"], final,
+                            manifest(value, repo, latest["initial_manifest"]), delivery=delivery)
         used = latest.get("review_fix_count", 0)
         grants_total = sum(item["additional_passes"] for item in grants)
         continuity = budget_continuity(value, repo, contract_path)
@@ -3767,6 +4421,7 @@ def complete(contract_path, out):
             for finding in state.load(absolute_file(latest["review_path"]))["findings"]:
                 open_findings.append({**finding, "scope": "repo",
                                       "review_acceptance_path": latest.get("review_acceptance_path")})
+        slice_inputs = {}
         slices_root = root / repo / "slices"
         if slices_root.is_dir():
             for directory in sorted(p for p in slices_root.iterdir() if p.is_dir()):
@@ -3774,6 +4429,11 @@ def complete(contract_path, out):
                 if not slice_events:
                     continue
                 slice_latest = slice_events[-1][2]
+                if has_bound_pre_review(value, repo) and slice_latest.get("status") == "accepted":
+                    inputs = check_input_status(value, repo, slice_latest)
+                    require(all(item["status"] == "verified" for item in inputs), "Completion slice check input is stale")
+                    if inputs:
+                        slice_inputs[directory.name] = inputs
                 inherited = {}
                 for _, _, event in slice_events:
                     check_event_seals(value, repo, event, inherited)
@@ -3786,6 +4446,16 @@ def complete(contract_path, out):
         repos[repo] = {"source_fingerprint": final["fingerprint"], "state_path": str(events[-1][1]),
                        "review_budget": budget_summary, "open_findings": open_findings,
                        "gate_fix_budget": audit["gate_fix_budget"], "gate_fix_history_sha256": audit["history_sha256"]}
+        if value.get("deliverables", {}).get(repo):
+            deliveries = delivery_status(value, repo, latest, recheck=False)
+            require(all(item["status"] == "verified" for item in deliveries), "Completion deliverable is stale")
+            repos[repo]["deliverables"] = deliveries
+        if value.get("external_stores"):
+            inputs = check_input_status(value, repo, latest)
+            require(all(item["status"] == "verified" for item in inputs), "Completion check input is stale")
+            repos[repo]["check_inputs"] = inputs
+            if slice_inputs:
+                repos[repo]["slice_check_inputs"] = slice_inputs
         paths += [str(events[-1][1]), *latest["artifact_hashes"]]
     if value.get("telemetry_policy", {}).get("run_local_seals"):
         require_run_local(value, root, paths)
@@ -3794,12 +4464,15 @@ def complete(contract_path, out):
         require(current and str(current[-1][1]) == entry["state_path"]
                 and sha(current[-1][1]) == certified_state_hashes[repo], "Completion state changed during checks")
     check_gate_sources_current(lineages)
+    seals = seal_files(paths, value if value.get("external_stores") else None)
+    if value.get("external_stores"):
+        confirm_completion_versions(value, repos)
     state.write_once(out, {"schema_version": VERSION, "run_id": value["run_id"],
                           "workflow": value["workflow"], "status": "completed",
                           "amendment": value.get("_amendment"),
                           "amendments": [dict(applied) for applied in value.get("_amendments", [])],
                           "at": datetime.now(timezone.utc).isoformat(), "repos": repos,
-                          "artifact_hashes": seal_files(paths)})
+                          "artifact_hashes": seals})
 
 
 def packet(contract_path, repo, scope_path, baseline_dir, out):
@@ -3867,8 +4540,12 @@ def prepare_evidence_record(contract_path, repo, record):
         require(prepared.get("amendment_sha256") in suffix, "Evidence lacks amendment binding")
     prepared["criterion_id"] = claims[0]["id"]
     final = manifest(value, repo, prepared["after_manifest"])
-    state.evidence(prepared, final, value.get("read_excludes", {}).get(repo, []))
-    execution_binding(prepared)
+    state.evidence(prepared, final, repo_read_excludes(value, repo), guard=lambda p: guard_path(p, value))
+    for path in prepared["artifact_paths"]:
+        absolute_file(path, value)
+    execution_binding(prepared, value)
+    validate_input_binding(value, repo, prepared)
+    validate_delivery_reference(value, repo, prepared)
     prepared["artifact_hashes"] = seal_files([
         prepared["before_manifest"], prepared["after_manifest"], *prepared["artifact_paths"]])
     return prepared
@@ -4114,6 +4791,31 @@ def digest(contract_path, repo, verbose=False):
     })
     status = latest.get("status") if latest else "uninitialized"
     summary["current_status"] = status
+    if value.get("deliverables", {}).get(repo):
+        summary["deliverables"] = delivery_status(value, repo, latest)
+        if any(row["status"] == "stale" for row in summary["deliverables"]):
+            summary["status"] = "failed"
+            errors["deliverables"] = "A published deliverable differs from its bound version"
+    try:
+        if latest and value.get("external_stores"):
+            summary["check_inputs"] = check_input_status(value, repo, latest)
+        declaration = value.get("slice_schedules", {}).get(repo)
+        if declaration and has_bound_pre_review(value, repo):
+            schedule, _ = checked_slice_schedule(value, repo, declaration["path"])
+            summary["slices"] = {}
+            for item in schedule["slices"]:
+                slice_events = history(directory / "slices" / item["id"], value)
+                current = slice_events[-1][2] if slice_events else {}
+                summary["slices"][item["id"]] = {"status": current.get("status", "pending"),
+                                                 "deliverables": delivery_status(value, repo, current, slice_item=item),
+                                                 "check_inputs": check_input_status(value, repo, current)}
+            if any(row["status"] == "stale" for section in summary["slices"].values()
+                   for row in section["deliverables"] + section["check_inputs"]):
+                summary["status"] = "failed"
+                errors["slices"] = "A slice has stale published deliverables or check inputs"
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        summary["status"] = "failed"
+        errors["bindings"] = str(error)
     try:
         lineage = GateFixLineage(value, repo)
         limit, grants = review_budget(events, contract_path, value, repo, gate_lineage=lineage)
@@ -4176,14 +4878,17 @@ def digest(contract_path, repo, verbose=False):
             if latest.get("matrix_path"):
                 matrix(value, repo, latest["matrix_path"], final)
                 evidence["matrix"] = "passed"
+            delivery = None
+            if latest.get("deliverable_manifest_path") and staged_deliverables(value, repo):
+                delivery = artifact_reference(latest["deliverable_manifest_path"])
             if latest.get("pre_review_evidence_paths"):
-                check_set(value, repo, "pre_review_checks", latest["pre_review_evidence_paths"], final)
+                check_set(value, repo, "pre_review_checks", latest["pre_review_evidence_paths"], final, delivery=delivery)
                 evidence["pre_review_checks"] = "passed"
             if latest.get("gate_evidence_paths"):
-                check_set(value, repo, "required_gates", latest["gate_evidence_paths"], final)
+                check_set(value, repo, "required_gates", latest["gate_evidence_paths"], final, delivery=delivery)
                 evidence["required_gates"] = "passed"
             if latest.get("assessment_path"):
-                assessment(value, repo, latest["assessment_path"], final, initial)
+                assessment(value, repo, latest["assessment_path"], final, initial, delivery=delivery)
                 evidence["assessment"] = "passed"
             if latest.get("scope_amendment_path"):
                 scope_amendment(contract_path, value, repo, latest["scope_amendment_path"], events, initial)

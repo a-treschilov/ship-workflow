@@ -6,7 +6,9 @@ Inputs: PLAN_PATH/approved snapshot for ship or BUG_BRIEF for fix, exact scoped 
 SCOPE_FILES/baselines/verified REVIEW_BASE, scoped deltas, initial/final manifests, review/gate results,
 completion matrix and EVIDENCE_PATHS. Missing required inputs means blocked/unverified. Don't silently
 check the whole HEAD diff or every item in a master plan.
-Inspect selected published deliverables and their snapshot manifest as part of the submitted evidence.
+Inspect all published deliverables and their selected manifest as part of the submitted evidence, including
+files in an approved external STORE. For staged deliverables record the manifest's `deliverable_binding` in
+the assessment and require the same binding in proofs for linked criteria.
 
 **Workflow-helper invariant:** prefer available file-reading and search capabilities for inspection. If a workflow helper is required, invoke it
 as one direct shell-tool call from the project root: `python3 -I -B .agents/workflows/ship-fix/scripts/<script>.py ...`. No `cd`,

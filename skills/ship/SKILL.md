@@ -47,6 +47,9 @@ the consumers' actual versions in the final cross-repo assessment. Do not alter 
 Order repositories so each shared package is built and synced before its consumers, and declare that order in
 the contract. Print scope/order and author handoffs.
 
+Use the protocol's `required_at` for staged deliverables. Bind external files only under STORE roots approved
+in the plan. Schedule checks that consume a late deliverable at the whole-repo gates.
+
 Before creating a run, search existing `plans/.ship-runs/*/run.json` for the selected plan and item, inspect
 the latest related state and report open work and budget usage. Continue the matching run where possible;
 never reset its budget or treat a new directory as a fresh result.
@@ -124,6 +127,8 @@ edited-unverified request. Never reuse IDs.
 For --from-review preserve author_handoff instead of fabricating an implementer or closed repair.
 
 Validate the submission with the protocol's `validate-submission` command before dispatching each reviewer.
+Pass the selected deliverable manifest to the pre-review checks and reviewer. Report pending deliverables at
+slice handoff. Use `digest` to detect stale bindings on resume and follow the protocol's recheck lifecycle.
 Run independent pre-review checks before the first expensive review. Run all final gates in one
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_run_checks.py gates --contract CONTRACT --repo REPO --scope SCOPE --out-dir DIR --phase-id ID`
 call; it writes phase telemetry and prints pass/fail per check. Prepare helper packet or revision
@@ -210,6 +215,7 @@ Issue each cross-repo-independent operation once, not once per repo: one exec ce
 
 Spawn existing plan-checker with PLAN_PATH/approved snapshot, CONTRACT_PATH, absolute protocol/helper,
 scoped deltas/bases, all repo paths, manifests and EVIDENCE_PATHS. No author's persuasive narrative.
+Include the whole-repo deliverable manifest and external input bindings with the acceptance evidence.
 Save its structured criterion assessment immutably per repo. Missing/partial/unmet/failed/unverified is a
 blocker. Reopen only through original implementer (or author session), charge the protocol repair budget,
 repeat affected review/gates/checker; no budget reset.

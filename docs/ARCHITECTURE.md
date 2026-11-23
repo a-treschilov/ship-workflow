@@ -51,7 +51,7 @@ Context usage, when available, is a timestamped Codex orchestrator input and win
 | `ship_artifacts.py` | Implementer-side mechanics: task files, first-touch backups, declared check runs, evidence records, matrices, applied results, capsules | Decide semantic success or run independent gates |
 | `ship_run_checks.py` | Orchestrator-side execution of declared `argv` checks; saves logs, real exit codes, before/after manifests and bound evidence | Decide that a failed command passed |
 | `ship_checks.py` | Opt-in single declared check execution with an explicit execution spec and digest | Become the default `/ship` executor |
-| `ship_workflow.py` | Versioned lifecycle validation and transition rules | Launch agents or execute project code |
+| `ship_workflow.py`, `ship_store.py` | Versioned lifecycle validation, transition rules and descriptor-based STORE observations | Launch agents or execute project code |
 | `roundtrip_audit.py` | Read-only transcript audit for batching and tool-call patterns | Rewrite transcripts or run state |
 | `agent_models.py` | Validate and initialize model profiles, generate native Claude and Codex role files, and detect drift | Guess an unavailable model or alias |
 | `ocx_models.py` | Refresh the optional OCX model catalog and Claude aliases | Change role assignments |
@@ -123,10 +123,11 @@ boundaries.
 Successor budget continuity records bind the latest predecessor state, the SHA-256 of its audited history and
 the explicit user decision. Historical schedule validation uses the already loaded predecessor contract.
 Related-run discovery belongs to active contract validation. The repo gate-fix budget follows the historical links and counts each predecessor's local
-repair events once. The combined allowance is two attempts. Declared
-deliverables use run-local snapshots, checked against the live published paths before review and completion.
-Declared check inputs can be snapshotted at execution; these bindings do not independently establish the
-semantic correctness of a claim or authenticate a process identity.
+repair events once. The combined allowance is two attempts. A contract can assign a deliverable to slice
+pre-review or whole-repo pre-review. Whole-repo certification includes every deliverable. Small files use
+run-local snapshots. An approved external STORE uses descriptor-based streaming and sealed version manifests,
+with separate before and after observations for declared check inputs. Live certification checks the published
+versions. Historical audits verify the recorded seals. Semantic acceptance still requires independent evidence.
 
 ## Roles
 

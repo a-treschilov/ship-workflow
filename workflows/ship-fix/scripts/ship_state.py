@@ -111,6 +111,7 @@ def validate_run(contract_path, attempt_id, workflow):
         require(value["run_id"] == meta["run_id"] and value["workflow"] == meta["workflow"],
                 "Run metadata/contract identity mismatch")
         require(value["repos"] == meta.get("repos"), "Run metadata/contract repositories mismatch")
+        workflow.validate_store_roots(value)
         if value["workflow"] == "ship":
             require(value.get("plan_path") == meta.get("plan_path"), "Run metadata/contract plan mismatch")
         schedules = value.get("slice_schedules", {})
@@ -1619,16 +1620,9 @@ def main():
         workflow = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(workflow)
         if args.command == "snapshot-deliverables":
-            selected = None
-            if args.slice:
-                require(args.schedule, "--slice needs --schedule")
-                workflow.slice_schedule(args.contract, args.repo, args.schedule)
-                item = next((entry for entry in load(args.schedule)["slices"] if entry["id"] == args.slice), None)
-                require(item is not None, "Unknown slice")
-                selected = {c["criterion_id"] for c in item["contributions"]}
-            else:
-                require(not args.schedule, "--schedule needs --slice")
-            print(workflow.snapshot_deliverables(args.contract, args.repo, args.out_dir, selected))
+            value = workflow.contract(args.contract)
+            item = workflow.selected_slice(value, args.repo, args.slice, args.schedule)
+            print(workflow.snapshot_deliverables(args.contract, args.repo, args.out_dir, slice_item=item))
         elif args.command == "validate-submission":
             value = workflow.contract(args.contract)
             final = workflow.manifest(value, args.repo, args.manifest)
@@ -1640,21 +1634,16 @@ def main():
             errors = workflow.submission_evidence_errors(value, args.repo, args.matrix, final,
                                                           "rows" if args.slice else "criteria")
             require(not errors, "Invalid submission:\n" + "\n".join(errors))
-            if args.slice:
-                require(args.schedule, "--slice needs --schedule")
-                workflow.slice_schedule(args.contract, args.repo, args.schedule)
-                schedule = load(args.schedule)
-                item = next((entry for entry in schedule["slices"] if entry["id"] == args.slice), None)
-                require(item is not None, "Unknown slice")
+            item = workflow.selected_slice(value, args.repo, args.slice, args.schedule)
+            if item is not None:
                 workflow.slice_matrix(value, args.repo, item, args.matrix, final)
             else:
-                require(not args.schedule, "--schedule needs --slice")
                 workflow.matrix(value, args.repo, args.matrix, final)
-            selected = {c["criterion_id"] for c in item["contributions"]} if args.slice else None
-            workflow.validate_deliverables(value, args.repo, args.deliverable_manifest, selected)
+            workflow.validate_deliverables(value, args.repo, args.deliverable_manifest, slice_item=item)
             print(json.dumps({"status": "valid", "repo": args.repo, "slice": args.slice}))
         elif args.command == "validate-contract":
             value = workflow.contract(args.contract)
+            workflow.validate_store_roots(value)
             schedules = value.get("slice_schedules", {})
             require(isinstance(schedules, dict) and set(schedules) <= set(value["repos"]), "Invalid slice schedules")
             for repo, declaration in schedules.items():

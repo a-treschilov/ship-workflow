@@ -60,9 +60,13 @@ def checks_module():
     return module
 
 
-def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop_on_fail):
+def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop_on_fail, *,
+              deliverable_manifest=None, slice_id=None, schedule=None):
     repo_path = contract["repo_paths"][repo]
     workflow = workflow_module()
+    if contract.get("external_stores") or workflow.staged_deliverables(contract, repo) or deliverable_manifest:
+        contract = workflow.contract(contract_path)
+    item = workflow.selected_slice(contract, repo, slice_id, schedule)
     read_excludes = workflow.repo_read_excludes(contract, repo)
     policies = workflow.read_policy(contract)
     workflow.state.guard_excluded_paths(Path(out_dir).absolute(), policies)
@@ -81,6 +85,7 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
         raise SystemExit("Unknown or non-argv check id requested")
     results = {}
     for check in checks:
+        delivery = workflow.check_delivery(contract, repo, group, deliverable_manifest, slice_item=item)
         cid = check["id"]
         marker = out_dir / f"{cid}.exit"
         if marker.exists():
@@ -88,17 +93,21 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
         before, after = out_dir / f"{cid}-before.json", out_dir / f"{cid}-after.json"
         log = out_dir / f"{cid}.log"
         capture(workflow.state, repo_path, scope_paths, before, exclusions, read_excludes, policies)
-        inputs = workflow.snapshot_inputs(check.get("input_paths", []), out_dir / f"{cid}-inputs",
-                                          repo_path, read_excludes)
+        inputs, observed = workflow.before_check_inputs(contract, repo, check, out_dir / f"{cid}-inputs")
         done = run(check["argv"], cwd=repo_path)
-        workflow.check_inputs_unchanged(inputs)
         log.write_text(sanitize((done.stdout + "\n--- stderr ---\n" + done.stderr).encode()))
         marker.write_text(f"{done.returncode}\n")
+        inputs, bindings = workflow.after_check_inputs(contract, check, inputs, observed)
+        workflow.require(delivery == workflow.check_delivery(contract, repo, group, deliverable_manifest, slice_item=item),
+                         "Deliverable version changed during execution")
         capture(workflow.state, repo_path, scope_paths, after, exclusions, read_excludes, policies)
         status = "passed" if done.returncode == 0 else "failed"
         execution = out_dir / f"{cid}-execution.json"
+        artifacts = [str(log), str(marker), str(execution), *inputs]
+        references = workflow.execution_references(artifacts, bindings, delivery)
         workflow.state.write_once(execution, {"producer": "orchestrator", "command": shlex.join(check["argv"]),
-                                                "exit_code": done.returncode, "log": str(log)})
+                                                "exit_code": done.returncode, "log": str(log),
+                                                **({"check_id": cid, **references} if references else {})})
         body = {
             "kind": check["kind"], "status": status, "producer": "orchestrator",
             "command": shlex.join(check["argv"]), "exit_code": done.returncode,
@@ -106,8 +115,7 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
             "data_scope": check.get("data_scope") or DEFAULT_SCOPE,
             "claims": [{"id": cid, "assertion": f"{check.get('verification', cid)} Actual exit {done.returncode}."}],
             "before_manifest": str(before), "after_manifest": str(after),
-            "artifact_paths": [str(log), str(marker), str(execution), *inputs], "criterion_id": cid,
-            "execution_record": str(execution),
+            "artifact_paths": artifacts, "criterion_id": cid, "execution_record": str(execution), **references,
         }
         if status == "failed":
             body["reason"] = f"Declared command exited {done.returncode}; see {log.name}."
@@ -196,6 +204,9 @@ def main():
     parser.add_argument("--repos", help="Comma-separated repo names for a batched gates run")
     parser.add_argument("--all-repos", action="store_true")
     parser.add_argument("--scope", help="JSON array of source paths (same as the transition scope_path)")
+    parser.add_argument("--deliverable-manifest")
+    parser.add_argument("--slice")
+    parser.add_argument("--schedule")
     parser.add_argument("--scope-dir", help="Directory holding <repo>-scope.json files (default <run>/inputs)")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--group", choices=["preflight_checks", "pre_review_checks", "required_gates"])
@@ -207,6 +218,8 @@ def main():
     parser.add_argument("--at")
     args = parser.parse_args()
     if args.command == "gates":
+        if args.deliverable_manifest or args.slice or args.schedule:
+            raise SystemExit("gates uses the reviewed whole-repo deliverable manifest")
         if args.group and args.group != "required_gates":
             raise SystemExit("gates runs required_gates only")
         if args.repo:
@@ -230,7 +243,8 @@ def main():
         raise SystemExit("checks requires --repo and --scope")
     wanted = {i for i in args.ids.split(",") if i}
     results = run_group(args.contract, contract, args.repo, args.scope, args.out_dir,
-                        args.group, wanted, args.stop_on_fail)
+                        args.group, wanted, args.stop_on_fail, deliverable_manifest=args.deliverable_manifest,
+                        slice_id=args.slice, schedule=args.schedule)
     sys.exit(0 if all(code == 0 for code, _ in results.values()) else 1)
 
 

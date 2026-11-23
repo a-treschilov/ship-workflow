@@ -47,6 +47,8 @@ There is no plan_path or archival. Extract a small acceptance brief, not a large
 - environment, independent gates and pre-review/preflight checks per protocol.
 Ask only when expected behavior is genuinely ambiguous; don't invent approval questions for obvious fixes.
 
+Use the protocol's `required_at` for staged deliverables and approved STORE roots for external files.
+
 Select acceptance mode reproduced-bug/improvement/unavailable-baseline. Reproduce a bug safely on initial
 source when possible and record failure before edits; otherwise document why baseline unavailable.
 Both before/after scenario evidence uses the original_scenario string; no fabricated red test.
@@ -57,6 +59,8 @@ actual runtime source/mount, safe test DB, dependencies and permissions. An unav
 blocks before edits. Explicit user-authorized code-only work stays implemented/unverified, never success.
 Preserve unrelated dirty WIP; first-touch snapshots isolate same-file pre-existing edits.
 Validate the submission with the protocol's `validate-submission` command before dispatching each reviewer.
+Pass the selected manifest to pre-review checks, reviewer and assessment. Report pending and stale bindings
+from the run digest and follow the protocol's recheck lifecycle.
 
 ## 2. Shared implementation / review / gates
 

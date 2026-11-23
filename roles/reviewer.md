@@ -20,8 +20,10 @@ scoped diff and every mandatory pass; slice reports narrow nothing. Focus it on 
 interface agreement on both sides, DI/wiring and shared files, duplicated or diverging behavior across slices,
 unseen consumers, non-goals and criteria that several slices contribute to.
 Missing inputs/manifests/scope are blocked, not clean. Run-wide arbitrary HEAD diff cannot replace scope.
-Inspect selected deliverable snapshots and the published paths alongside the current matrix; a corrected draft
-does not establish that the delivered file was updated.
+Inspect due deliverables and their published versions alongside the current matrix. Report later deliverables
+as pending. For a staged manifest with due files, confirm the published versions through the submission
+validation and return the protocol's `deliverable_binding` in the review result. Whole-repo review covers all
+declared deliverables, including files in an approved external STORE.
 
 ## Inspection
 
