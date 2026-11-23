@@ -114,10 +114,12 @@ prerequisites and cross-repo bindings. Evidence records name a producer, kind, s
 environment, data scope, before/after manifests and bounded artifact paths. Hash freshness is not semantic
 proof; a matching manifest only shows that the evidence was captured against the current source.
 
-Optional contract read exclusions prune matching paths from helper capture and reject intersecting input snapshots.
-Historical validation carries these exclusions by repository root through nested audits and checks path
-components before accessing artifacts. When scope amendment validation checks the Git index under a read
-exclusion policy, Git receives an isolated copy of the guarded index metadata.
+Optional contract read exclusions prune the untracked walk and filter tracked names in Git before it emits
+them. Restricted capture isolates the index, HEAD and ignore configuration, expands only allowed sparse
+trees and uses directory descriptors to prevent symlink swaps during reads. Nested policies apply to
+parent captures and historical audits. See the
+[source capture rules](../workflows/ship-fix/PROTOCOL.md#submission-validation) for the Git and filesystem
+boundaries.
 Successor budget continuity records bind the latest predecessor state, the SHA-256 of its audited history and
 the explicit user decision. Historical schedule validation uses the already loaded predecessor contract.
 Related-run discovery belongs to active contract validation. The repo gate-fix budget follows the historical links and counts each predecessor's local

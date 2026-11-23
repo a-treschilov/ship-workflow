@@ -54,9 +54,11 @@ def task_file(path):
     for key in ("contract", "repo", "repo_path", "baseline_dir", "touched", "write_scope", "evidence_dir"):
         require(value.get(key), f"Task lacks {key}")
     require(Path(value["evidence_dir"]).is_absolute(), "evidence_dir must be absolute")
-    value["touched_list"] = state.load(value["touched"]) if Path(value["touched"]).is_file() else []
-    value["source_scope_list"] = state.load(value["source_scope"]) if value.get("source_scope") else []
-    value["read_excludes"] = state.load(value["contract"]).get("read_excludes", {}).get(value["repo"], [])
+    contract = state.load(value["contract"])
+    value["touched_list"] = workflow.scope_input(value["touched"], contract, optional=True)
+    value["source_scope_list"] = workflow.scope_input(value["source_scope"], contract) if value.get("source_scope") else []
+    value["read_excludes"] = workflow.repo_read_excludes(contract, value["repo"])
+    value["read_policy"] = workflow.read_policy(contract)
     return value
 
 
@@ -149,7 +151,7 @@ def run(task, name, argv, check):
     dependencies, excludes = workflow.capture_policy(task["contract"], task["repo"])
     scope = sorted(set(task["touched_list"]) | set(task["source_scope_list"]) | set(dependencies))
     root = task["repo_path"]
-    before = state.capture(root, scope, excludes, task.get("read_excludes", []))
+    before = state.capture(root, scope, excludes, task.get("read_excludes", []), policies=task.get("read_policy", ()))
     before_path = evidence / "runs" / f"{name}-before.json"
     state.write_once(before_path, before)
     check_spec = spec_for(state.load(task["contract"]), task["repo"], check) if check else {}
@@ -161,7 +163,7 @@ def run(task, name, argv, check):
     text = checks.sanitize(raw, truncated=timed_out or len(raw) >= checks.LIMIT)
     suffix = " (timeout)" if timed_out else ""
     log.write_text(text + f"\nEXIT={returncode}{suffix}\n", encoding="utf-8")
-    after = state.capture(root, scope, excludes, task.get("read_excludes", []))
+    after = state.capture(root, scope, excludes, task.get("read_excludes", []), policies=task.get("read_policy", ()))
     after_path = evidence / "runs" / f"{name}-after.json"
     state.write_once(after_path, after)
     state.write_once(record, {"name": name, "producer": "implementer", "command": shlex.join(argv), "exit_code": returncode,
@@ -416,11 +418,19 @@ def git_changes(root):
 
 
 def scope_check(task):
-    if not (Path(task["repo_path"]) / ".git").exists():
+    root = Path(task["repo_path"]).absolute()
+    read_excludes = task.get("read_excludes", [])
+    policies = task.get("read_policy", ())
+    pinned = bool(read_excludes or policies)
+    marker = (state.guard_excluded_paths(root / ".git", policies, pinned=True) if policies else
+              state.guard_excluded_path(root / ".git", root, read_excludes, pinned=pinned))
+    try:
+        state.capture_lstat(marker) if pinned else marker.stat()
+    except FileNotFoundError:
         print("scope-check skipped: non-git source root")
         return
     events = workflow.history(Path(task["contract"]).resolve().parent / task["repo"])
-    names = state.PathNames(Path(task["repo_path"]).resolve(), task.get("read_excludes", []))
+    names = state.PathNames(root.resolve(), read_excludes)
     changed = None
     if events:
         initial_path = events[0][2].get("initial_manifest")
@@ -428,7 +438,7 @@ def scope_check(task):
         initial = state.checked_manifest(initial_path)
         dependencies, excludes = workflow.capture_policy(task["contract"], task["repo"])
         scope = sorted(set(initial["files"]) | set(task["touched_list"]) | set(dependencies))
-        current = state.capture(task["repo_path"], scope, excludes, task.get("read_excludes", []))
+        current = state.capture(root, scope, excludes, read_excludes, policies=policies)
         require(initial["repo_path"] == current["repo_path"], "Initial manifest belongs to another repo")
         path_keys = names.changed(initial, current, missing=state.MISSING)
         spellings = names.spellings(initial["files"].keys() | current["files"].keys() | set(task["touched_list"]))
@@ -437,7 +447,7 @@ def scope_check(task):
         unowned = sorted(path_keys - names.keys(task["touched_list"]))
         changed = path_keys
     else:
-        require(not task.get("read_excludes"), "scope-check requires initialized history with read_excludes")
+        require(not pinned, "scope-check requires initialized history with read_excludes")
         changed = git_changes(task["repo_path"])
         outside = sorted(p for p in changed if not workflow.in_scope(p, task["write_scope"], names))
         unowned = sorted(names.keys(changed) - names.keys(task["touched_list"]))
@@ -477,10 +487,12 @@ def capsule(task, draft_file, agent_id):
     # The helper binds a capsule to its own fingerprint scope; a repo task must name the scope file it uses.
     require(task.get("slice_id") or task.get("scope_file"), "Repo capsule needs scope_file in the task")
     # Same scope the helper fingerprints: a slice uses its touched list, a repo its scope file, plus dependencies.
-    base = state.load(task["scope_file"]) if task.get("scope_file") and not task.get("slice_id") else task["touched_list"]
+    base = (workflow.scope_input(task["scope_file"], contract)
+            if task.get("scope_file") and not task.get("slice_id") else task["touched_list"])
     scope = sorted(set(base) | set(task["source_scope_list"]))
     _, excludes = workflow.capture_policy(task["contract"], task["repo"])
-    manifest = state.capture(task["repo_path"], scope, excludes, task.get("read_excludes", []))
+    manifest = state.capture(task["repo_path"], scope, excludes, task.get("read_excludes", []),
+                             policies=task.get("read_policy", ()))
     directory = Path(task["evidence_dir"]) / "capsules"
     target = next_free(directory, ".json")
     sidecar = directory / (target.stem + ".manifest.json")
@@ -502,10 +514,12 @@ def since_capsule(task, capsule_file):
     value = state.load(capsule_file)
     manifest = state.checked_manifest(value["manifest_path"])
     require(manifest["fingerprint"] == value["source_fingerprint"], "Capsule fingerprint mismatch")
-    base = state.load(task["scope_file"]) if task.get("scope_file") and not task.get("slice_id") else task["touched_list"]
+    contract = state.load(task["contract"])
+    base = (workflow.scope_input(task["scope_file"], contract)
+            if task.get("scope_file") and not task.get("slice_id") else task["touched_list"])
     _, excludes = workflow.capture_policy(task["contract"], task["repo"])
     current = state.capture(task["repo_path"], sorted(set(base) | set(task["source_scope_list"])), excludes,
-                            task.get("read_excludes", []))
+                            task.get("read_excludes", []), policies=task.get("read_policy", ()))
     read_excludes = task.get("read_excludes", [])
     if state.same_source(manifest, current, read_excludes):
         print("no change since capsule")

@@ -204,6 +204,7 @@ class WorkflowStateTests(unittest.TestCase):
         if alternate.exists():
             self.skipTest("filesystem ignores case")
         os.link(self.source, alternate)
+        self.git("add", "SOURCE.TXT")
         capture = state.capture(self.repo, ["SOURCE.TXT"], read_excludes=["private"])
         self.assertEqual({"source.txt", "SOURCE.TXT"}, capture["files"].keys())
         self.assertEqual({"SOURCE.TXT"}, state.capture(self.repo, [], read_excludes=["source.txt"])["files"].keys())
@@ -225,27 +226,63 @@ class WorkflowStateTests(unittest.TestCase):
 
         private = nested / "private"
         private.mkdir()
-        (private / "protected.txt").write_text("protected")
+        blocked_tracked = private / "protected.txt"
+        blocked_tracked.write_text("protected")
+        self.git("add", str(blocked_tracked))
+        (private / "child").mkdir()
+        (private / "child/untracked.txt").write_text("protected")
         metadata = nested / ".git"
         metadata.mkdir()
         (metadata / "config").write_text("metadata")
-        scan, listdir = os.scandir, os.listdir
+        scan, listdir, lstat, open_file = os.scandir, os.listdir, Path.lstat, Path.open
 
-        def guarded(reader, path):
-            directory = Path(path)
-            for blocked in (private, metadata, link):
-                self.assertFalse(directory == blocked or blocked in directory.parents,
-                                 f"capture entered {directory}")
-            return reader(path)
+        def guarded(reader, path, *args, **kwargs):
+            if not isinstance(path, int):
+                self.assertFalse(Path(path).is_relative_to(private), "capture accessed excluded tree")
+                if reader in (scan, listdir):
+                    for blocked in (metadata, link):
+                        self.assertFalse(Path(path).is_relative_to(blocked), "capture entered metadata or symlink")
+            return reader(path, *args, **kwargs)
+
+        real_run = subprocess.run
+        index_calls = []
+
+        def observed_git(args, **kwargs):
+            result = real_run(args, **kwargs)
+            if "ls-files" in args:
+                paths = state.nul_paths(result.stdout)
+                self.assertNotIn("outer/inner/private/protected.txt", paths, "Git enumerated excluded tracked path")
+                index_calls.append(paths)
+            if "check-ignore" in args:
+                self.assertFalse(any(name.startswith("outer/inner/private/")
+                                     for name in state.nul_paths(kwargs["input"])))
+            return result
 
         with patch.object(state.os, "scandir", side_effect=lambda p: guarded(scan, p)), \
-                patch.object(state.os, "listdir", side_effect=lambda p: guarded(listdir, p)):
+                patch.object(state.os, "listdir", side_effect=lambda p: guarded(listdir, p)), \
+                patch.object(Path, "lstat", lambda p: guarded(lstat, p)), \
+                patch.object(Path, "open", lambda p, *a, **kw: guarded(open_file, p, *a, **kw)), \
+                patch.object(subprocess, "run", side_effect=observed_git):
+            with self.assertRaisesRegex(AssertionError, "Git enumerated excluded tracked path"):
+                state.git_paths(repo, "--cached")
+            with self.assertRaisesRegex(AssertionError, "accessed excluded tree"):
+                os.scandir(private)
+            with self.assertRaisesRegex(AssertionError, "accessed excluded tree"):
+                blocked_tracked.read_text()
             captured = state.capture(repo, [], read_excludes=read_excludes)
         link_name = "outer/inner/private-link"
+        self.assertEqual([{"source.txt", tracked}] * 2, index_calls)
         self.assertEqual({"source.txt", tracked, untracked, link_name}, captured["files"].keys())
         self.assertEqual({"kind": "symlink", "target": "private"}, captured["files"][link_name])
         state.match(state.checked_manifest(previous), captured)
         self.assertEqual(previous_bytes, previous.read_bytes())
+        for name in (tracked, untracked):
+            (repo / name).write_text("changed")
+        self.assertEqual({tracked, untracked}, state.PathNames(repo, read_excludes).changed(
+            captured, state.capture(repo, [], read_excludes=read_excludes)))
+        for name in ("outer/inner", link_name, f"{link_name}/child/untracked.txt"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "read_excludes|Symlinked parent"):
+                state.capture(repo, [name], read_excludes=read_excludes)
 
     def test_read_exclusion_prunes_both_spellings_before_descending(self):
         if not (self.repo / "SOURCE.TXT").exists():
@@ -258,7 +295,8 @@ class WorkflowStateTests(unittest.TestCase):
         scan, listdir = os.scandir, os.listdir
 
         def guarded(reader, path):
-            self.assertNotEqual(private, Path(path), "entered excluded directory")
+            if not isinstance(path, int):
+                self.assertNotEqual(private, Path(path), "entered excluded directory")
             return reader(path)
 
         with patch.object(state.os, "scandir", side_effect=lambda p: guarded(scan, p)), \
@@ -270,6 +308,291 @@ class WorkflowStateTests(unittest.TestCase):
                     state.capture(self.repo, [name], read_excludes=read_excludes)
         with self.assertRaisesRegex(ValueError, "read_excludes"):
             state.guard_excluded_path(self.repo / "PRIVATE/tracked", self.repo, ["Private"])
+
+    def test_restricted_capture_omits_unicode_aliases_from_git_output(self):
+        directory = self.repo / "Équipe"
+        directory.mkdir()
+        (directory / "private.txt").write_text("fixture")
+        self.git("add", ".")
+        excluded = "e\u0301quipe"
+        if not (self.repo / excluded).exists():
+            self.skipTest("filesystem distinguishes case or Unicode normalization")
+
+        run = subprocess.run
+
+        def observe(args, **kwargs):
+            result = run(args, **kwargs)
+            if "ls-files" in args:
+                self.assertEqual(b"source.txt\0", result.stdout)
+            return result
+
+        with patch.object(subprocess, "run", side_effect=observe):
+            self.assertEqual(self.manifest, state.capture(self.repo, [], read_excludes=[excluded]))
+
+    def test_restricted_capture_preserves_allowed_stages_below_excluded_index_ancestor(self):
+        folder = self.repo / "merge[é]"
+        folder.mkdir()
+        (folder / "allowed").write_text("fixture")
+        (folder / "private").write_text("fixture")
+        oid = self.git("hash-object", "-w", "source.txt").stdout.strip()
+        entries = b"".join(b"100644 " + oid + f" {stage}\t{name}\n".encode()
+                           for stage, name in ((2, folder.name), (3, f"{folder.name}/allowed"),
+                                               (3, f"{folder.name}/private")))
+        subprocess.run(["git", "-C", str(self.repo), "update-index", "--index-info"], check=True, input=entries)
+        exclusion = f"{folder.name}/private"
+        visible = f"{folder.name}/allowed"
+        captured = state.capture(self.repo, [], read_excludes=[exclusion], excludes=[visible])
+        self.assertEqual({"source.txt", visible}, captured["files"].keys())
+
+    def test_restricted_capture_guards_metadata_pointers_before_following(self):
+        root = self.repo.resolve()
+        private = root / "private"
+        private.mkdir()
+        marker = root / ".git"
+        index = marker / "index"
+        index.rename(private / "index")
+        index.symlink_to("../private/index")
+        for pointer in ("index symlink", "GIT_INDEX_FILE", "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE",
+                        "commondir", "gitfile", "gitdir symlink"):
+            with self.subTest(pointer=pointer):
+                if pointer == "commondir":
+                    (marker / "commondir").write_text("../private\n")
+                if pointer == "gitfile":
+                    marker.rename(root / "ordinary-metadata")
+                    marker.write_text("gitdir: private\n")
+                if pointer == "gitdir symlink":
+                    marker.unlink()
+                    marker.symlink_to("private", target_is_directory=True)
+                env = {}
+                if pointer.startswith("GIT_"):
+                    env[pointer] = "private/index" if pointer == "GIT_INDEX_FILE" else "private"
+                with patch.dict(os.environ, env), patch.object(subprocess, "run", side_effect=AssertionError("Git started")):
+                    with self.assertRaisesRegex(ValueError, "read_excludes"):
+                        state.capture(root, [], read_excludes=["private"])
+                if pointer == "index symlink":
+                    index.unlink()
+                    (private / "index").rename(index)
+                if pointer == "commondir":
+                    (marker / "commondir").unlink()
+
+    def test_restricted_capture_isolates_config_and_git_environment(self):
+        root = self.repo.resolve()
+        private = root / "private"
+        private.mkdir()
+        include = root / "capture-config"
+        include.write_text("[core]\nexcludesFile = in-tree-ignore\n")
+        (root / "in-tree-ignore").write_text("global-hidden\n")
+        (root / ".git/info/exclude").write_text("info-hidden\n")
+        (root / ".gitignore").write_text("local-hidden\n")
+        for name in ("global-hidden", "info-hidden", "local-hidden", "visible"):
+            (root / name).write_text(name)
+        self.git("config", "include.path", str(include))
+        expected = state.capture(root, [])
+        env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.excludesFile",
+               "GIT_CONFIG_VALUE_0": str(private / "hidden"), "GIT_OBJECT_DIRECTORY": str(private),
+               "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(private), "GIT_TRACE": str(private / "trace")}
+        with patch.dict(os.environ, env):
+            self.assertEqual(expected, state.capture(root, [], read_excludes=["private"]))
+        self.assertEqual([], list(private.iterdir()))
+        include.write_text("[core]\nexcludesFile = private/hidden\n")
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            state.capture(root, [], read_excludes=["private"])
+        self.git("config", "include.path", str(private / "config"))
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            state.capture(root, [], read_excludes=["private"])
+
+    def test_restricted_capture_preserves_split_index_packed_head_and_linked_worktree(self):
+        private = self.repo / "private"
+        private.mkdir()
+        (private / "tracked").write_text("fixture")
+        self.git("add", ".")
+        self.git("-c", "user.name=test", "-c", "user.email=test@example.org", "commit", "-qm", "base")
+        self.git("pack-refs", "--all")
+        self.git("update-index", "--index-version", "4")
+        expected = state.capture(self.repo, [])
+        expected["files"].pop("private/tracked")
+        expected["fingerprint"] = state.digest({k: v for k, v in expected.items() if k != "fingerprint"})
+        self.git("update-index", "--split-index")
+        self.assertEqual(expected, state.capture(self.repo, [], read_excludes=["private"]))
+        linked = self.root / "linked"
+        self.git("worktree", "add", "--detach", str(linked))
+        self.assertEqual(expected["head"], state.capture(linked, [], read_excludes=["private"])["head"])
+
+    def test_restricted_capture_supports_sha256_indexes(self):
+        repo = self.root / "sha256"
+        initialized = subprocess.run(["git", "init", "-q", "--object-format=sha256", str(repo)],
+                                     capture_output=True)
+        if initialized.returncode != 0 and b"object-format" in initialized.stderr:
+            self.skipTest("Git does not support SHA-256 repositories")
+        self.assertEqual(0, initialized.returncode, initialized.stderr)
+        self.repo = repo
+        (repo / "allowed").write_text("fixture")
+        (repo / "private").write_text("fixture")
+        self.git("add", ".")
+        self.git("-c", "user.name=test", "-c", "user.email=test@example.org", "commit", "-qm", "base")
+        captured = state.capture(repo, [], read_excludes=["private"])
+        self.assertEqual({"allowed"}, captured["files"].keys())
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.decode().strip(), captured["head"])
+
+    def test_restricted_sparse_index_expands_only_allowed_trees(self):
+        for name in ("retained/tracked", "collapsed/allowed/tracked", "collapsed/private/never-read"):
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name)
+        self.git("add", ".")
+        self.git("-c", "user.name=test", "-c", "user.email=test@example.org", "commit", "-qm", "base")
+        protected = self.git("rev-parse", "HEAD:collapsed/private").stdout.strip()
+        self.git("sparse-checkout", "set", "--sparse-index", "retained")
+        exclusion = ["collapsed/private"]
+        expected = state.capture(self.repo, [])
+        expected["files"].pop("collapsed/private/never-read")
+        expected["fingerprint"] = state.digest({k: v for k, v in expected.items() if k != "fingerprint"})
+        run = subprocess.run
+
+        def observe(args, **kwargs):
+            self.assertNotIn(protected.decode(), args, "Git was asked to open the excluded tree OID")
+            result = run(args, **kwargs)
+            if "ls-files" in args:
+                self.assertNotIn(b"collapsed/", result.stdout, "Git emitted a collapsed index path")
+            if "cat-file" in args:
+                self.assertNotIn(b"never-read", result.stdout, "Git emitted entries of an excluded tree")
+            return result
+
+        for packed in (False, True):
+            if packed:
+                self.git("gc")
+            with self.subTest(packed=packed), patch.object(subprocess, "run", side_effect=observe):
+                self.assertEqual(expected, state.capture(self.repo, [], read_excludes=exclusion))
+
+    def test_restricted_capture_uses_system_and_conditional_ignore_config(self):
+        root = self.repo.resolve()
+        config = self.root.resolve() / "system-config"
+        paths = [(root / "path-rules", "path-hidden\n"), (root / "branch-rules", "branch-hidden\n"),
+                 (root / "remote-rules", "remote-hidden\n"), (root / "system-rules", "system-hidden\n")]
+        for rules, pattern in paths:
+            rules.write_text(pattern)
+            rules.with_name(rules.name.replace("rules", "config")).write_text(f"[core]\nexcludesFile = {rules}\n")
+        for hidden in ("path-hidden", "branch-hidden", "remote-hidden", "system-hidden"):
+            (root / hidden).write_text("untracked")
+        (root / "private").mkdir()
+        branch = self.git("symbolic-ref", "--short", "HEAD").stdout.decode().strip()
+        self.git("config", "remote.origin.url", "https://example.invalid/team/project")
+        conditionals = (
+            ("gitdir:**/repo/.git", "path-config", "path-hidden"),
+            (f"onbranch:{branch}", "branch-config", "branch-hidden"),
+            ("hasconfig:remote.*.url:https://example.invalid/**", "remote-config", "remote-hidden"),
+        )
+        with patch.dict(os.environ, {"GIT_CONFIG_SYSTEM": str(config), "GIT_CONFIG_NOSYSTEM": "0"}):
+            for condition, source, hidden in conditionals:
+                with self.subTest(condition=condition):
+                    config.write_text(f'[includeIf "{condition}"]\npath = {root / source}\n'
+                                      '[includeIf "onbranch:never-matches"]\npath = ' +
+                                      str(root / "private/never-open") + "\n")
+                    unrestricted = state.capture(root, [])
+                    self.assertNotIn(hidden, unrestricted["files"])
+                    self.assertEqual(unrestricted, state.capture(root, [], read_excludes=["private"]))
+            # These conditions are unknown on older Git. Match the installed
+            # implementation before deciding whether they can select a file.
+            for condition in ("hostname:**", f"worktree:{root}", f"worktree/i:{str(root).upper()}"):
+                config.write_text(f'[includeIf "{condition}"]\npath = {root / "system-config"}\n')
+                with self.subTest(condition=condition):
+                    self.assertEqual(state.capture(root, []), state.capture(root, [], read_excludes=["private"]))
+            config.write_text(f"[include]\npath = {root / 'system-config'}\n")
+            self.assertNotIn("system-hidden", state.capture(root, [], read_excludes=["private"])["files"])
+            config.write_text(f'[includeIf "onbranch:{branch}"]\npath = {root / "private/never-open"}\n')
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                state.capture(root, [], read_excludes=["private"])
+        with patch.dict(os.environ, {"GIT_CONFIG_SYSTEM": str(root / "private/config"), "GIT_CONFIG_NOSYSTEM": "0"}):
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                state.capture(root, [], read_excludes=["private"])
+        self.git("config", "core.excludesFile", os.devnull)
+        with patch.dict(os.environ, {"GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "0"}):
+            self.assertEqual(state.capture(root, []), state.capture(root, [], read_excludes=["private"]))
+
+    def test_restricted_capture_matches_gitdir_condition_with_symlinked_home(self):
+        root = self.repo.resolve()
+        home = root.parent
+        alias = home / "home-alias"
+        alias.symlink_to(home, target_is_directory=True)
+        (home / ".gitconfig").write_text('[includeIf "gitdir:~/repo/.git"]\npath = conditional-config\n')
+        (home / "conditional-config").write_text(f"[core]\nexcludesFile = {root / 'ignore'}\n")
+        (root / "ignore").write_text("hidden\n")
+        (root / "hidden").write_text("fixture")
+        with patch.dict(os.environ, {"HOME": str(alias), "XDG_CONFIG_HOME": str(home / "xdg"),
+                                     "GIT_CONFIG_NOSYSTEM": "1"}):
+            unrestricted = state.capture(root, [])
+            self.assertNotIn("hidden", unrestricted["files"])
+            self.assertEqual(unrestricted, state.capture(root, [], read_excludes=["private"]))
+
+    def test_restricted_capture_preserves_reftable_head_and_linked_worktree(self):
+        repo = self.root / "table"
+        initialized = subprocess.run(["git", "init", "-q", "--ref-format=reftable", str(repo)], capture_output=True)
+        if initialized.returncode and b"ref-format" in initialized.stderr:
+            self.skipTest("Git does not support reftable")
+        self.assertEqual(0, initialized.returncode, initialized.stderr)
+        self.repo = repo
+        (repo / "tracked").write_text("fixture")
+        (repo / ".git/info").mkdir(exist_ok=True)
+        (repo / ".git/info/exclude").write_text("ignored\n")
+        self.git("add", ".")
+        self.git("-c", "user.name=test", "-c", "user.email=test@example.org", "commit", "-qm", "base")
+        linked = self.root / "linked-table"
+        self.git("worktree", "add", "--detach", str(linked))
+        for worktree in (repo, linked):
+            (worktree / "ignored").write_text("fixture")
+            with self.subTest(worktree=worktree):
+                self.assertEqual(state.capture(worktree, []),
+                                 state.capture(worktree, [], read_excludes=["private"]))
+
+    def test_restricted_capture_denies_symlink_swaps_before_opening(self):
+        root = self.repo.resolve()
+        private = root / "private"
+        private.mkdir()
+        (private / "secret").write_text("never read")
+        allowed_dir = root / "allowed"
+        allowed_dir.mkdir()
+        (allowed_dir / "untracked").write_text("fixture")
+        real_open, real_scan = os.open, os.scandir
+        private_info = private.stat()
+        for path, target in ((root / "source.txt", private / "secret"), (allowed_dir, private),
+                             (root / ".git/index", private / "secret")):
+            switched = []
+            parent = path.parent.stat()
+            original = path.with_name(path.name + ".original")
+
+            def swap(name, flags, *args, dir_fd=None):
+                if name == path.name and dir_fd is not None and os.path.samestat(os.fstat(dir_fd), parent):
+                    if not switched:
+                        path.rename(original)
+                        path.symlink_to(target, target_is_directory=target == private)
+                        switched.append(True)
+                    self.assertTrue(flags & os.O_NOFOLLOW, "capture tried to follow replacement link")
+                return real_open(name, flags, *args, dir_fd=dir_fd)
+
+            def scan(fd):
+                if isinstance(fd, int):
+                    self.assertFalse(os.path.samestat(os.fstat(fd), private_info), "enumerated replacement target")
+                return real_scan(fd)
+
+            with self.subTest(path=path), patch.object(os, "open", side_effect=swap), patch.object(os, "scandir", side_effect=scan):
+                with self.assertRaises(OSError):
+                    state.capture(root, [], read_excludes=["private"])
+                self.assertEqual([True], switched)
+            path.unlink()
+            original.rename(path)
+
+    def test_restricted_capture_does_not_create_git_scratch_in_caller_tmpdir(self):
+        root = self.repo.resolve()
+        protected = root / "private"
+        protected.mkdir()
+        supplied = self.root.resolve() / "caller-scratch"
+        supplied.symlink_to(protected, target_is_directory=True)
+        scratch = tempfile.TemporaryDirectory
+        with patch.dict(os.environ, {"TMPDIR": str(supplied)}), \
+                patch.object(tempfile, "TemporaryDirectory", wraps=scratch) as temporary:
+            state.capture(root, [], read_excludes=["private"])
+        self.assertEqual([Path("/tmp").resolve()] * 2, [call.kwargs["dir"] for call in temporary.call_args_list])
+        self.assertEqual([], list(protected.iterdir()))
 
     def test_guard_blocks_excluded_root_alias_before_metadata_lookup(self):
         root = self.repo.resolve()

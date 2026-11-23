@@ -98,21 +98,19 @@ def describe(contract_path, repo, group, check_id, scope_path, attempt,
     if relative != ".":
         state.relative_path(relative)
     root = Path(value["repo_paths"][repo]).resolve()
-    state.guard_excluded_path(root / relative, root, value.get("read_excludes", {}).get(repo, []))
+    read_excludes = list(workflow.repo_read_excludes(value, repo))
+    state.guard_excluded_path(root / relative, root, read_excludes)
     cwd = (root / relative).resolve(strict=True)
     state.require(cwd.is_dir() and cwd.is_relative_to(root), "cwd escapes repository")
     search_path = os.pathsep.join(str(cwd / p) for p in os.environ.get("PATH", os.defpath).split(os.pathsep))
     if "/" not in argv[0]:
         for directory in search_path.split(os.pathsep):
-            state.guard_excluded_path(Path(os.path.abspath(directory)) / argv[0], root,
-                                      value.get("read_excludes", {}).get(repo, []))
+            state.guard_excluded_path(Path(os.path.abspath(directory)) / argv[0], root, read_excludes)
     else:
-        state.guard_excluded_path(Path(os.path.abspath(cwd / argv[0])), root,
-                                  value.get("read_excludes", {}).get(repo, []))
+        state.guard_excluded_path(Path(os.path.abspath(cwd / argv[0])), root, read_excludes)
     executable = shutil.which(argv[0], path=search_path) if "/" not in argv[0] else str(cwd / argv[0])
     state.require(executable is not None, "Executable unavailable")
-    state.guard_excluded_path(Path(os.path.abspath(executable)), root,
-                              value.get("read_excludes", {}).get(repo, []))
+    state.guard_excluded_path(Path(os.path.abspath(executable)), root, read_excludes)
     # Preserve the invocation path: resolving a venv's Python symlink changes its environment.
     executable = Path(os.path.abspath(executable))
     state.require(executable.is_file() and os.access(executable, os.X_OK), "Executable is not executable")
@@ -124,8 +122,7 @@ def describe(contract_path, repo, group, check_id, scope_path, attempt,
                   "Run artifacts must be outside assigned source repositories")
     output = run / "checks" / repo / attempt
     state.require(output.resolve().is_relative_to(run), "Output escapes run directory")
-    state.guard_excluded_path(Path(scope_path).absolute(), root, value.get("read_excludes", {}).get(repo, []))
-    scope = state.scope_paths(scope_path)
+    scope = workflow.scope_input(Path(scope_path).absolute(), value)
     excludes = sorted({state.relative_path(x) for x in excludes})
     for field, supplied in (("environment", environment), ("data_scope", data_scope)):
         state.require(not check.get(field) or supplied is None or supplied == check[field], "Check metadata mismatch")
@@ -143,7 +140,7 @@ def describe(contract_path, repo, group, check_id, scope_path, attempt,
         "termination_grace_seconds": GRACE, "phase_id": f"check-{repo}-{attempt}",
         "output_dir": str(output), "output_policy": output_policy, "stream_limit_bytes": LIMIT,
         "scope_path": str(Path(scope_path).resolve()), "scope": scope, "excludes": excludes,
-        "read_excludes": value.get("read_excludes", {}).get(repo, []),
+        "read_excludes": read_excludes,
         "environment": environment, "data_scope": data_scope, "verification": check["verification"],
         "environment_policy": "inherited, not recorded; no overrides", "permission_notice": NOTICE,
         "cancellation_limit": "Local process group only; no Docker/remote/daemon cancellation guarantee",
@@ -295,15 +292,18 @@ def run(spec, expected_digest):
               "outcome": "capture-error", "child_returncode": None}
     code, evidence_path = 3, None
     phase_status, end_reason = "blocked", "unknown"
+    policies = workflow.read_policy(value)
     try:
-        before = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"])
+        before = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"],
+                               policies=policies)
         state.write_once(output / "before.json", before)
         actual, streams = execute(spec)
         result.update(actual)
         result["process_outcome"] = actual["outcome"]
         for name, stream in streams.items():
             state.write_once(output / f"{name}.json", stream)
-        after = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"])
+        after = state.capture(value["repo_paths"][repo], spec["scope"], spec["excludes"], spec["read_excludes"],
+                              policies=policies)
         state.write_once(output / "after.json", after)
         result["source_unchanged"] = before == after
         if before != after:

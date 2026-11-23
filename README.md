@@ -3,9 +3,10 @@
 Related ship and fix runs preserve review-fix budgets through stable work-item identifiers and explicit,
 audited continuity. The protocol describes recovery when independent run histories omitted that continuity.
 
-Contracts can declare read exclusions and versioned deliverables. The lifecycle helpers validate submitted
-evidence and compare declared published files with run-local snapshots before review and completion; see
-the [protocol](workflows/ship-fix/PROTOCOL.md) for commands and limitations.
+Contracts can declare read exclusions and versioned deliverables. Source capture applies read exclusions before
+Git emits tracked paths or the untracked walk enters an excluded directory. The lifecycle helpers validate
+submitted evidence and compare published files with run-local snapshots before review and completion.
+See the [protocol](workflows/ship-fix/PROTOCOL.md) for commands and limitations.
 
 A delivery workflow for AI coding agents that makes the agent prove its work before it calls a task done.
 

@@ -388,6 +388,48 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn(replacement, corrected["artifact_hashes"])
         self.assertEqual(0, corrected["review_fix_count"])
 
+    def test_fresh_projects_nested_repo_exclusions_before_git_lists_tracked_files(self):
+        nested = self.repo / "nested"
+        protected = nested / "private"
+        protected.mkdir(parents=True)
+        (protected / "tracked.txt").write_text("fixture")
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        recorded = state.capture(self.repo, [], read_excludes=["nested/private"])
+        source = self.save("nested-excluded-manifest.json", recorded)
+        value = {**self.c, "repo_paths": {**self.c["repo_paths"], "nested": str(nested)},
+                 "read_excludes": {"nested": ["private"]}}
+        run = subprocess.run
+
+        def observe(args, **kwargs):
+            result = run(args, **kwargs)
+            if "ls-files" in args:
+                self.assertNotIn(b"nested/private/tracked.txt", result.stdout)
+            return result
+
+        with patch.object(subprocess, "run", side_effect=observe):
+            self.assertEqual(recorded, workflow.fresh(value, "api", source, []))
+
+    def test_fresh_applies_sibling_policy_to_git_pointers_and_scope_files(self):
+        sibling = self.root / "sibling"
+        private = sibling / "private"
+        private.mkdir(parents=True)
+        (private / "scope.json").write_text("[]")
+        scope = self.run / "scope-alias.json"
+        scope.symlink_to(private / "scope.json")
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        original = self.save("sibling-manifest.json", state.capture(self.repo, []))
+        value = {**self.c, "repo_paths": {**self.c["repo_paths"], "sibling": str(sibling)},
+                 "read_excludes": {"sibling": ["private"]}}
+        self.assertEqual(state.checked_manifest(original), workflow.fresh(value, "api", original, []))
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            workflow.scope_input(scope, value)
+        with patch.dict(os.environ, {"GIT_INDEX_FILE": str(private / "index")}), \
+                patch.object(subprocess, "run", side_effect=AssertionError("Git ran with a forbidden index")):
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                workflow.fresh(value, "api", original, [])
+
     def test_legacy_alias_manifest_can_continue_without_rewriting_review(self):
         if not (self.repo / "SOURCE.TXT").exists():
             self.skipTest("filesystem distinguishes case")

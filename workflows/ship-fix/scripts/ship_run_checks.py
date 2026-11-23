@@ -37,15 +37,13 @@ def run(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, text=True, **kwargs)
 
 
-def capture(repo_path, scope, out, excludes=(), read_excludes=()):
-    argv = [sys.executable, "-I", "-B", str(HELPER), "capture", "--repo", repo_path, "--scope", scope, "--out", str(out)]
-    for path in excludes:
-        argv.extend(["--exclude", path])
-    for path in read_excludes:
-        argv.extend(["--read-exclude", path])
-    done = run(argv)
-    if done.returncode != 0:
-        raise SystemExit("capture failed: " + (done.stdout + done.stderr).strip())
+def capture(state, repo_path, scope, out, excludes, read_excludes, policies):
+    try:
+        destination = state.guard_excluded_paths(out.absolute(), policies, pinned=bool(policies))
+        captured = state.capture(repo_path, scope, excludes, read_excludes, policies=policies)
+        state.write_once(destination, captured, pinned=bool(policies))
+    except (ValueError, OSError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"capture failed: {error}") from error
 
 
 def workflow_module():
@@ -65,10 +63,10 @@ def checks_module():
 def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop_on_fail):
     repo_path = contract["repo_paths"][repo]
     workflow = workflow_module()
-    workflow.state.guard_excluded_path(Path(out_dir).absolute(), repo_path,
-                                       contract.get("read_excludes", {}).get(repo, []))
-    workflow.state.guard_excluded_path(Path(scope).absolute(), repo_path,
-                                       contract.get("read_excludes", {}).get(repo, []))
+    read_excludes = workflow.repo_read_excludes(contract, repo)
+    policies = workflow.read_policy(contract)
+    workflow.state.guard_excluded_paths(Path(out_dir).absolute(), policies)
+    source_scope = workflow.scope_input(Path(scope).absolute(), contract)
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     sanitize = checks_module().sanitize
@@ -76,7 +74,8 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
     effective_scope = out_dir / "capture-scope.json"
     if effective_scope.exists():
         raise SystemExit("capture scope already exists; use a new --out-dir")
-    effective_scope.write_text(json.dumps(sorted(set(json.loads(Path(scope).read_text())) | set(dependencies))))
+    scope_paths = sorted(set(source_scope) | set(dependencies))
+    effective_scope.write_text(json.dumps(scope_paths))
     checks = [c for c in contract[group][repo] if "argv" in c and (not wanted or c["id"] in wanted)]
     if wanted and {c["id"] for c in checks} != wanted:
         raise SystemExit("Unknown or non-argv check id requested")
@@ -88,14 +87,14 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
             raise SystemExit(f"{cid}: output already exists in {out_dir}; use a new --out-dir (write-once)")
         before, after = out_dir / f"{cid}-before.json", out_dir / f"{cid}-after.json"
         log = out_dir / f"{cid}.log"
-        capture(repo_path, str(effective_scope), before, exclusions, contract.get("read_excludes", {}).get(repo, []))
+        capture(workflow.state, repo_path, scope_paths, before, exclusions, read_excludes, policies)
         inputs = workflow.snapshot_inputs(check.get("input_paths", []), out_dir / f"{cid}-inputs",
-                                          repo_path, contract.get("read_excludes", {}).get(repo, []))
+                                          repo_path, read_excludes)
         done = run(check["argv"], cwd=repo_path)
         workflow.check_inputs_unchanged(inputs)
         log.write_text(sanitize((done.stdout + "\n--- stderr ---\n" + done.stderr).encode()))
         marker.write_text(f"{done.returncode}\n")
-        capture(repo_path, str(effective_scope), after, exclusions, contract.get("read_excludes", {}).get(repo, []))
+        capture(workflow.state, repo_path, scope_paths, after, exclusions, read_excludes, policies)
         status = "passed" if done.returncode == 0 else "failed"
         execution = out_dir / f"{cid}-execution.json"
         workflow.state.write_once(execution, {"producer": "orchestrator", "command": shlex.join(check["argv"]),

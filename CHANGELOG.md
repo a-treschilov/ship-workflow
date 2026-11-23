@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.4.2 - 2026-11-23
+
+### Bug Fixes
+
+- Enforce read exclusions before Git lists tracked source paths, including case and Unicode aliases. Guard
+  metadata and ignore rules during restricted captures so Git cannot follow pointers into excluded trees.
+- Preserve restricted source capture for system and conditional Git ignore configuration, reftable refs
+  and sparse indexes. Block symlink swaps while opening worktree paths or Git metadata.
+
 ## v1.4.1 - 2026-11-23
 
 ### Bug Fixes

@@ -645,18 +645,42 @@ is validated against the effective amended scope and retains the amendment hash 
 preserved; new or modified changes outside the assigned scope remain violations.
 
 Contracts may declare `read_excludes` as a repo-to-relative-path-list map. Captures must pass every path
-as `--read-exclude`; helpers use the contract automatically. Captures prune excluded paths before untracked
-directory traversal and omit tracked and untracked excluded file contents. A touched or dependency scope
-intersecting an exclusion is refused. Historical audits apply the exclusions of the audited contract and its
-callers to nested predecessors and artifact reads. Scope amendments check the frozen slice write scopes and
-the added paths for exclusion overlap, including symlink targets. With read exclusions active, the tracked-path
-check uses literal Git pathspecs against a temporary copy of guarded Git index metadata. Index layouts that
-require the live object database for the query fail validation. Do not dispatch arbitrary commands that would
-read a forbidden path. `ship_checks.py` binds these exclusions in its execution specification and applies
-them to both captures. An uninitialized scope-check refuses read exclusions rather than running an unrestricted
-Git status scan. Existing `excludes` retains its untracked-file meaning.
-An exclusion also applies to potential alternate spellings unless distinct entries can be established from
-their allowed parent directory.
+as `--read-exclude`. Helpers use the contract automatically. Capture prunes the untracked walk at each
+excluded boundary. It applies exclusion pathspecs to a private copy of the guarded Git index before Git
+emits any tracked paths. An exclusion covers potential case and Unicode aliases unless distinct entries
+can be established from their allowed parent directory. The capture hashes only allowed source files.
+A touched or dependency scope intersecting an exclusion is refused, including overlap via a symlink target.
+Discovered symlinks are recorded by link text and their targets are never followed during the source walk.
+
+Restricted capture resolves Git directory, common directory, index and ref pointers under the read policy.
+Git receives a private worktree and sanitized environment. The helper supplies guarded files or reftable
+HEAD metadata and applicable worktree, repository, user and system ignore rules. It resolves conditional
+config includes before opening their targets. Git itself never loads the live configuration. For a custom Git
+build whose default system config path cannot be identified, supply a guarded `GIT_CONFIG_SYSTEM` or use
+`GIT_CONFIG_NOSYSTEM=1`. Index and system-config paths from the environment are guarded. Other Git environment
+overrides are stripped, and `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` are refused.
+
+Capture expands a sparse index by reading local tree objects for allowed directories. The guarded object
+lookup uses only the requested loose trees or pinned pack descriptors, with no network fetch. A parent tree's
+metadata identifies the boundary entry. Capture skips excluded child trees before requesting their objects.
+Contract-bound captures project read exclusions from nested repositories into the parent repository and apply
+the full contract policy to scope artifacts and metadata pointers. Git runs in a private directory under the
+system temporary root, independent of `TMPDIR`.
+
+The worktree walk and restricted metadata reads open path components through directory descriptors with
+symlink following disabled, so replacing a checked path with a symlink cannot redirect the read. Capture
+checks drift by comparing two snapshots. Read exclusions bind paths and their supported filesystem spellings.
+Use an operating-system sandbox for inode-based restrictions against hard links, mounts or moving protected
+objects into an allowed name.
+
+Historical audits apply the exclusions of the audited contract and its callers to nested predecessors and
+artifact reads. Scope amendments check the frozen slice write scopes and the added paths for exclusion overlap,
+including symlink targets. Under a read policy, the amendment's tracked-path check uses literal Git pathspecs
+against a temporary copy of guarded index metadata. Index layouts that require the live object database for the
+query fail validation. Manifest format and historical seals are unchanged. `ship_checks.py` binds read
+exclusions in its execution specification and applies them to both captures. An uninitialized scope-check
+refuses read exclusions rather than running an unrestricted Git status scan. Existing `excludes` retains its
+untracked-file meaning. Do not dispatch arbitrary commands that would read a forbidden path.
 
 First-touch baseline lookup accepts another spelling of a source path when the filesystem identifies both
 spellings as the same directory entry and the existing marker and backup remain valid. An unrecorded backup

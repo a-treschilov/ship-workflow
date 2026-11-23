@@ -135,6 +135,21 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("other.txt", result.stdout)
 
+    def test_scope_check_rejects_excluded_gitdir_symlink_before_probe(self):
+        root = self.repo.resolve()
+        private = root / "private"
+        (root / ".git").rename(private)
+        (root / ".git").symlink_to("private", target_is_directory=True)
+        lstat = Path.lstat
+
+        def guarded(path):
+            self.assertFalse(path.is_relative_to(private), "scope-check probed excluded Git metadata")
+            return lstat(path)
+
+        with patch.object(Path, "lstat", guarded):
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                artifacts.scope_check({"repo_path": str(root), "read_excludes": ["private"]})
+
     def test_capture_read_exclusion_skips_tracked_and_untracked(self):
         (self.repo / "secret").mkdir()
         (self.repo / "secret/private.txt").write_text("private")
@@ -151,8 +166,9 @@ class ArtifactTests(unittest.TestCase):
         scan = os.scandir
 
         def guarded(path):
-            self.assertFalse(Path(path) == secret or secret in Path(path).parents,
-                             "capture traversed excluded directory")
+            if not isinstance(path, int):
+                self.assertFalse(Path(path) == secret or secret in Path(path).parents,
+                                 "capture traversed excluded directory")
             return scan(path)
 
         with patch.object(artifacts.state.os, "scandir", side_effect=guarded):

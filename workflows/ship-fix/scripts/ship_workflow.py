@@ -89,6 +89,18 @@ def absolute_file(path, value=None):
     return path
 
 
+def scope_input(path, value, *, optional=False):
+    require(isinstance(path, (str, Path)) and Path(path).is_absolute(), f"Missing absolute file: {path}")
+    policies = read_policy(value)
+    source = state.guard_excluded_paths(Path(path), policies, pinned=bool(policies))
+    try:
+        return state.scope_paths(source, pinned=bool(policies))
+    except FileNotFoundError as error:
+        if optional:
+            return []
+        raise ValueError(f"Missing absolute file: {path}") from error
+
+
 def repo_read_excludes(value, repo):
     policies = read_policy(value)
     if not policies:
@@ -159,8 +171,10 @@ def scope_amendment(contract_path, value, repo, path, events, initial):
         state.relative_path(name)
         require(not any(char in name for char in "*?[]"), "Scope amendment paths cannot be patterns")
         guard_path(root / name, value, scope=True)
-    tracked = state.scoped_tracked_paths(root, additions, names.read_excludes,
-                                       guard=baseline_guard if read_policy(value) else None)
+    policies = read_policy(value)
+    tracked = state.scoped_tracked_paths(
+        root, additions, names.read_excludes,
+        guard=(lambda path: state.guard_excluded_paths(path, policies, pinned=True)) if policies else None)
     require(len(names.keys(additions)) == len(additions), "Scope amendment needs unique source entries")
     before_files, initial_files = names.files(before["files"]), names.files(initial["files"])
     already_scoped = names.keys(anchor.get("scope", []) + anchor.get("source_scope", []))
@@ -482,8 +496,9 @@ def manifest(value, repo, path):
 
 def fresh(value, repo, path, scope, excludes=()):
     recorded = manifest(value, repo, path)
-    read_excludes = value.get("read_excludes", {}).get(repo, [])
-    state.match_source(recorded, state.capture(value["repo_paths"][repo], scope, excludes, read_excludes), read_excludes)
+    read_excludes = repo_read_excludes(value, repo)
+    state.match_source(recorded, state.capture(value["repo_paths"][repo], scope, excludes, read_excludes,
+                                             policies=read_policy(value)), read_excludes)
     return recorded
 
 
@@ -2054,11 +2069,11 @@ def transition(contract_path, repo, request_path, out):
     expected_out = directory / f"state-{len(events) + 1}.json"
     require(Path(out).resolve() == expected_out.resolve(), "Transition output must be next immutable state")
     scope_path = request.get("scope_path", previous.get("scope_path"))
-    scope = state.scope_paths(absolute_file(scope_path))
+    scope = scope_input(scope_path, value)
     source_path = request.get("source_manifest")
     exclusions = previous.get("excludes", request.get("excludes", []))
     dependency_scope_path = request.get("source_scope_path", previous.get("source_scope_path", scope_path))
-    dependency_scope = state.scope_paths(absolute_file(dependency_scope_path))
+    dependency_scope = scope_input(dependency_scope_path, value)
     require(set(previous.get("scope", [])) <= set(scope), "Touched scope must not shrink")
     final = fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
     if sliced and before == "needs-fix" and status in {"reviewed", "capped"}:
@@ -3653,7 +3668,7 @@ def review_budget_status(contract_path, repo, slice_id=None):
     scope = (sorted(set(latest.get("scope", [])) | set(latest.get("source_scope", [])))
              if slice_id is None else latest.get("touched", []))
     current = state.capture(value["repo_paths"][repo], scope, latest.get("excludes", []),
-                            value.get("read_excludes", {}).get(repo, []))
+                            repo_read_excludes(value, repo), policies=read_policy(value))
     recorded = manifest(value, repo, latest["source_manifest"])
     changed = sorted(source_names(value, repo).changed(recorded, current, missing=state.MISSING))
     source_matches = not changed and recorded["head"] == current["head"]
@@ -3790,19 +3805,21 @@ def complete(contract_path, out):
 def packet(contract_path, repo, scope_path, baseline_dir, out):
     value = contract(contract_path)
     require(repo in value["repos"], "Unknown packet repo")
-    scope = state.scope_paths(scope_path)
+    scope = scope_input(Path(scope_path).absolute(), value)
     directory = Path(out)
-    require(directory.is_absolute() and directory.resolve().is_relative_to(Path(contract_path).parent.resolve()),
+    require(directory.is_absolute() and guard_path(directory, value).resolve().is_relative_to(Path(contract_path).parent.resolve()),
             "Review packet must remain in run directory")
     require(not directory.exists(), "Review packet directory already exists")
     events = history(Path(contract_path).parent / repo)
     previous_state = events[-1][2] if events else {}
     source_scope = sorted(set(scope) | set(previous_state.get("source_scope", [])))
     excludes = previous_state.get("excludes", [])
-    current = state.capture(value["repo_paths"][repo], source_scope, excludes, value.get("read_excludes", {}).get(repo, []))
+    read_excludes = repo_read_excludes(value, repo)
+    current = state.capture(value["repo_paths"][repo], source_scope, excludes, read_excludes,
+                            policies=read_policy(value))
     changes = state.delta(value["repo_paths"][repo], baseline_dir, scope)
-    state.match(current, state.capture(value["repo_paths"][repo], source_scope, excludes,
-                                       value.get("read_excludes", {}).get(repo, [])))
+    state.match(current, state.capture(value["repo_paths"][repo], source_scope, excludes, read_excludes,
+                                       policies=read_policy(value)))
     reviews = [e[2] for e in events if e[2]["status"] in {"needs-fix", "reviewed"}
                and not e[2].get("budget_grant_applied")]
     previous = manifest(value, repo, reviews[-1]["source_manifest"]) if reviews else None
