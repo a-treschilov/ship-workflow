@@ -271,6 +271,38 @@ class WorkflowStateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "read_excludes"):
             state.guard_excluded_path(self.repo / "PRIVATE/tracked", self.repo, ["Private"])
 
+    def test_guard_blocks_excluded_root_alias_before_metadata_lookup(self):
+        root = self.repo.resolve()
+        protected = root / "private"
+        protected.mkdir()
+        private_alias = self.root / "a"
+        private_alias.symlink_to(protected)
+        repo_alias = self.root / "z"
+        repo_alias.symlink_to(root)
+        lstat = Path.lstat
+
+        def guarded(path):
+            self.assertFalse(path.is_relative_to(protected), "probed protected repository root")
+            return lstat(path)
+
+        with patch.object(Path, "lstat", guarded):
+            for policies in (((private_alias, ("unused",)), (repo_alias, ("private",))),
+                             ((protected, ("unused",)), (repo_alias, ("private",)))):
+                with self.subTest(policies=policies), self.assertRaisesRegex(ValueError, "read_excludes"):
+                    state.guard_excluded_paths(self.source, policies)
+
+    def test_isolated_git_queries_entries_in_a_sparse_index(self):
+        for directory in ("retained", "other"):
+            (self.repo / directory).mkdir()
+            (self.repo / directory / "tracked").write_text("fixture")
+        self.git("add", ".")
+        self.git("-c", "user.name=test", "-c", "user.email=test@example.org", "commit", "-qm", "base")
+        self.git("sparse-checkout", "set", "--sparse-index", "retained")
+        exclusions = ("other",)
+        index_paths = state.scoped_tracked_paths(self.repo, ["retained/tracked"], exclusions,
+                                               guard=lambda p: state.guard_excluded_path(p, self.repo, exclusions))
+        self.assertEqual({"retained/tracked"}, index_paths)
+
     def test_manifest_alias_comparison_rejects_conflicting_or_stale_states(self):
         if not (self.repo / "SOURCE.TXT").exists():
             self.skipTest("filesystem distinguishes case")

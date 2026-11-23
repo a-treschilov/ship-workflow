@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -107,7 +108,7 @@ def validate_run(contract_path, attempt_id, workflow):
         require(isinstance(schedules, dict) and set(schedules) <= set(value["repos"]), "Invalid slice schedules")
         for repo, declaration in schedules.items():
             require(isinstance(declaration, dict), "Invalid slice schedule declaration")
-            workflow.slice_schedule(contract_path, repo, declaration.get("path"))
+            workflow.checked_slice_schedule(value, repo, declaration.get("path"))
     except Exception as error:
         end = {**start, "event": "phase-end", "at": datetime.now(timezone.utc).isoformat(),
                "status": "failed", "end_reason": "unknown", "error": str(error),
@@ -128,8 +129,9 @@ def relative_path(value):
     return value
 
 
-def safe_path(root, value):
+def safe_path(root, value, *, guard=Path):
     path = Path(root) / relative_path(value)
+    guard(path)
     # A final symlink is source data; a symlinked parent would escape the scoped tree.
     for parent in path.parents:
         if parent == Path(root):
@@ -141,11 +143,56 @@ def safe_path(root, value):
 
 
 def guard_excluded_path(path, root, read_excludes):
+    return guard_excluded_paths(path, ((Path(root).absolute(), read_excludes),) if read_excludes else ())
+
+
+def guard_excluded_paths(path, policies, *, scope=False):
     """Resolve symlinks one component at a time without probing an excluded path."""
-    if not read_excludes:
+    if not policies:
         return Path(path)
-    root = Path(root).resolve()
-    names = PathNames(root)
+    pending = [PathNames(root, exclusions) for root, exclusions in policies]
+    names = list(pending)
+    while pending:
+        unresolved = []
+        for table in pending:
+            # Another declared root may be an alias. Defer any candidate that might enter its
+            # exclusions until that root can be resolved without crossing a protected path.
+            unknown = [entry for entry in pending if entry is not table]
+            root = resolve_guarded(table.root, names, unknown)
+            if root is None:
+                unresolved.append(table)
+            elif root != table.root:
+                names.append(PathNames(root, table.read_excludes))
+        require(len(unresolved) < len(pending), "Cannot resolve repository roots without crossing read_excludes")
+        pending = unresolved
+    return resolve_guarded(path, names, scope=scope)
+
+
+def same_path_prefix(path, other):
+    length = min(len(path.parts), len(other.parts))
+    prefix, other_prefix = path.parts[:length], other.parts[:length]
+    if prefix == other_prefix:
+        return True
+    actual, expected = Path(*prefix), Path(*other_prefix)
+    if spelling_key(str(actual)) != spelling_key(str(expected)):
+        return False
+    root_names = PathNames(expected.anchor, (expected.relative_to(expected.anchor).as_posix(),))
+    return root_names.excluded(actual.relative_to(expected.anchor).as_posix())
+
+
+def check_path_exclusions(path, names, *, scope=False):
+    for table in names:
+        if not same_path_prefix(path, table.root):
+            continue
+        relative = "/".join(path.parts[len(table.root.parts):])
+        if relative:
+            excluded = table.excluded(relative, include_ancestors=scope)
+        else:
+            excluded = scope
+        require(not excluded, "Path intersects read_excludes")
+
+
+def resolve_guarded(path, names, unknown_roots=(), *, scope=False):
     path = Path(path)
     require(path.is_absolute(), "Expected an absolute path")
     pending = list(path.parts[1:])
@@ -159,18 +206,10 @@ def guard_excluded_path(path, root, read_excludes):
             current = current.parent
             continue
         current = current / part
-        try:
-            relative = current.relative_to(root).as_posix()
-        except ValueError:
-            relative = None
-            if len(current.parts) == len(root.parts) and spelling_key(str(current)) == spelling_key(str(root)):
-                try:
-                    if os.path.samestat(current.lstat(), root.lstat()):
-                        current = root
-                except FileNotFoundError:
-                    pass
-        require(relative is None or not names.intersects(relative, read_excludes),
-                "Path intersects read_excludes")
+        check_path_exclusions(current, names, scope=scope and not pending)
+        if any(spelling_key(current.as_posix()).endswith("/" + spelling_key(exclusion))
+               for table in unknown_roots for exclusion in table.read_excludes):
+            return None
         try:
             info = current.lstat()
         except FileNotFoundError:
@@ -181,6 +220,8 @@ def guard_excluded_path(path, root, read_excludes):
             target = Path(os.readlink(current))
             current = Path(target.anchor) if target.is_absolute() else current.parent
             pending = list(target.parts[1:] if target.is_absolute() else target.parts) + pending
+    if scope:
+        check_path_exclusions(current, names, scope=True)
     return current
 
 
@@ -215,10 +256,10 @@ def capture_once(root, scope, excludes, read_excludes=()):
     is_git = (root / ".git").exists()
     explicit = {relative_path(p) for p in scope}
     forbidden = [relative_path(p) for p in read_excludes]
-    names = PathNames(root)
+    names = PathNames(root, forbidden)
 
     def forbidden_path(path):
-        return names.intersects(path, forbidden, include_ancestors=True)
+        return names.excluded(path, include_ancestors=True)
 
     require(not any(forbidden_path(p) for p in explicit), "Source scope intersects read_excludes")
     tracked, others, head = set(), set(), None
@@ -231,7 +272,7 @@ def capture_once(root, scope, excludes, read_excludes=()):
                     for entry in entries:
                         name = prefix + entry.name
                         if (spelling_key(entry.name) == ".git" and entry.name == names.entry(directory, ".git")
-                                or names.intersects(name, forbidden)):
+                                or names.excluded(name)):
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             walk(Path(entry.path), name + "/")
@@ -318,6 +359,72 @@ def git_paths(root, *args):
     return {os.fsdecode(path) for path in git(root, "ls-files", "-z", *args).split(b"\0") if path}
 
 
+def scoped_tracked_paths(root, paths, exclusions, *, guard=None):
+    """Look up exact index entries, isolating Git from live metadata when reads are restricted."""
+    includes = [f":(top,literal){name}" for name in paths]
+    pathspecs = ["--", *includes, *[f":(top,exclude,literal){name}" for name in exclusions]]
+    if guard is None:
+        require((root / ".git").exists(), "Scope amendment requires a git repository")
+        return git_paths(root, "--cached", *pathspecs)
+
+    git_dir = guard(root / ".git")
+    if git_dir.is_file():
+        pointer = git_dir.read_text().strip()
+        require(pointer.startswith("gitdir: "), "Invalid Git directory pointer")
+        git_dir = guard(git_dir.parent / pointer.removeprefix("gitdir: "))
+    require(git_dir.is_dir(), "Scope amendment requires a git repository")
+    index = guard(root / os.environ["GIT_INDEX_FILE"] if "GIT_INDEX_FILE" in os.environ else git_dir / "index")
+    require(index.is_file(), "Scope amendment needs a Git index")
+    common_pointer = guard(git_dir / "commondir")
+    common = guard(git_dir / common_pointer.read_text().strip()) if common_pointer.is_file() else git_dir
+    config = guard(common / "config")
+    return isolated_index_paths(git_dir, index, config, pathspecs, includes, guard)
+
+
+def isolated_index_paths(git_dir, index, config, pathspecs, includes, guard):
+    # Never expose the live config, object database, worktree or Git environment to ls-files.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_OPTIONAL_LOCKS="0")
+    scratch_parent = guard(Path(os.environ.get("TMPDIR") or "/tmp").absolute())
+    with tempfile.TemporaryDirectory(prefix="ship-index-", dir=scratch_parent) as temporary:
+        scratch = Path(temporary)
+        if config.is_file():
+            result = subprocess.run(["git", "config", "--file", str(config), "--no-includes",
+                                     "--get", "extensions.objectformat"], cwd=scratch, env=env, capture_output=True)
+            require(result.returncode in (0, 1), "Cannot read Git index object format")
+            algorithm = result.stdout.strip()
+        else:
+            algorithm = b""
+        require(algorithm in {b"", b"sha1", b"sha256"}, "Unsupported Git index object format")
+        (scratch / "objects").mkdir()
+        (scratch / "refs").mkdir()
+        (scratch / "HEAD").write_text("ref: refs/heads/unused\n")
+        if algorithm == b"sha256":
+            (scratch / "config").write_text("[core]\nrepositoryformatversion = 1\n"
+                                            "[extensions]\nobjectformat = sha256\n")
+        shutil.copyfile(index, scratch / "index")
+        for shared in git_dir.glob("sharedindex.*"):
+            if re.fullmatch(r"sharedindex\.(?:[0-9a-f]{40}|[0-9a-f]{64})", shared.name):
+                shared = guard(shared)
+                require(shared.is_file(), "Invalid Git shared index")
+                shutil.copyfile(shared, scratch / shared.name)
+        command = ["git", "--git-dir", str(scratch), "ls-files", "-z", "--cached"]
+        result = subprocess.run([*command, *pathspecs], cwd=scratch, env=env, capture_output=True)
+        if result.stderr:
+            # Sparse indexes can report their materialized entries without loading tree objects.
+            (scratch / "info").mkdir()
+            (scratch / "info/sparse-checkout").write_text("/*\n!/*/\n")
+            command = ["git", "--git-dir", str(scratch), "-c", "core.sparseCheckout=true",
+                       "-c", "core.sparseCheckoutCone=true", "-c", "index.sparse=true",
+                       "ls-files", "-z", "--cached", "--sparse"]
+            # Git's sparse matcher can drop allowed paths when an exclusion names a collapsed entry.
+            # The caller already checked each literal against the policy before opening the index.
+            result = subprocess.run([*command, "--", *includes], cwd=scratch, env=env, capture_output=True)
+        require(result.returncode == 0 and not result.stderr,
+                "Cannot verify scope amendment with the isolated Git index")
+        return {os.fsdecode(path) for path in result.stdout.split(b"\0") if path}
+
+
 def spelling_key(name):
     return unicodedata.normalize("NFD", name).casefold()
 
@@ -332,14 +439,17 @@ class PathNames:
         self.keys_by_path = {}
         self.symlink_ancestors = set()
 
-    def entry(self, directory, name):
+    def directory_entries(self, directory):
         if directory not in self.directories:
             by_spelling = {}
             if not directory.is_symlink() and directory.is_dir():
                 for actual in os.listdir(directory):
                     by_spelling.setdefault(spelling_key(actual), set()).add(actual)
             self.directories[directory] = by_spelling
-        candidates = self.directories[directory].get(spelling_key(name), ())
+        return self.directories[directory]
+
+    def entry(self, directory, name):
+        candidates = self.directory_entries(directory).get(spelling_key(name), ())
         if name in candidates or not candidates:
             return name
         try:
@@ -353,6 +463,7 @@ class PathNames:
     def key(self, path):
         if path not in self.keys_by_path:
             path = relative_path(path)
+            require(not self.excluded(path), "Path intersects read_excludes")
             parent, _, name = path.rpartition("/")
             directory = self.root / self.key(parent) if parent else self.root
             # Resolve only entries in real directories. A symlink is distinct source data.
@@ -397,12 +508,36 @@ class PathNames:
     def files(self, files):
         result = {}
         for path, recorded in files.items():
-            require(not self.intersects(path, self.read_excludes, include_ancestors=True),
+            require(not self.excluded(path, include_ancestors=True),
                     "Manifest path intersects read_excludes")
             key = self.key(path)
             require(key not in result or result[key] == recorded, f"Conflicting manifest entries for {key}")
             result[key] = recorded
         return result
+
+    def excluded(self, path, *, include_ancestors=False):
+        """Check read exclusions without probing possible aliases of a protected entry."""
+        parts = path.split("/")
+        for exclusion in sorted(self.read_excludes, key=lambda name: name.count("/")):
+            excluded = exclusion.split("/")
+            if len(parts) < len(excluded) and not include_ancestors:
+                continue
+            prefix = list(zip(parts, excluded))
+            if any(spelling_key(part) != spelling_key(expected) for part, expected in prefix):
+                continue
+            directory = self.root
+            for part, expected in prefix:
+                if part != expected:
+                    entries = self.directory_entries(directory).get(spelling_key(part), ())
+                    if part in entries and expected in entries:
+                        break
+                    # An absent spelling could be an alias. Do not stat it to find out.
+                    if part not in entries:
+                        part = expected
+                directory /= part
+            else:
+                return True
+        return False
 
     def changed(self, before, after, *, missing=None):
         left, right = self.files(before["files"]), self.files(after["files"])
@@ -423,29 +558,34 @@ def match_source(left, right, read_excludes=()):
     require(same_source(left, right, read_excludes), "Stale certification: source states differ")
 
 
-def baseline_record(root, directory, path):
-    markers = directory / ".ship-state"
+def baseline_record(root, directory, path, *, guard=Path):
+    markers = guard(directory / ".ship-state")
     require(not markers.is_symlink(), "Symlinked baseline marker directory")
-    marker = markers / (digest(path) + ".json")
+    marker = guard(markers / (digest(path) + ".json"))
     exact = None
     if os.path.lexists(marker):
         require(not marker.is_symlink() and marker.is_file(), "Invalid baseline marker")
         exact = load(marker)
         require(exact.get("path") == path, "Baseline marker does not match path")
     names = PathNames(root)
+    guard(root / path)
     entry = names.key(path)
-    if not os.path.lexists(safe_path(root, path)):
+    if not os.path.lexists(safe_path(root, path, guard=guard)):
         return exact
     matches = [exact] if exact is not None else []
     for candidate in markers.glob("*.json") if markers.is_dir() else ():
         if candidate == marker:
             continue
+        guard(candidate)
         require(not candidate.is_symlink() and candidate.is_file(), "Invalid baseline marker")
         record = load(candidate)
         name = relative_path(record.get("path"))
         require(candidate.name == digest(name) + ".json", "Baseline marker does not match path")
-        if spelling_key(name) == spelling_key(path) and names.key(name) == entry:
-            require(file_state(safe_path(directory, name)) == record["state"], "Baseline was modified")
+        if spelling_key(name) != spelling_key(path):
+            continue
+        guard(root / name)
+        if names.key(name) == entry:
+            require(file_state(safe_path(directory, name, guard=guard)) == record["state"], "Baseline was modified")
             matches.append(record)
     require(len(matches) <= 1, "Conflicting baseline markers for source path")
     return matches[0] if matches else None
@@ -561,7 +701,7 @@ def applied(value, review):
             "Each finding must occur exactly once in applied/failed/skipped")
 
 
-def evidence(value, final, read_excludes=(), *, historical=False):
+def evidence(value, final, read_excludes=(), *, historical=False, guard=Path):
     require(isinstance(value, dict), "Evidence must be an object")
     for field in ("criterion_id", "environment", "data_scope"):
         text(value.get(field), field)
@@ -584,9 +724,10 @@ def evidence(value, final, read_excludes=(), *, historical=False):
     artifacts = value.get("artifact_paths")
     require(isinstance(artifacts, list) and bool(artifacts), "Missing evidence artifacts")
     for path in artifacts:
-        require(Path(path).is_absolute() and (historical or Path(path).is_file()), f"Missing absolute artifact: {path}")
-    after = checked_manifest(value["after_manifest"])
-    match(checked_manifest(value["before_manifest"]), after)
+        require(Path(path).is_absolute() and (historical or guard(path).is_file()),
+                f"Missing absolute artifact: {path}")
+    after = checked_manifest(guard(value["after_manifest"]))
+    match(checked_manifest(guard(value["before_manifest"])), after)
     match_source(after, final, read_excludes)
 
 

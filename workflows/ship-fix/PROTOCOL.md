@@ -368,7 +368,10 @@ Before writing a repo successor contract, run `validate-history` for each predec
 path and SHA-256 and its `history_sha256`. Set `source_history_sha256` for a single predecessor or
 `history_sha256` on each entry in `recovery_sources`, including in the recovery decision. This applies even
 when the predecessor used zero gate-fix attempts. Stop using a predecessor's lifecycle once its state is
-selected for continuation. The helper checks each predecessor is still at its cited latest state.
+selected for continuation. The helper checks each predecessor is still at its cited latest state. Historical
+validation follows the predecessor links and checks any scope amendment against its sealed schedule. It
+continues to work after successor contracts appear. Active contract validation checks for missing related runs
+against the full audited predecessor lineage.
 
 The history hash is SHA-256 over canonical JSON with keys `contract_sha256`, `states` (ordered
 `[filename, SHA-256]` pairs) and `sources` (sorted `[canonical absolute contract path, history_sha256]`
@@ -644,11 +647,16 @@ preserved; new or modified changes outside the assigned scope remain violations.
 Contracts may declare `read_excludes` as a repo-to-relative-path-list map. Captures must pass every path
 as `--read-exclude`; helpers use the contract automatically. Captures prune excluded paths before untracked
 directory traversal and omit tracked and untracked excluded file contents. A touched or dependency scope
-intersecting an exclusion is refused. This controls helper capture, not arbitrary shell commands or external programs: do not dispatch a command that
-would read a forbidden path. `ship_checks.py` binds these exclusions in its execution specification and applies
+intersecting an exclusion is refused. Historical audits apply the exclusions of the audited contract and its
+callers to nested predecessors and artifact reads. Scope amendments check the frozen slice write scopes and
+the added paths for exclusion overlap, including symlink targets. With read exclusions active, the tracked-path
+check uses literal Git pathspecs against a temporary copy of guarded Git index metadata. Index layouts that
+require the live object database for the query fail validation. Do not dispatch arbitrary commands that would
+read a forbidden path. `ship_checks.py` binds these exclusions in its execution specification and applies
 them to both captures. An uninitialized scope-check refuses read exclusions rather than running an unrestricted
 Git status scan. Existing `excludes` retains its untracked-file meaning.
-An exclusion also applies to confirmed alternate spellings of the excluded entry.
+An exclusion also applies to potential alternate spellings unless distinct entries can be established from
+their allowed parent directory.
 
 First-touch baseline lookup accepts another spelling of a source path when the filesystem identifies both
 spellings as the same directory entry and the existing marker and backup remain valid. An unrecorded backup

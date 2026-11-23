@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.4.1 - 2026-11-23
+
+### Bug Fixes
+
+- Validate predecessor histories with approved scope amendments after a successor is created.
+- Enforce read exclusions during historical scope amendment and budget continuity validation, including nested
+  artifact reads, symlink resolution, and Git index lookup.
+
 ## v1.4.0 - 2026-11-23
 
 ### Bug Fixes
