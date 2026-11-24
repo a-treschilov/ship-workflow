@@ -124,6 +124,62 @@ class CheckTests(unittest.TestCase):
         self.persist()
         return path
 
+    def test_unknown_check_does_not_mark_work_started(self):
+        with self.assertRaisesRegex(SystemExit, "Unknown or non-argv"):
+            runner.run_group(str(self.path), self.contract, "api", self.scope, self.run_dir / "unknown",
+                             "required_gates", {"missing"}, False)
+        self.assertFalse((self.run_dir / "activity-started.json").exists())
+
+    def test_runner_refuses_output_inside_another_run(self):
+        other = self.root / "plans/.fix-runs/other"
+        other.mkdir(parents=True)
+        (other / "setup-replacement.json").write_text("{}")
+        with self.assertRaisesRegex(SystemExit, "different run"):
+            runner.run_group(str(self.path), self.contract, "api", self.scope, other / "injected",
+                             "preflight_checks", set(), False)
+        self.assertFalse((other / "injected").exists())
+
+    def test_runner_refuses_output_directory_swapped_to_another_run(self):
+        other = self.root / "plans/.fix-runs/other"
+        other.mkdir(parents=True)
+        (other / "setup-replacement.json").write_text("{}")
+        output = self.run_dir / "safe"
+        output.mkdir()
+        original_mark = workflow.mark_work_started
+
+        def swap(contract_path, repo):
+            original_mark(contract_path, repo)
+            output.rename(self.run_dir / "moved")
+            output.symlink_to(other, target_is_directory=True)
+
+        with mock.patch.object(runner, "workflow_module", return_value=workflow), \
+             mock.patch.object(workflow, "mark_work_started", side_effect=swap):
+            with self.assertRaises((ValueError, OSError)):
+                runner.run_group(str(self.path), self.contract, "api", self.scope, output,
+                                 "required_gates", set(), False)
+        self.assertFalse((other / "capture-scope.json").exists())
+
+    def test_evidence_reader_refuses_swapped_excluded_output(self):
+        private = self.repo / "private"
+        private.mkdir()
+        (private / "gate.tests-input.json").write_text("{")
+        self.contract["read_excludes"] = {"api": ["private"]}
+        self.persist()
+        output = self.run_dir / "group"
+        original_run = runner.run
+
+        def swap(argv, **kwargs):
+            if "record-evidence" in argv:
+                output.rename(self.run_dir / "moved")
+                output.symlink_to(private, target_is_directory=True)
+            return original_run(argv, **kwargs)
+
+        with mock.patch.object(runner, "run", side_effect=swap):
+            with self.assertRaisesRegex(SystemExit, "read_excludes"):
+                runner.run_group(str(self.path), self.contract, "api", self.scope, output,
+                                 "required_gates", set(), False)
+        self.assertFalse((private / "gate.tests-record.json").exists())
+
     def test_external_input_evidence_is_sealed_by_both_orchestrator_runners(self):
         path = self.declare_external_check(lambda file: f"assert open({str(file)!r}, 'rb').read() == b'declared bytes'")
         spec, (code, result) = self.run_check()

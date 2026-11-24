@@ -118,6 +118,9 @@ completion certificates show inherited and local usage, their sum and the remain
 
 New runs are created with the workflow's `init-run` helper; `validate-run` records setup success or failure
 before preflight. An interrupted setup can remain open, and a failed setup does not count as a passed check.
+When a frozen setup-only contract needs replacement, `replace-setup` preserves its artifacts and binds a new
+contract to it. The successor carries the audited budgets of all related lifecycle histories. See the
+[replacement procedure](workflows/ship-fix/PROTOCOL.md#replacing-a-setup-only-run).
 
 ### Configure review criteria
 

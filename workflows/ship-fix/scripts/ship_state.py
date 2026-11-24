@@ -5,6 +5,7 @@ import argparse
 import codecs
 from contextlib import contextmanager, ExitStack
 import difflib
+import fcntl
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -38,6 +39,37 @@ def load(path):
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=True).encode()).hexdigest()
+
+
+def contract_read_policy(path):
+    """Read the declared exclusions or refuse a policy that cannot be enforced."""
+    try:
+        contract = load(path)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return ()
+    if not isinstance(contract, dict):
+        return ()
+    return read_policy_input(contract)
+
+
+def read_policy_input(contract):
+    """Validate an explicit exclusion policy and return the guarded roots."""
+    if not isinstance(contract, dict):
+        raise ValueError("Invalid read policy")
+    exclusions = contract.get("read_excludes", {})
+    require(isinstance(exclusions, dict), "Invalid read_excludes")
+    roots = contract.get("repo_paths", {})
+    require(isinstance(roots, dict), "Invalid repository paths")
+    policies = []
+    for repo, paths in exclusions.items():
+        require(isinstance(paths, list) and all(isinstance(path, str) for path in paths), "Invalid read_excludes")
+        root = roots.get(repo)
+        require(isinstance(root, str) and Path(root).is_absolute(), "Invalid read_excludes repository")
+        for excluded in paths:
+            relative_path(excluded)
+        if paths:
+            policies.append((root, tuple(paths)))
+    return tuple(policies)
 
 
 def write_once(path, value, *, pinned=False):
@@ -88,13 +120,29 @@ def init_run(run_dir, workflow, repos, description, plan_path, session_id):
 
 def validate_run(contract_path, attempt_id, workflow):
     contract_file = Path(contract_path).absolute()
-    root = contract_file.parent
+    policies = contract_read_policy(contract_file)
+    resolved_contract = guard_excluded_paths(contract_file, policies, pinned=bool(policies))
+    if not policies:
+        resolved_contract = resolved_contract.resolve()
+    root = resolved_contract.parent
+    guard = lambda path: guard_excluded_paths(path.absolute(), policies, pinned=bool(policies))
+    require(not guarded_exists(root / "setup-replacement.json", policies), "This setup run has been replaced")
     relative_path(attempt_id)
     require(re.fullmatch(r"[A-Za-z0-9_.-]+", attempt_id) is not None, "Invalid setup attempt ID")
-    meta = load(root / "run.json")
+    metadata_path = guard(root / "run.json")
+    if policies:
+        with capture_open(metadata_path) as handle:
+            meta = json.load(handle)
+    else:
+        meta = load(metadata_path)
     require(isinstance(meta, dict) and meta.get("schema_version") == 2
             and meta.get("run_id") == root.name and meta.get("workflow") in {"ship", "fix"},
             "Invalid run metadata")
+    for repo in meta.get("repos", []):
+        relative_path(repo)
+        reservation = root / repo / "successor-reservation.json"
+        require(not guarded_exists(reservation, policies),
+                "Predecessor has been reserved for a successor")
     identifier = "setup-" + attempt_id
     session = os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", session):
@@ -102,10 +150,18 @@ def validate_run(contract_path, attempt_id, workflow):
     start = {"schema_version": 2, "run_id": meta["run_id"], "workflow": meta["workflow"],
              "repo": None, "phase_id": identifier, "phase": "setup", "event": "phase-start",
              "at": datetime.now(timezone.utc).isoformat(), "session_id": session}
-    start_path = root / "telemetry" / (identifier + "-start.json")
-    end_path = root / "telemetry" / (identifier + "-end.json")
-    require(not end_path.exists() and not end_path.is_symlink(), "Setup attempt already exists")
-    write_once(start_path, start)
+    start_path = guard(root / "telemetry" / (identifier + "-start.json"))
+    end_path = guard(root / "telemetry" / (identifier + "-end.json"))
+    require(not guarded_exists(end_path, policies), "Setup attempt already exists")
+    write_once(start_path, start, pinned=bool(policies))
+    if guarded_exists(contract_file, policies):
+        contract_source = guard(contract_file)
+        opener = capture_open(contract_source) if policies else open(contract_source, "rb")
+        with opener as contract_input:
+            contract_hash = hashlib.file_digest(contract_input, "sha256").hexdigest()
+        seal = guard(root / "setup-seals" / (identifier + ".json"))
+        write_once(seal, {"schema_version": 2, "run_id": meta["run_id"], "phase_id": identifier,
+                          "contract_sha256": contract_hash}, pinned=bool(policies))
     try:
         value = workflow.contract(contract_path)
         require(value["run_id"] == meta["run_id"] and value["workflow"] == meta["workflow"],
@@ -122,12 +178,12 @@ def validate_run(contract_path, attempt_id, workflow):
     except Exception as error:
         end = {**start, "event": "phase-end", "at": datetime.now(timezone.utc).isoformat(),
                "status": "failed", "end_reason": "unknown", "error": str(error),
-               "start_sha256": hashlib.sha256(start_path.read_bytes()).hexdigest()}
-        write_once(end_path, end)
+               "start_sha256": hashlib.sha256(capture_bytes(start_path) if policies else start_path.read_bytes()).hexdigest()}
+        write_once(end_path, end, pinned=bool(policies))
         raise
     end = {**start, "event": "phase-end", "at": datetime.now(timezone.utc).isoformat(),
-           "status": "passed", "start_sha256": hashlib.sha256(start_path.read_bytes()).hexdigest()}
-    write_once(end_path, end)
+           "status": "passed", "start_sha256": hashlib.sha256(capture_bytes(start_path) if policies else start_path.read_bytes()).hexdigest()}
+    write_once(end_path, end, pinned=bool(policies))
     return end
 
 
@@ -216,6 +272,50 @@ def guard_excluded_paths(path, policies, *, scope=False, pinned=False):
     if not policies:
         return Path(path)
     return resolve_guarded(path, policy_tables(policies, pinned), scope=scope)
+
+
+def guarded_exists(path, policies):
+    path = Path(path).absolute()
+    if not policies:
+        return path.exists() or path.is_symlink()
+    guard_excluded_paths(path, policies, pinned=True)
+    parent = guard_excluded_paths(path.parent, policies, pinned=True)
+    try:
+        with open_directory(parent) as fd:
+            os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def output_run_root(path, policies=()):
+    if not path:
+        return None
+    candidate = Path(path).absolute()
+    guarded = guard_excluded_paths(candidate, policies, pinned=bool(policies))
+    if not policies:
+        guarded = guarded.resolve()
+    for output in (guarded, candidate):
+        for parent in (output, *output.parents):
+            if parent.parent.name in {".ship-runs", ".fix-runs"}:
+                return parent
+    for parent in (guarded, *guarded.parents):
+        contract = parent / "contract.json"
+        if not guarded_exists(contract, policies):
+            continue
+        source = guard_excluded_paths(contract, policies, pinned=bool(policies))
+        try:
+            if policies:
+                with capture_open(source) as handle:
+                    value = json.load(handle)
+            else:
+                value = load(source)
+        except (ValueError, OSError):
+            continue
+        if (isinstance(value, dict) and value.get("schema_version") == 2
+                and value.get("workflow") in {"ship", "fix"} and value.get("run_id") == parent.name):
+            return parent
+    return None
 
 
 def policy_tables(policies, pinned):
@@ -391,8 +491,8 @@ def capture(root, scope, excludes=(), read_excludes=(), *, policies=()):
     return first
 
 
-def checked_manifest(path):
-    value = load(path)
+def checked_manifest(path, *, loader=load):
+    value = loader(path)
     require(isinstance(value, dict) and isinstance(value.get("files"), dict), "Invalid manifest")
     payload = {key: value[key] for key in ("repo_path", "head", "files")}
     require(value.get("fingerprint") == digest(payload), "Invalid manifest fingerprint")
@@ -1269,8 +1369,44 @@ def match_source(left, right, read_excludes=()):
     require(same_source(left, right, read_excludes), "Stale certification: source states differ")
 
 
-def baseline_record(root, directory, path, *, guard=Path):
+def baseline_record(root, directory, path, *, guard=Path, pinned=False):
     markers = guard(directory / ".ship-state")
+    if pinned:
+        marker_name = digest(path) + ".json"
+        try:
+            with open_directory(markers) as descriptor:
+                with os.scandir(descriptor) as entries:
+                    names = sorted(entry.name for entry in entries if entry.name.endswith(".json"))
+                records = []
+                for name in names:
+                    guard(markers / name)
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+                    with os.fdopen(fd, "rb") as handle:
+                        info = os.fstat(handle.fileno())
+                        require(stat.S_ISREG(info.st_mode), "Invalid baseline marker")
+                        record = json.load(handle)
+                    recorded_path = relative_path(record.get("path"))
+                    require(name == digest(recorded_path) + ".json", "Baseline marker does not match path")
+                    if name == marker_name or spelling_key(recorded_path) == spelling_key(path):
+                        records.append(record)
+        except FileNotFoundError:
+            return None
+        source = guard(root / path)
+        try:
+            capture_lstat(source)
+        except FileNotFoundError:
+            return next((record for record in records if record["path"] == path), None)
+        names = PathNames(root, pinned=True)
+        entry = names.key(path)
+        matches = []
+        for record in records:
+            guard(root / record["path"])
+            if names.key(record["path"]) == entry:
+                target = safe_path(directory, record["path"], guard=guard)
+                require(file_state(target, pinned=True) == record["state"], "Baseline was modified")
+                matches.append(record)
+        require(len(matches) <= 1, "Conflicting baseline markers for source path")
+        return matches[0] if matches else None
     require(not markers.is_symlink(), "Symlinked baseline marker directory")
     marker = guard(markers / (digest(path) + ".json"))
     exact = None
@@ -1302,29 +1438,41 @@ def baseline_record(root, directory, path, *, guard=Path):
     return matches[0] if matches else None
 
 
-def baseline(root, directory, path):
-    root = Path(root).resolve()
-    source = safe_path(root, path)
-    directory = Path(directory).resolve()
+def baseline(root, directory, path, *, pinned_directory=None, policies=()):
+    root = guard_excluded_paths(Path(root).absolute(), policies, pinned=bool(policies))
+    if not policies:
+        root = root.resolve()
+    guard = lambda item: guard_excluded_paths(Path(item).absolute(), policies, pinned=bool(policies))
+    source = safe_path(root, path, guard=guard if policies else Path)
+    directory = Path(pinned_directory) if pinned_directory is not None else Path(directory).resolve()
+    if pinned_directory is not None:
+        with open_directory(directory, create=True):
+            pass
     marker = directory / ".ship-state" / (digest(path) + ".json")
-    record = baseline_record(root, directory, path)
+    record = baseline_record(root, directory, path, guard=guard if policies else Path,
+                             pinned=pinned_directory is not None)
     if record is not None:
-        require(file_state(safe_path(directory, record["path"])) == record["state"], "Baseline was modified")
+        require(file_state(safe_path(directory, record["path"]), pinned=pinned_directory is not None) == record["state"], "Baseline was modified")
         return
-    before = file_state(source)
+    if policies:
+        guard(source)
+    before = file_state(source, pinned=bool(policies))
     target = safe_path(directory, path)
-    require(not target.exists() and not target.is_symlink(), "Unrecorded baseline already exists")
+    require(not guarded_exists(target, policies), "Unrecorded baseline already exists")
     if before["kind"] == "file":
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("xb") as handle:
-            handle.write(source.read_bytes())
-        os.chmod(target, stat.S_IMODE(source.stat().st_mode))
+        with open_directory(target.parent, create=True) as parent:
+            fd = os.open(target.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(capture_bytes(source) if policies else source.read_bytes())
+                source_info = capture_lstat(source) if policies else source.stat()
+                os.fchmod(handle.fileno(), stat.S_IMODE(source_info.st_mode))
     elif before["kind"] == "symlink":
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(before["target"], target)
-    require(file_state(source) == before and file_state(target) == before,
+        with open_directory(target.parent, create=True) as parent:
+            os.symlink(before["target"], target.name, dir_fd=parent)
+    require(file_state(source, pinned=bool(policies)) == before
+            and file_state(target, pinned=pinned_directory is not None) == before,
             "Source changed during baseline capture")
-    write_once(marker, {"path": path, "state": before})
+    write_once(marker, {"path": path, "state": before}, pinned=True)
 
 
 def delta(root, directory, scope):
@@ -1412,7 +1560,7 @@ def applied(value, review):
             "Each finding must occur exactly once in applied/failed/skipped")
 
 
-def evidence(value, final, read_excludes=(), *, historical=False, guard=Path):
+def evidence(value, final, read_excludes=(), *, historical=False, guard=Path, loader=load, file_check=None):
     require(isinstance(value, dict), "Evidence must be an object")
     for field in ("criterion_id", "environment", "data_scope"):
         text(value.get(field), field)
@@ -1435,10 +1583,10 @@ def evidence(value, final, read_excludes=(), *, historical=False, guard=Path):
     artifacts = value.get("artifact_paths")
     require(isinstance(artifacts, list) and bool(artifacts), "Missing evidence artifacts")
     for path in artifacts:
-        require(Path(path).is_absolute() and (historical or guard(path).is_file()),
+        require(Path(path).is_absolute() and (historical or (file_check(path) if file_check else guard(path).is_file())),
                 f"Missing absolute artifact: {path}")
-    after = checked_manifest(guard(value["after_manifest"]))
-    match(checked_manifest(guard(value["before_manifest"])), after)
+    after = checked_manifest(guard(value["after_manifest"]), loader=loader)
+    match(checked_manifest(guard(value["before_manifest"]), loader=loader), after)
     match_source(after, final, read_excludes)
 
 
@@ -1455,6 +1603,11 @@ def main():
     sub = commands.add_parser("validate-run")
     sub.add_argument("--contract", required=True)
     sub.add_argument("--attempt-id", required=True)
+    sub = commands.add_parser("replace-setup")
+    sub.add_argument("--contract", required=True)
+    sub.add_argument("--successor-draft", required=True)
+    sub.add_argument("--reason", required=True)
+    sub.add_argument("--read-policy", required=True)
     for name in ("capture", "delta"):
         sub = commands.add_parser(name)
         sub.add_argument("--repo", required=True)
@@ -1522,7 +1675,7 @@ def main():
             sub.add_argument("--repo", required=True)
         if name == "transition":
             sub.add_argument("--file", required=True)
-        if name == "review-budget":
+        if name in ("review-budget", "validate-history"):
             sub.add_argument("--slice")
         if name == "packet":
             sub.add_argument("--scope", required=True)
@@ -1578,6 +1731,70 @@ def main():
     mode.add_argument("--all-repos", action="store_true")
     sub.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.command != "replace-setup" and getattr(args, "contract", None):
+        policies = contract_read_policy(args.contract)
+        source = guard_excluded_paths(Path(args.contract).absolute(), policies, pinned=bool(policies))
+        if not policies:
+            source = source.resolve()
+        root = source.parent
+        guard_excluded_paths(root, policies, pinned=bool(policies))
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return dispatch(args)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    output = getattr(args, "out", None) or (getattr(args, "baseline", None) if args.command == "baseline" else None)
+    explicit = ((args.repo, tuple(args.read_exclude)),) if getattr(args, "read_exclude", None) else ()
+    lexical_root = None
+    if output:
+        candidate = Path(output).absolute()
+        lexical_root = next((parent for parent in (candidate, *candidate.parents)
+                             if parent.parent.name in {".ship-runs", ".fix-runs"}), None)
+    if lexical_root is not None:
+        contract_file = lexical_root / "contract.json"
+        guard_excluded_paths(contract_file, explicit, pinned=bool(explicit))
+        explicit = (*explicit, *contract_read_policy(contract_file))
+    if output:
+        resolved_output = guard_excluded_paths(Path(output).absolute(), explicit, pinned=bool(explicit))
+        if not explicit:
+            resolved_output = resolved_output.resolve()
+        if args.command == "baseline":
+            args.baseline = str(resolved_output)
+        else:
+            args.out = str(resolved_output)
+    root = output_run_root(output, explicit)
+    if root is not None:
+        contract_file = root / "contract.json"
+        guard_excluded_paths(contract_file, explicit, pinned=bool(explicit))
+        policies = (*explicit, *contract_read_policy(contract_file))
+        args._read_policy = policies
+        guard_excluded_paths(root, policies, pinned=bool(policies))
+        guard_excluded_paths(Path(output).absolute(), policies, pinned=bool(policies))
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            require(not guarded_exists(root / "setup-replacement.json", policies), "This setup run has been replaced")
+            if guarded_exists(contract_file, policies):
+                path = guard_excluded_paths(contract_file, policies, pinned=bool(policies))
+                if policies:
+                    with capture_open(path) as handle:
+                        record = json.load(handle)
+                else:
+                    record = load(path)
+                for repo in record.get("repos", []):
+                    relative_path(repo)
+                    require(not guarded_exists(root / repo / "successor-reservation.json", policies),
+                            "Predecessor has been reserved for a successor")
+            return dispatch(args)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    return dispatch(args)
+
+
+def dispatch(args):
     if args.command == "init-run":
         print(json.dumps(init_run(args.run_dir, args.workflow, args.repo, args.description, args.plan_path, args.session_id)))
         return
@@ -1587,6 +1804,15 @@ def main():
         workflow = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(workflow)
         print(json.dumps(validate_run(args.contract, args.attempt_id, workflow)))
+        return
+    if args.command == "replace-setup":
+        import importlib.util
+        module_spec = importlib.util.spec_from_file_location("ship_workflow", Path(__file__).with_name("ship_workflow.py"))
+        workflow = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(workflow)
+        policies = read_policy_input(json.loads(args.read_policy))
+        print(json.dumps(workflow.replace_setup(args.contract, args.successor_draft, args.reason,
+                                                bootstrap_policy=policies)))
         return
     if args.command in {"slice-transition", "slice-gate", "batch-start", "batch-barrier"}:
         import importlib.util
@@ -1650,7 +1876,9 @@ def main():
                 require(isinstance(declaration, dict), "Invalid slice schedule declaration")
                 workflow.slice_schedule(args.contract, repo, declaration.get("path"))
         elif args.command == "validate-history":
-            print(json.dumps(workflow.validate_history(args.contract, args.repo), indent=2))
+            result = (workflow.audit_slice_history(args.contract, args.repo, args.slice, strict=True) if args.slice
+                      else workflow.validate_history(args.contract, args.repo))
+            print(json.dumps(result, indent=2))
         elif args.command == "review-budget":
             print(json.dumps(workflow.review_budget_status(args.contract, args.repo, args.slice), indent=2))
         elif args.command == "transition":
@@ -1723,7 +1951,8 @@ def main():
     elif args.command == "project-ignored-dependencies":
         write_once(args.out, project_ignored_dependencies(args.manifest, args.dependencies))
     elif args.command == "baseline":
-        baseline(args.repo, args.baseline, args.path)
+        baseline(args.repo, args.baseline, args.path, pinned_directory=args.baseline,
+                 policies=getattr(args, "_read_policy", ()))
     elif args.command == "delta":
         write_once(args.out, delta(args.repo, args.baseline, scope_paths(args.scope)))
     elif args.command == "match":

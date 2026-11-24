@@ -81,6 +81,65 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Outside write_scope", result.stderr)
         self.assertEqual(json.loads(self.touched.read_text()), [])
+        self.assertFalse((self.run_dir / "activity-started.json").exists())
+
+    def test_invalid_task_preparation_does_not_start_work(self):
+        result = self.init(self.run_dir / "tasks/invalid.json")
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse((self.run_dir / "activity-started.json").exists())
+
+    def test_task_preparation_refuses_writes_inside_another_run(self):
+        other = self.root / "plans/.fix-runs/other"
+        other.mkdir(parents=True)
+        (other / "setup-replacement.json").write_text("{}")
+        target = other / "injected.json"
+        result = self.init(self.run_dir / "tasks/invalid.json", "--scope-file", str(self.scope),
+                           "--touched", str(target))
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("different run", result.stderr)
+        self.assertFalse(target.exists())
+
+    def test_begin_edit_refuses_swapped_baseline_directory(self):
+        spec = importlib.util.spec_from_file_location("artifact_swap_fixture", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        other = self.root / "plans/.fix-runs/other"
+        other.mkdir(parents=True)
+        (other / "setup-replacement.json").write_text("{}")
+        self.baseline.mkdir(parents=True)
+        task = module.task_file(str(self.task))
+        original = module.workflow.mark_work_started
+
+        def swap(contract_path, repo):
+            original(contract_path, repo)
+            self.baseline.rename(self.baseline.with_name("moved-baseline"))
+            self.baseline.symlink_to(other, target_is_directory=True)
+
+        with patch.object(module.workflow, "mark_work_started", side_effect=swap):
+            with self.assertRaises((ValueError, OSError)):
+                module.begin_edit(task, ["src/a.txt"])
+        self.assertFalse((other / "src/a.txt").exists())
+
+    def test_generic_baseline_refuses_swapped_directory(self):
+        other = self.root / "plans/.fix-runs/other"
+        other.mkdir(parents=True)
+        (other / "setup-replacement.json").write_text("{}")
+        self.baseline.mkdir(parents=True)
+        helper = artifacts.state
+        original = helper.output_run_root
+
+        def swap(path, policies=()):
+            result = original(path, policies)
+            self.baseline.rename(self.baseline.with_name("moved-baseline"))
+            self.baseline.symlink_to(other, target_is_directory=True)
+            return result
+
+        argv = ["ship_state.py", "baseline", "--repo", str(self.repo), "--baseline", str(self.baseline),
+                "--path", "src/a.txt"]
+        with patch.object(sys, "argv", argv), patch.object(helper, "output_run_root", side_effect=swap):
+            with self.assertRaises((ValueError, OSError)):
+                helper.main()
+        self.assertFalse((other / "src/a.txt").exists())
 
     def test_declared_store_input_is_bound_by_implementer_run_and_record(self):
         directory = self.root.resolve() / "store"

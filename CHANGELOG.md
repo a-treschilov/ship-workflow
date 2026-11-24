@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.6.0 - 2026-11-25
+
+### New Features
+
+- Replace a setup-only run with a new contract while retaining its setup artifacts and predecessor budgets.
 
 ### Improvements
 

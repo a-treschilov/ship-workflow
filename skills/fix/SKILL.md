@@ -57,6 +57,8 @@ A new feature/improvement need not fail before implementation. Capture true obse
 Before freezing scope, include impacted documentation and, for user-, consumer- or operator-visible changes, `CHANGELOG.md` (`## Unreleased`; skip repositories that do not track releases). Confirmed drift discovered outside authorized scope is a blocking gap: seek approval to expand scope rather than silently defer it. Validate each new run with the protocol's `validate-run` helper, initialize source/scope/baselines and execute preflight before implementer. Confirm
 actual runtime source/mount, safe test DB, dependencies and permissions. An unavailable mandatory check
 blocks before edits. Explicit user-authorized code-only work stays implemented/unverified, never success.
+If a frozen setup-only contract needs replacement, follow the protocol's `replace-setup` procedure and carry
+every actual predecessor's budget and history into the new contract.
 Preserve unrelated dirty WIP; first-touch snapshots isolate same-file pre-existing edits.
 Validate the submission with the protocol's `validate-submission` command before dispatching each reviewer.
 Pass the selected manifest to pre-review checks, reviewer and assessment. Report pending and stale bindings

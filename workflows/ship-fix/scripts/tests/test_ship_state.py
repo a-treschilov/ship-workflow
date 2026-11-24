@@ -172,6 +172,14 @@ class WorkflowStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             state.baseline(self.repo, self.base, "source.txt")
 
+    def test_pinned_baseline_preserves_allowed_symlink(self):
+        link = self.repo / "link"
+        link.symlink_to("source.txt")
+        policy = ((str(self.repo), ("private",)),)
+        state.baseline(self.repo, self.base, "link", pinned_directory=self.base.resolve(), policies=policy)
+        self.assertTrue((self.base / "link").is_symlink())
+        self.assertEqual("source.txt", os.readlink(self.base / "link"))
+
     def test_baseline_alias_uses_existing_first_touch_record(self):
         if not (self.repo / "SOURCE.TXT").exists():
             self.skipTest("filesystem distinguishes case")

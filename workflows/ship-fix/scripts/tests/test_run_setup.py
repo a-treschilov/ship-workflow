@@ -10,6 +10,23 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'ship_state.py'
 
 
 class RunSetupTests(unittest.TestCase):
+    def test_invalid_read_excludes_never_falls_back_to_unrestricted_setup(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['SHIP_TEST_TMPDIR']) as directory:
+            repo = Path(directory) / 'repo'
+            run = repo / 'private/run'
+            run.mkdir(parents=True)
+            (run / 'run.json').write_text(json.dumps({'schema_version': 2, 'workflow': 'fix',
+                                                       'run_id': 'run', 'repos': ['api']}))
+            contract = run / 'contract.json'
+            contract.write_text(json.dumps({'repo_paths': {'api': str(repo)},
+                                            'read_excludes': {'api': ['private'], 'bad': ['hidden']}}))
+            result = subprocess.run(['python3', '-I', '-B', str(SCRIPT), 'validate-run',
+                                     '--contract', str(contract), '--attempt-id', 'first'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertFalse((run / 'telemetry').exists())
+            self.assertFalse((run / 'setup-seals').exists())
+
     def test_init_is_valid_exclusive_and_reports_actual_start(self):
         with tempfile.TemporaryDirectory(dir=os.environ['SHIP_TEST_TMPDIR']) as directory:
             root = Path(directory)

@@ -23,6 +23,7 @@ immediately-before-run observations to the run. Existing outputs are never overw
 import argparse
 import importlib.util
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -41,7 +42,7 @@ def capture(state, repo_path, scope, out, excludes, read_excludes, policies):
     try:
         destination = state.guard_excluded_paths(out.absolute(), policies, pinned=bool(policies))
         captured = state.capture(repo_path, scope, excludes, read_excludes, policies=policies)
-        state.write_once(destination, captured, pinned=bool(policies))
+        state.write_once(destination, captured, pinned=True)
     except (ValueError, OSError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"capture failed: {error}") from error
 
@@ -60,6 +61,13 @@ def checks_module():
     return module
 
 
+def write_text_once(state, path, text):
+    with state.open_directory(path.parent, create=True) as directory:
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+
 def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop_on_fail, *,
               deliverable_manifest=None, slice_id=None, schedule=None):
     repo_path = contract["repo_paths"][repo]
@@ -71,18 +79,28 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
     policies = workflow.read_policy(contract)
     workflow.state.guard_excluded_paths(Path(out_dir).absolute(), policies)
     source_scope = workflow.scope_input(Path(scope).absolute(), contract)
-    out_dir = Path(out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    checks = [c for c in contract[group][repo] if "argv" in c and (not wanted or c["id"] in wanted)]
+    if wanted and {c["id"] for c in checks} != wanted:
+        raise SystemExit("Unknown or non-argv check id requested")
+    out_dir = workflow.guarded_resolve(Path(out_dir).absolute(), contract)
+    output_run = workflow.state.output_run_root(out_dir, policies)
+    contract_run = workflow.guarded_resolve(contract_path, contract).parent
+    if output_run is not None and output_run != contract_run:
+        raise SystemExit("Check output cannot be written inside a different run")
     sanitize = checks_module().sanitize
     dependencies, exclusions = workflow.capture_policy(contract_path, repo)
     effective_scope = out_dir / "capture-scope.json"
     if effective_scope.exists():
         raise SystemExit("capture scope already exists; use a new --out-dir")
     scope_paths = sorted(set(source_scope) | set(dependencies))
-    effective_scope.write_text(json.dumps(scope_paths))
-    checks = [c for c in contract[group][repo] if "argv" in c and (not wanted or c["id"] in wanted)]
-    if wanted and {c["id"] for c in checks} != wanted:
-        raise SystemExit("Unknown or non-argv check id requested")
+    if not checks:
+        with workflow.prepare_run_artifact(contract_path, repo):
+            if effective_scope.exists():
+                raise SystemExit("capture scope already exists; use a new --out-dir")
+            write_text_once(workflow.state, effective_scope, json.dumps(scope_paths))
+        return {}
+    workflow.mark_work_started(contract_path, repo)
+    write_text_once(workflow.state, effective_scope, json.dumps(scope_paths))
     results = {}
     for check in checks:
         delivery = workflow.check_delivery(contract, repo, group, deliverable_manifest, slice_item=item)
@@ -93,10 +111,11 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
         before, after = out_dir / f"{cid}-before.json", out_dir / f"{cid}-after.json"
         log = out_dir / f"{cid}.log"
         capture(workflow.state, repo_path, scope_paths, before, exclusions, read_excludes, policies)
-        inputs, observed = workflow.before_check_inputs(contract, repo, check, out_dir / f"{cid}-inputs")
+        inputs, observed = workflow.before_check_inputs(contract, repo, check, out_dir / f"{cid}-inputs",
+                                                        pinned_out_dir=out_dir / f"{cid}-inputs")
         done = run(check["argv"], cwd=repo_path)
-        log.write_text(sanitize((done.stdout + "\n--- stderr ---\n" + done.stderr).encode()))
-        marker.write_text(f"{done.returncode}\n")
+        write_text_once(workflow.state, log, sanitize((done.stdout + "\n--- stderr ---\n" + done.stderr).encode()))
+        write_text_once(workflow.state, marker, f"{done.returncode}\n")
         inputs, bindings = workflow.after_check_inputs(contract, check, inputs, observed)
         workflow.require(delivery == workflow.check_delivery(contract, repo, group, deliverable_manifest, slice_item=item),
                          "Deliverable version changed during execution")
@@ -107,7 +126,7 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
         references = workflow.execution_references(artifacts, bindings, delivery)
         workflow.state.write_once(execution, {"producer": "orchestrator", "command": shlex.join(check["argv"]),
                                                 "exit_code": done.returncode, "log": str(log),
-                                                **({"check_id": cid, **references} if references else {})})
+                                                **({"check_id": cid, **references} if references else {})}, pinned=True)
         body = {
             "kind": check["kind"], "status": status, "producer": "orchestrator",
             "command": shlex.join(check["argv"]), "exit_code": done.returncode,
@@ -120,7 +139,7 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
         if status == "failed":
             body["reason"] = f"Declared command exited {done.returncode}; see {log.name}."
         inp = out_dir / f"{cid}-input.json"
-        inp.write_text(json.dumps(body, indent=1, ensure_ascii=False))
+        workflow.state.write_once(inp, body, pinned=True)
         rec = run([sys.executable, "-I", "-B", str(HELPER), "record-evidence", "--contract", contract_path,
                    "--repo", repo, "--file", str(inp), "--out", str(out_dir / f"{cid}-record.json")])
         note = (rec.stdout + rec.stderr).strip().splitlines()[-1:] or [""]
@@ -139,12 +158,16 @@ def gates(contract_path, repo, scope, out_dir, phase_id, ids="", stop_on_fail=Fa
     if repo not in contract["repo_paths"]:
         raise SystemExit("Unknown repo")
     workflow = workflow_module()
+    wanted = {i for i in ids.split(",") if i}
+    available = {check["id"] for check in contract["required_gates"][repo] if "argv" in check}
+    if not wanted <= available:
+        raise SystemExit("Unknown or non-argv check id requested")
+    workflow.mark_work_started(contract_path, repo)
     run_dir = Path(contract_path).resolve().parent
     start_path = run_dir / "telemetry" / f"{phase_id}-start.json"
     end_path = run_dir / "telemetry" / f"{phase_id}-end.json"
     workflow.phase_from_flags(contract_path, str(start_path), phase_id=phase_id, phase="gates",
                               event="phase-start", repo=repo, session_id=session_id, at=at)
-    wanted = {i for i in ids.split(",") if i}
     try:
         results = run_group(contract_path, contract, repo, scope, out_dir, "required_gates", wanted, stop_on_fail)
     except (Exception, SystemExit):

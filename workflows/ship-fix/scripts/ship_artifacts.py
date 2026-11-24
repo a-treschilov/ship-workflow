@@ -14,6 +14,7 @@ Created by `init-task` (orchestrator, before each spawn); `capsule-check` needs 
 
 import argparse
 import difflib
+import fcntl
 import importlib.util
 import json
 import os
@@ -21,6 +22,7 @@ from pathlib import Path
 import re
 import selectors
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -55,6 +57,12 @@ def task_file(path):
         require(value.get(key), f"Task lacks {key}")
     require(Path(value["evidence_dir"]).is_absolute(), "evidence_dir must be absolute")
     contract = state.load(value["contract"])
+    for field in ("baseline_dir", "touched", "evidence_dir"):
+        value["_pinned_" + field] = workflow.guarded_resolve(Path(value[field]).absolute(), contract)
+        workflow.require_writable_run(value["_pinned_" + field], value["contract"], contract)
+    if value.get("round_dir"):
+        value["_pinned_round_dir"] = workflow.guarded_resolve(Path(value["round_dir"]).absolute(), contract)
+        workflow.require_writable_run(value["_pinned_round_dir"], value["contract"], contract)
     value["touched_list"] = workflow.scope_input(value["touched"], contract, optional=True)
     value["source_scope_list"] = workflow.scope_input(value["source_scope"], contract) if value.get("source_scope") else []
     value["read_excludes"] = workflow.repo_read_excludes(contract, value["repo"])
@@ -71,6 +79,21 @@ def require_readable(task, path):
     state.guard_excluded_path(root / path, root, exclusion)
 
 
+def pinned_evidence(task, path):
+    return task["_pinned_evidence_dir"] / Path(path).relative_to(Path(task["evidence_dir"]))
+
+
+def task_load(task, path):
+    return workflow.guarded_load(path, {"_read_policy": task["read_policy"]})
+
+
+def write_text_once(path, text):
+    with state.open_directory(path.parent, create=True) as directory:
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+
 def next_free(base, suffix):
     index = 1
     while (base / f"{index}{suffix}").exists():
@@ -80,7 +103,10 @@ def next_free(base, suffix):
 
 def backup_for(task, path):
     folder = Path(task["evidence_dir"]) / "backups" / Path(path).parent
-    matches = list(folder.glob(f"*.{Path(path).name}.bak")) if folder.is_dir() else []
+    suffix = f".{Path(path).name}.bak"
+    physical = task["_pinned_evidence_dir"] / "backups" / Path(path).parent
+    matches = [folder / name for name, mode in workflow.guarded_entries(physical, {"_read_policy": task["read_policy"]})
+               if name.endswith(suffix) and stat.S_ISREG(mode)]
     numbered = [(int(match.name.split(".", 1)[0]), match) for match in matches if match.name.split(".", 1)[0].isdigit()]
     return max(numbered)[1] if numbered else None
 
@@ -92,15 +118,34 @@ def begin_edit(task, paths):
     for path in paths:
         require_readable(task, path)
         require(workflow.in_scope(path, task["write_scope"], names), f"Outside write_scope: {path}")
-        state.baseline(root, task["baseline_dir"], path)
+    workflow.mark_work_started(task["contract"], task["repo"])
+    for path in paths:
+        state.baseline(root, task["baseline_dir"], path, pinned_directory=task["_pinned_baseline_dir"],
+                       policies=task["read_policy"])
         source = state.safe_path(root.resolve(), path)
         if source.is_file():
-            target = next_free(Path(task["evidence_dir"]) / "backups" / Path(path).parent, f".{Path(path).name}.bak")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(source.read_bytes())
+            folder = task["_pinned_evidence_dir"] / "backups" / Path(path).parent
+            with state.open_directory(folder, create=True) as directory:
+                index = 1
+                while True:
+                    name = f"{index}.{Path(path).name}.bak"
+                    try:
+                        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                     0o666, dir_fd=directory)
+                        break
+                    except FileExistsError:
+                        index += 1
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(workflow.guarded_bytes(source, {"_read_policy": task["read_policy"]}))
+            target = Path(task["evidence_dir"]) / "backups" / Path(path).parent / name
             print(f"backup {path} -> {target}")
         touched.add(path)
-    Path(task["touched"]).write_text(json.dumps(sorted(touched), indent=2) + "\n")
+    touched_path = task["_pinned_touched"]
+    with state.open_directory(touched_path.parent, create=True) as directory:
+        fd = os.open(touched_path.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     0o666, dir_fd=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(sorted(touched), indent=2) + "\n")
     print(f"begin-edit ok: {len(paths)} path(s), touched={len(touched)}")
 
 
@@ -109,12 +154,13 @@ def check_file(task, paths):
     for path in paths:
         require_readable(task, path)
         source = state.safe_path(Path(task["repo_path"]).resolve(), path)
-        require(source.is_file(), f"Not a regular file: {path}")
-        size = source.stat().st_size
-        lines = source.read_bytes().count(b"\n")
+        data = workflow.guarded_bytes(source, {"_read_policy": task["read_policy"]})
+        size = len(data)
+        lines = data.count(b"\n")
         backup = backup_for(task, path)
         if backup:
-            old_size, old_lines = backup.stat().st_size, backup.read_bytes().count(b"\n")
+            previous = workflow.guarded_bytes(backup, {"_read_policy": task["read_policy"]})
+            old_size, old_lines = len(previous), previous.count(b"\n")
             grown = size > FILE_LIMIT and size > GROWTH_LIMIT * max(old_size, 1)
             grown = grown or (lines > 1000 and lines > GROWTH_LIMIT * max(old_lines, 1))
         else:
@@ -145,19 +191,20 @@ def run(task, name, argv, check, deliverable_manifest=None):
     record = evidence / "runs" / f"{name}.json"
     log = evidence / "logs" / f"{name}.log"
     require(not record.exists() and not log.exists(), f"Run {name} already exists; choose a new name")
-    contract = state.load(task["contract"])
+    contract = task_load(task, task["contract"])
     repo = task["repo"]
     if contract.get("external_stores") or workflow.staged_deliverables(contract, repo) or deliverable_manifest:
         contract = workflow.contract(task["contract"])
     if check:
         argv = run_check(contract, repo, check)
     require(argv, "Give --check ID or argv after --")
+    workflow.mark_work_started(task["contract"], task["repo"])
     dependencies, excludes = workflow.capture_policy(task["contract"], task["repo"])
     scope = sorted(set(task["touched_list"]) | set(task["source_scope_list"]) | set(dependencies))
     root = task["repo_path"]
     before = state.capture(root, scope, excludes, task.get("read_excludes", []), policies=task.get("read_policy", ()))
     before_path = evidence / "runs" / f"{name}-before.json"
-    state.write_once(before_path, before)
+    state.write_once(pinned_evidence(task, before_path), before, pinned=True)
     check_spec = spec_for(contract, repo, check) if check else {}
     item, delivery = None, None
     if deliverable_manifest:
@@ -165,12 +212,12 @@ def run(task, name, argv, check, deliverable_manifest=None):
         schedule = contract["slice_schedules"][repo]["path"] if slice_id else None
         item = workflow.selected_slice(contract, repo, slice_id, schedule)
         delivery, _ = workflow.deliverable_binding(contract, repo, deliverable_manifest, slice_item=item)
-    inputs, observed = workflow.before_check_inputs(contract, repo, check_spec, evidence / "inputs" / f"{name}-files")
+    inputs, observed = workflow.before_check_inputs(contract, repo, check_spec, evidence / "inputs" / f"{name}-files",
+                                                    pinned_out_dir=task["_pinned_evidence_dir"] / "inputs" / f"{name}-files")
     returncode, raw, timed_out = bounded_run(argv, root)
-    log.parent.mkdir(parents=True, exist_ok=True)
     text = checks.sanitize(raw, truncated=timed_out or len(raw) >= checks.LIMIT)
     suffix = " (timeout)" if timed_out else ""
-    log.write_text(text + f"\nEXIT={returncode}{suffix}\n", encoding="utf-8")
+    write_text_once(pinned_evidence(task, log), text + f"\nEXIT={returncode}{suffix}\n")
     inputs, input_bindings = workflow.after_check_inputs(contract, check_spec, inputs, observed)
     if deliverable_manifest:
         require(delivery == workflow.deliverable_binding(contract, repo, deliverable_manifest, slice_item=item)[0],
@@ -178,11 +225,11 @@ def run(task, name, argv, check, deliverable_manifest=None):
     references = workflow.execution_references(inputs, input_bindings, delivery)
     after = state.capture(root, scope, excludes, task.get("read_excludes", []), policies=task.get("read_policy", ()))
     after_path = evidence / "runs" / f"{name}-after.json"
-    state.write_once(after_path, after)
-    state.write_once(record, {"name": name, "producer": "implementer", "command": shlex.join(argv), "exit_code": returncode,
+    state.write_once(pinned_evidence(task, after_path), after, pinned=True)
+    state.write_once(pinned_evidence(task, record), {"name": name, "producer": "implementer", "command": shlex.join(argv), "exit_code": returncode,
                               "before_manifest": str(before_path), "after_manifest": str(after_path),
                               "log": str(log), "check": check, "timed_out": timed_out, "input_artifacts": inputs,
-                              **({"check_id": check, **references} if references else {})})
+                              **({"check_id": check, **references} if references else {})}, pinned=True)
     print(f"run {name}: exit={returncode} log={log}")
     for line in text.splitlines()[-20:]:
         print("  " + line)
@@ -255,17 +302,17 @@ def evidence_input(contract, repo, run_record, claims, environment, data_scope):
 def record(task, name, claims, environment, data_scope):
     evidence = Path(task["evidence_dir"])
     execution_path = evidence / "runs" / f"{run_name(name)}.json"
-    run_record = state.load(execution_path)
+    run_record = task_load(task, execution_path)
     parsed = []
     for item in claims:
         require("=" in item, "Claim must be ID=assertion")
         identifier, assertion = item.split("=", 1)
         parsed.append((identifier, assertion))
-    body = evidence_input(state.load(task["contract"]), task["repo"], run_record, parsed, environment, data_scope)
+    body = evidence_input(task_load(task, task["contract"]), task["repo"], run_record, parsed, environment, data_scope)
     body["execution_record"] = str(execution_path)
     body["artifact_paths"].append(str(execution_path))
     request = evidence / "inputs" / f"{name}-record.json"
-    state.write_once(request, body)
+    state.write_once(pinned_evidence(task, request), body, pinned=True)
     target = evidence / "records" / f"{name}.json"
     completed = subprocess.run([sys.executable, "-I", "-B", str(HELPER), "record-evidence",
                                 "--contract", task["contract"], "--repo", task["repo"],
@@ -276,9 +323,9 @@ def record(task, name, claims, environment, data_scope):
 
 def preflight(task, plan_file):
     """Inspect planned operations without executing commands or creating artifacts."""
-    operations = state.load(plan_file)
+    operations = task_load(task, plan_file)
     require(isinstance(operations, list) and operations, "Preflight input must be a non-empty array")
-    contract = state.load(task["contract"])
+    contract = task_load(task, task["contract"])
     evidence = Path(task["evidence_dir"])
     planned_runs, planned_records = set(), set()
     results = []
@@ -319,7 +366,7 @@ def preflight(task, plan_file):
                         "All claims of one run must share one verification kind")
                 run_path = evidence / "runs" / f"{name}.json"
                 if run_path.is_file():
-                    evidence_input(contract, task["repo"], state.load(run_path), parsed,
+                    evidence_input(contract, task["repo"], task_load(task, run_path), parsed,
                                    operation.get("environment"), operation.get("data_scope"))
                 else:
                     require(name in planned_runs, f"Missing run: {name}")
@@ -327,7 +374,7 @@ def preflight(task, plan_file):
                 deferred.append("Claim truth and final evidence validity are not checked")
                 planned_records.add(name)
             elif kind == "matrix":
-                rows = state.load(operation.get("rows"))
+                rows = task_load(task, operation.get("rows"))
                 require(isinstance(rows, list) and rows, "Matrix input is a non-empty array of rows")
                 for row in rows:
                     require(isinstance(row, dict) and isinstance(row.get("runs", []), list), "Invalid matrix row")
@@ -338,7 +385,7 @@ def preflight(task, plan_file):
                             deferred.append(f"Evidence record pending: {name}")
                 deferred.append("Matrix semantics and source freshness are not checked")
             elif kind == "capsule-check":
-                capsule_draft(operation.get("draft"))
+                capsule_draft(operation.get("draft"), loader=lambda path: task_load(task, path))
                 deferred.append("Capsule claims and source binding are not checked")
             else:
                 raise ValueError(f"Unknown preflight operation: {kind}")
@@ -361,13 +408,13 @@ def evidence_paths(task, runs):
 
 
 def matrix(task, rows_file, base_file=None):
-    rows = state.load(rows_file)
+    rows = task_load(task, rows_file)
     require(isinstance(rows, list) and rows, "Matrix input is a non-empty array of rows")
     key = "rows" if task.get("slice_id") else "criteria"
     out = []
     if base_file:
-        base = state.load(workflow.absolute_file(base_file))
-        workflow.bound(state.load(task["contract"]), task["repo"], base)
+        base = task_load(task, workflow.absolute_file(base_file, {"_read_policy": task["read_policy"]}))
+        workflow.bound(task_load(task, task["contract"]), task["repo"], base)
         require(base.get("slice_id") == task.get("slice_id"), "Matrix base belongs to another slice")
         require(isinstance(base.get(key), list), "Matrix base lacks rows")
         out = list(base[key])
@@ -388,20 +435,20 @@ def matrix(task, rows_file, base_file=None):
             out[matches[0]] = entry
             continue
         out.append(entry)
-    body = {"schema_version": workflow.VERSION, "run_id": state.load(task["contract"])["run_id"],
+    body = {"schema_version": workflow.VERSION, "run_id": task_load(task, task["contract"])["run_id"],
             "repo": task["repo"], key: out}
     if task.get("slice_id"):
         body["slice_id"] = task["slice_id"]
     target = next_free(Path(task["evidence_dir"]) / "matrix", ".json")
-    state.write_once(target, body)
+    state.write_once(pinned_evidence(task, target), body, pinned=True)
     print(f"matrix: {target}")
 
 
 def applied(task, result_file):
-    result = state.load(result_file)
-    findings = state.load(task["findings"])
+    result = task_load(task, result_file)
+    findings = task_load(task, task["findings"])
     kinds = {f["id"]: f["verification_kind"] for f in findings["findings"]}
-    contract = state.load(task["contract"])
+    contract = task_load(task, task["contract"])
     body = {"schema_version": workflow.VERSION, "run_id": contract["run_id"], "repo": task["repo"],
             "round": findings["round"], "applied": [], "failed": [], "skipped": []}
     for entry in result.get("applied", []):
@@ -414,7 +461,7 @@ def applied(task, result_file):
             body[group].append({"id": entry.get("id"), "reason": entry.get("reason")})
     state.applied(body, findings)
     target = Path(task["round_dir"]) / f"round-{findings['round']}-applied.json"
-    state.write_once(target, body)
+    state.write_once(task["_pinned_round_dir"] / target.name, body, pinned=True)
     print(f"applied: {target}")
 
 
@@ -476,9 +523,9 @@ def scope_check(task):
     print("scope-check ok")
 
 
-def capsule_draft(draft_file):
+def capsule_draft(draft_file, *, loader=state.load):
     """Shape check only: the author's text, never the binding fields the orchestrator writes."""
-    draft = state.load(draft_file)
+    draft = loader(draft_file)
     require(isinstance(draft, dict), "Capsule must be an object")
     for field in CAPSULE_FIELDS:
         require(field in draft, f"Capsule lacks {field}")
@@ -496,9 +543,9 @@ def capsule_check(draft_file):
 def capsule(task, draft_file, agent_id):
     """Sealed by the orchestrator with the agent identity it observed; the agent cannot name its own author."""
     require(isinstance(agent_id, str) and agent_id.strip(), "capsule needs --agent-id of the author that wrote it")
-    draft = capsule_draft(draft_file)
+    draft = capsule_draft(draft_file, loader=lambda path: task_load(task, path))
     body = json_text(draft)
-    contract = state.load(task["contract"])
+    contract = task_load(task, task["contract"])
     # The helper binds a capsule to its own fingerprint scope; a repo task must name the scope file it uses.
     require(task.get("slice_id") or task.get("scope_file"), "Repo capsule needs scope_file in the task")
     # Same scope the helper fingerprints: a slice uses its touched list, a repo its scope file, plus dependencies.
@@ -511,13 +558,13 @@ def capsule(task, draft_file, agent_id):
     directory = Path(task["evidence_dir"]) / "capsules"
     target = next_free(directory, ".json")
     sidecar = directory / (target.stem + ".manifest.json")
-    state.write_once(sidecar, manifest)
+    state.write_once(pinned_evidence(task, sidecar), manifest, pinned=True)
     value = {**draft, "schema_version": workflow.VERSION, "run_id": contract["run_id"], "repo": task["repo"],
              "written_by": agent_id, "source_fingerprint": manifest["fingerprint"],
              "manifest_path": str(sidecar)}
     if task.get("slice_id"):
         value["slice_id"] = task["slice_id"]
-    state.write_once(target, value)
+    state.write_once(pinned_evidence(task, target), value, pinned=True)
     print(f"capsule: {target}")
 
 
@@ -526,10 +573,10 @@ def json_text(value):
 
 
 def since_capsule(task, capsule_file):
-    value = state.load(capsule_file)
-    manifest = state.checked_manifest(value["manifest_path"])
+    value = task_load(task, capsule_file)
+    manifest = state.checked_manifest(value["manifest_path"], loader=lambda path: task_load(task, path))
     require(manifest["fingerprint"] == value["source_fingerprint"], "Capsule fingerprint mismatch")
-    contract = state.load(task["contract"])
+    contract = task_load(task, task["contract"])
     base = (workflow.scope_input(task["scope_file"], contract)
             if task.get("scope_file") and not task.get("slice_id") else task["touched_list"])
     _, excludes = workflow.capture_policy(task["contract"], task["repo"])
@@ -546,10 +593,18 @@ def since_capsule(task, capsule_file):
 
 def init_task(args):
     """Orchestrator step before each spawn or resume: writes the task file the implementer reads."""
-    contract_path = str(Path(args.contract).resolve())
+    policies = state.contract_read_policy(args.contract)
+    guarded = state.guard_excluded_paths(Path(args.contract).absolute(), policies, pinned=bool(policies))
+    contract_path = str(guarded if policies else guarded.resolve())
     contract = workflow.contract(contract_path)
     require(args.repo in contract["repos"], f"Unknown repo: {args.repo}")
-    out = Path(args.out).resolve()
+    workflow.require_unreserved(contract, contract_path, args.repo)
+    for path in (args.touched, args.baseline, args.evidence_dir, args.out):
+        workflow.require_writable_run(path, contract_path, contract)
+    if args.round_dir:
+        workflow.require_writable_run(args.round_dir, contract_path, contract)
+    out = workflow.guarded_resolve(Path(args.out).absolute(), contract)
+    workflow.require_writable_run(out, contract_path, contract)
     require(out.is_relative_to(Path(contract_path).parent.resolve()), "--out must lie inside the run directory")
     require(bool(args.slice) != bool(args.scope_file), "Give exactly one of --slice or --scope-file")
     require(bool(args.findings) == bool(args.round_dir), "--findings and --round-dir go together")
@@ -562,13 +617,15 @@ def init_task(args):
     else:
         # Repo-level writes are bounded by the scope file and touched list, not by a pattern here.
         write_scope = ["**"]
-    touched = Path(args.touched).resolve()
+    touched = workflow.guarded_resolve(Path(args.touched).absolute(), contract)
+    workflow.require_writable_run(touched, contract_path, contract)
     if not touched.exists():
-        touched.parent.mkdir(parents=True, exist_ok=True)
-        touched.write_text("[]\n")
+        state.write_once(touched, [], pinned=True)
     task = {"contract": contract_path, "repo": args.repo, "repo_path": contract["repo_paths"][args.repo],
-            "baseline_dir": str(Path(args.baseline).resolve()), "touched": str(touched),
-            "write_scope": write_scope, "evidence_dir": str(Path(args.evidence_dir).resolve())}
+            "baseline_dir": str(workflow.guarded_resolve(Path(args.baseline).absolute(), contract)), "touched": str(touched),
+            "write_scope": write_scope, "evidence_dir": str(workflow.guarded_resolve(Path(args.evidence_dir).absolute(), contract))}
+    for field in ("baseline_dir", "evidence_dir"):
+        workflow.require_writable_run(task[field], contract_path, contract)
     if args.scope_file:
         task["scope_file"] = str(Path(args.scope_file).resolve())
     if args.source_scope:
@@ -577,8 +634,9 @@ def init_task(args):
         task["slice_id"] = args.slice
     if args.findings:
         task["findings"] = str(Path(args.findings).resolve())
-        task["round_dir"] = str(Path(args.round_dir).resolve())
-    state.write_once(out, task)
+        task["round_dir"] = str(workflow.guarded_resolve(Path(args.round_dir).absolute(), contract))
+        workflow.require_writable_run(task["round_dir"], contract_path, contract)
+    state.write_once(out, task, pinned=True)
     print(f"init-task: {out}")
 
 
@@ -634,12 +692,27 @@ def parser():
 def main(argv):
     args = parser().parse_args(argv)
     if args.command == "init-task":
-        init_task(args)
+        policies = state.contract_read_policy(args.contract)
+        source = state.guard_excluded_paths(Path(args.contract).absolute(), policies, pinned=bool(policies))
+        if not policies:
+            source = source.resolve()
+        root = source.parent
+        state.guard_excluded_paths(root, policies, pinned=bool(policies))
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            init_task(args)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
         return
     if args.command == "capsule-check":
         capsule_check(args.draft)
         return
     require(args.task, "--task is required for this command")
+    if args.command in {"record", "matrix", "applied", "capsule"}:
+        task = state.load(args.task)
+        workflow.mark_work_started(task["contract"], task["repo"])
     task = task_file(args.task)
     if args.command == "begin-edit":
         begin_edit(task, args.paths)

@@ -63,7 +63,8 @@ session ID or empty string. repo_paths refer to existing assigned sibling repos;
 New contracts include `telemetry_policy: {"repair_phase_required": true, "end_reason_required": true, "run_local_seals": true}` explicitly, and `"author_rotation": "capsule"` (omit only with `--no-rotation`, which writes `"resume"`).
 Declare empirical checks as `argv` lists where practical, and run each new pre-review/preflight command once
 before implementation. On any non-passed phase-end record `end_reason` (use `unknown` when not established).
-Validate each new run with the protocol's `validate-run` helper so setup success or failure is recorded before preflight. No approved requirement edits during execution. Approved plans tag repo
+Validate each new run with the protocol's `validate-run` helper so setup success or failure is recorded before preflight. If a frozen setup-only contract cannot express the approved plan, follow the protocol's `replace-setup`
+procedure and carry every actual predecessor's budget and history into the new contract. No approved requirement edits during execution. Approved plans tag repo
 ownership via subsection headings under `## Changes` / `## Implementation` (e.g. `### 1. Backend
 (\`server/\`) — …`); grep heading lines for a repo name (backtick-quoted directory or plain prose) to build
 each repo's `PLAN_EXCERPT` = cross-cutting sections (Context, Architecture, Verification,

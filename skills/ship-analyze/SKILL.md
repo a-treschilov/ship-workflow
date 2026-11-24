@@ -32,6 +32,8 @@ validates run metadata and contract; it does not prove preflight or project chec
 by agent_id/tool_use_id, deduplicates request/message chunks/replays and reads usage per phase, not cumulative
 agent totals. Actual model is per phase/instance; mixed phases expose a models list. Missing metrics are
 null, not zero. Reports without reliable correlation/completion are partial, not free work.
+When a run has `setup-replacement.json`, identify it as a replaced setup and retain its recorded telemetry.
+Use the successor's digest and completion certificate to inspect the replacement chain and inherited budgets.
 
 Render a compact phase table: phase/repo/round, actual models, input/output/cache usage, time, status and
 accounting completeness. Distinguish elapsed wall time, summed agent/service time, gate time, user waits,

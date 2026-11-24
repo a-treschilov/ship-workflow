@@ -103,6 +103,11 @@ A run lives in a unique directory under `plans/.ship-runs/` or `plans/.fix-runs/
 For new runs, `init-run` exclusively creates the directory and atomically publishes valid metadata. `validate-run`
 records a run-wide setup phase around contract and slice-schedule validation, including failures; it does not
 assert that preflight or any project check passed. `validate-contract` remains read-only for historical runs.
+Setup-only runs can be closed with a sealed replacement binding. The successor retains the original setup
+artifacts and independently accounts for all lifecycle predecessor budgets. The closure does not certify work.
+`validate-run` writes a per-attempt contract seal alongside its setup events. Historical runs without that
+seal bind the contract when they are replaced. External work helpers record an activity marker before they
+execute so that a concurrent replacement cannot overlook their work.
 
 State transitions recapture source and verify earlier seals. Artifacts are write-once; a correction is a new
 artifact, not an edit to history. Source files are bound by the manifest recorded in the event, while logs,

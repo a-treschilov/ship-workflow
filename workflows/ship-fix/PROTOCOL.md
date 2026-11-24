@@ -160,6 +160,90 @@ This records a run-wide `setup` phase before contract validation and a passed or
 result. A crash or interruption leaves an open phase; never invent an end. A failed setup blocks preflight and
 implementation. Retrying uses a fresh attempt ID and never overwrites events. `validate-contract` remains a
 read-only validation command for existing runs and does not create setup telemetry.
+
+### Replacing a setup-only run
+
+When a frozen contract cannot represent the approved work, preserve the original run and create a new run with
+`init-run`. Prepare its replacement contract as `RUN_DIR/inputs/replacement-contract.json`, including normal
+`budget_continuity` and `successor_scopes` for all actual lifecycle predecessors. Then invoke:
+
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py replace-setup --contract OLD_CONTRACT --successor-draft NEW_DRAFT --reason REASON --read-policy READ_POLICY_JSON`
+
+The helper publishes the original run's `setup-replacement.json` and the new `contract.json`. Validate the new
+contract with `validate-run` before continuing. A replacement is permitted only when the original run's complete
+available history shows setup activity and no lifecycle state, implementation, review, or budget consumption.
+The original contract and setup telemetry are preserved. Both runs must identify the same repositories and work
+items. A changed seal, conflicting replacement, missing related history, cycle, or inaccessible excluded path
+blocks replacement. Completion of the successor requires the ordinary independent review, gates, and assessment.
+
+Use absolute paths. The replacement draft must be `NEW_RUN/inputs/replacement-contract.json`, with the new
+run's `run_id` and all ordinary contract fields. It must omit `setup_replacement`. Each run must use the same
+workflow, ordered repositories, repository paths, and `budget_work_items`. The old contract must be parseable
+and identify those fields even when validation failed. `replace-setup` writes `setup_replacement` containing
+`contract_path`, `contract_sha256`, `reason`, and `files` mapping every original artifact path to its SHA-256.
+The old run's closure binds that declaration, the work-item and repository maps, the successor run ID and
+the new contract path and SHA-256. Rerun the same command
+after interruption to finish publication. The helper records its publication transaction under the new run's
+`inputs/setup-replacement-transaction.json` and serializes publication against workflow operations on both runs.
+A different draft, reason, or destination is refused.
+
+Supply `--read-policy` as a JSON object with `repo_paths` and `read_excludes`, containing the union of the
+exclusions already known to the orchestrator from both contracts and every predecessor. Supply `{}` when none
+has exclusions.
+The helper applies this bootstrap policy before opening either contract and rejects any omitted contract
+exclusion. The policy argument must itself be complete, because contract contents cannot be read safely to
+discover an exclusion that forbids reading the other contract.
+
+The helper reserves audited predecessor scopes with write-once `successor-reservation.json` records. It
+refuses an open work phase or a repair phase that is not accounted for by lifecycle history. Stop work on
+predecessors before invoking it. The current helpers coordinate their state changes and honor reservations.
+An older installed helper, host file write or external process that does not use this coordination can still
+write concurrently. Stop those processes before choosing a predecessor and preserve their recorded histories.
+
+The helper-generated contract member and closure have the following shape. Every path is absolute and every
+hash is SHA-256 over the file bytes. `files` includes the old `run.json`, contract, setup events and all other
+original files.
+
+```json
+{
+  "setup_replacement": {
+    "contract_path": "/absolute/old-run/contract.json",
+    "contract_sha256": "OLD_CONTRACT_SHA256",
+    "reason": "Reason for replacing the setup",
+    "files": {"/absolute/old-run/run.json": "RUN_METADATA_SHA256"}
+  }
+}
+```
+
+```json
+{
+  "schema_version": 2,
+  "status": "replaced",
+  "run_id": "old-run",
+  "workflow": "fix",
+  "work_items": {"app": "stable-work-item"},
+  "repo_paths": {"app": "/absolute/app"},
+  "replacement": {"contract_path": "/absolute/old-run/contract.json", "contract_sha256": "OLD_CONTRACT_SHA256",
+                  "reason": "Reason for replacing the setup", "files": {"/absolute/old-run/run.json": "RUN_METADATA_SHA256"}},
+  "successor_run_id": "new-run",
+  "successor_contract_path": "/absolute/new-run/contract.json",
+  "successor_contract_sha256": "NEW_CONTRACT_SHA256"
+}
+```
+
+Setup events and their contract seals are retained byte-for-byte. For runs predating setup contract seals, the
+contract hash is first bound by the replacement. The helper rejects non-setup telemetry, lifecycle state files,
+work and budget artifacts, symlinks within the run, and histories that cannot be read under the combined
+`read_excludes`. Both the successor and any subsequent successor must account for all locally identified related
+runs. A closed setup remains unverified. Its digest reports `replaced`; successor digests and completion
+certificates list its reason and sealed artifact paths.
+
+For each started predecessor slice, run `validate-history --contract CONTRACT --repo REPO --slice SLICE` and
+copy its `history_sha256` into the successor's slice continuity record as `source_history_sha256`. Include the
+record and matching successor scope even if repo lifecycle state has not started. A started slice must map to
+one slice in the replacement's approved schedule. If that mapping is ambiguous, resolve it before continuing.
+The history hash covers the contract, ordered slice states and prior slice history. Existing contracts without
+this optional hash continue to use their original validation rules.
 All commands below use actual absolute variables, not literal placeholders.
 
 For policy-enabled repo repairs, `phase-start` validates the current state path/hash, action, author and

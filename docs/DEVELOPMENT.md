@@ -73,6 +73,10 @@ When adding a command, keep output machine-readable, use write-once output paths
 directory where the contract requires that, and add focused tests for refusal paths as well as the happy path.
 Update the protocol and every skill or role that must know the command.
 
+Setup replacement tests must exercise publication recovery, related histories, slice budgets and immutable
+artifact bindings in actual temporary run directories. Keep historical certificates and legacy contracts
+readable when adding new replacement fields.
+
 The canonical invocation is always one standalone command from the project root:
 
 ```text

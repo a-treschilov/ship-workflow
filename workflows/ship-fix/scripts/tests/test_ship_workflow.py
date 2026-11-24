@@ -21,6 +21,468 @@ state = workflow.state
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_replace_setup_preserves_files_and_binds_successor(self):
+        plans = self.root / "plans"
+        old_run = plans / ".fix-runs" / "old"
+        new_run = plans / ".fix-runs" / "new"
+        old_run.mkdir(parents=True)
+        (new_run / "inputs").mkdir(parents=True)
+        old = {**self.c, "run_id": "old", "budget_work_items": {"api": "work-1"}}
+        new = {**old, "run_id": "new"}
+        for run, contract in ((old_run, old), (new_run, new)):
+            (run / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": run.name,
+                                                       "workflow": "fix", "repos": ["api"]}))
+        old_contract = old_run / "contract.json"
+        old_contract.write_text(json.dumps(old))
+        state.validate_run(str(old_contract), "first", workflow)
+        original = {p: p.read_bytes() for p in old_run.rglob("*") if p.is_file()}
+        draft = new_run / "inputs/replacement-contract.json"
+        draft.write_text(json.dumps(new))
+        missing_policy = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "replace-setup",
+                                         "--contract", str(old_contract), "--successor-draft", str(draft),
+                                         "--reason", "Correct the approved scope"], capture_output=True, text=True)
+        self.assertNotEqual(0, missing_policy.returncode)
+        self.assertFalse((old_run / "setup-replacement.json").exists())
+        draft.write_text(json.dumps({**new, "budget_work_items": {"api": "different"}}))
+        with self.assertRaisesRegex(ValueError, "work item mismatch"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope", bootstrap_policy=())
+        self.assertFalse((old_run / "setup-replacement.json").exists())
+        other_repo = self.root / "other-repository"
+        other_repo.mkdir()
+        draft.write_text(json.dumps({**new, "repo_paths": {"api": str(other_repo)}}))
+        with self.assertRaisesRegex(ValueError, "repository mismatch"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope", bootstrap_policy=())
+        self.assertFalse((old_run / "setup-replacement.json").exists())
+        draft.write_text(json.dumps(new))
+        publish = workflow.publish_once
+        def interrupt_temporary(path, payload, value, **kwargs):
+            if path == old_run / "setup-replacement.json":
+                kwargs["temporary_path"].write_bytes(b"partial")
+                raise OSError("interrupted temporary write")
+            publish(path, payload, value, **kwargs)
+        with patch.object(workflow, "publish_once", side_effect=interrupt_temporary):
+            with self.assertRaisesRegex(OSError, "interrupted temporary write"):
+                workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope", bootstrap_policy=())
+        def interrupt_publication(path, payload, value, **kwargs):
+            if path == new_run / "contract.json":
+                raise OSError("interrupted")
+            publish(path, payload, value, **kwargs)
+        with patch.object(workflow, "publish_once", side_effect=interrupt_publication):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope", bootstrap_policy=())
+        self.assertTrue((old_run / "setup-replacement.json").is_file())
+        self.assertFalse((new_run / "contract.json").exists())
+        with self.assertRaisesRegex(ValueError, "Conflicting replacement"):
+            workflow.replace_setup(str(old_contract), str(draft), "Different reason", bootstrap_policy=())
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "replace-setup", "--contract", str(old_contract),
+                                 "--successor-draft", str(draft), "--reason", "Correct the approved scope", "--read-policy", "{}"],
+                                capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        new_contract = new_run / "contract.json"
+        result = workflow.contract(new_contract)
+        self.assertEqual("old", result["_setup_replacements"][0]["run_id"])
+        state.validate_run(str(new_contract), "replacement", workflow)
+        digest = workflow.digest(str(new_contract), "api")
+        self.assertEqual("old", digest["setup_replacements"][0]["run_id"])
+        self.assertEqual("uninitialized", digest["current_status"])
+        self.assertEqual("replaced", workflow.digest(str(old_contract), "api")["current_status"])
+        self.assertEqual(original, {p: p.read_bytes() for p in original})
+        closure = old_run / "setup-replacement.json"
+        closure_bytes = closure.read_bytes()
+        closure.write_bytes(closure_bytes + b" ")
+        with self.assertRaisesRegex(ValueError, "closure mismatch"):
+            workflow.contract(new_contract)
+        closure.write_bytes(closure_bytes)
+        setup_end = old_run / "telemetry/setup-first-end.json"
+        original_end = setup_end.read_bytes()
+        setup_end.write_bytes(original_end + b" ")
+        with self.assertRaisesRegex(ValueError, "setup artifacts changed"):
+            workflow.contract(new_contract)
+        setup_end.write_bytes(original_end)
+        third_run = plans / ".fix-runs/third"
+        (third_run / "inputs").mkdir(parents=True)
+        (third_run / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": "third",
+                                                         "workflow": "fix", "repos": ["api"]}))
+        third_draft = third_run / "inputs/replacement-contract.json"
+        third_draft.write_text(json.dumps({**new, "run_id": "third"}))
+        workflow.replace_setup(str(new_contract), str(third_draft), "Correct it again", bootstrap_policy=())
+        third = workflow.contract(third_run / "contract.json")
+        self.assertEqual(["new", "old"], [item["run_id"] for item in third["_setup_replacements"]])
+        with self.assertRaisesRegex(ValueError, "replacement cycle"):
+            workflow.replacement_chain({**new, "setup_replacement": {
+                "contract_path": str(new_contract), "contract_sha256": "f" * 64, "reason": "cycle", "files": {}}},
+                new_contract)
+        with self.assertRaisesRegex(ValueError, "has been replaced"):
+            workflow.contract(old_contract)
+        with self.assertRaisesRegex(ValueError, "has been replaced"):
+            workflow.mark_work_started(old_contract)
+        self.assertFalse((old_run / "activity-started.json").exists())
+        validation = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "validate-run", "--contract",
+                                     str(old_contract), "--attempt-id", "after-closure"],
+                                    capture_output=True, text=True)
+        self.assertNotEqual(0, validation.returncode)
+        self.assertFalse((old_run / "telemetry/setup-after-closure-start.json").exists())
+        captured = old_run / "late-capture.json"
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "capture", "--repo", str(self.repo),
+                                 "--scope", self.scope, "--out", str(captured)], capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(captured.exists())
+        alias = self.root / "run-alias"
+        alias.symlink_to(old_run, target_is_directory=True)
+        aliased_output = alias / "aliased-capture.json"
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "capture", "--repo", str(self.repo),
+                                 "--scope", self.scope, "--out", str(aliased_output)], capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(aliased_output.exists())
+        contract_alias = self.root / "alias-contract.json"
+        contract_alias.symlink_to(old_contract)
+        with self.assertRaisesRegex(ValueError, "has been replaced"):
+            workflow.mark_work_started(contract_alias, "api")
+        validation = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "validate-run", "--contract",
+                                     str(contract_alias), "--attempt-id", "aliased"], capture_output=True, text=True)
+        self.assertNotEqual(0, validation.returncode)
+        self.assertFalse((old_run / "telemetry/setup-aliased-start.json").exists())
+        old_contract.write_bytes(old_contract.read_bytes() + b" ")
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            workflow.contract(third_run / "contract.json")
+
+    def test_setup_history_rejects_work_and_changed_contract(self):
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.save("contract.json", self.c)
+        self.save("run.json", {"schema_version": 2, "run_id": "run-1", "workflow": "fix", "repos": ["api"]})
+        state.validate_run(self.contract, "first", workflow)
+        self.assertTrue(workflow.setup_history(self.contract, self.c))
+        restricted = {**self.c, "read_excludes": {"api": ["private"]}}
+        self.assertTrue(workflow.setup_history(self.contract, restricted))
+        for name in ("api/state-1.json", "api/slices/s1/state-1.json", "activity-started.json",
+                     "budget-grants/grant.json", "reviews/round.json"):
+            forbidden = self.run / name
+            forbidden.parent.mkdir(parents=True, exist_ok=True)
+            forbidden.write_text("{}")
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "lifecycle or work"):
+                workflow.setup_history(self.contract, self.c)
+            forbidden.unlink()
+            if forbidden.parent.name in {"budget-grants", "reviews"}:
+                forbidden.parent.rmdir()
+        event = self.run / "telemetry/review-start.json"
+        event.write_text(json.dumps({"schema_version": 2, "run_id": "run-1", "workflow": "fix",
+                                     "phase": "review", "event": "phase-start"}))
+        with self.assertRaisesRegex(ValueError, "Non-setup telemetry"):
+            workflow.setup_history(self.contract, self.c)
+        event.unlink()
+        historic = self.run / "historical-state.json"
+        historic.write_text(json.dumps({"schema_version": 2, "run_id": "run-1", "repo": "api",
+                                        "status": "initialized"}))
+        with self.assertRaisesRegex(ValueError, "work event"):
+            workflow.setup_history(self.contract, self.c)
+        historic.unlink()
+        Path(self.contract).write_text(json.dumps(self.c) + " ")
+        with self.assertRaisesRegex(ValueError, "Setup contract seal mismatch"):
+            workflow.setup_history(self.contract, self.c)
+
+    def test_setup_history_refuses_excluded_run_before_walking(self):
+        run = self.repo / "private/run"
+        run.mkdir(parents=True)
+        contract = run / "contract.json"
+        contract.write_text("{}")
+        value = {"repo_paths": {"api": str(self.repo)}, "read_excludes": {"api": ["private"]}}
+        with patch.object(os, "walk", side_effect=AssertionError("excluded run was listed")):
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                workflow.setup_history(contract, value)
+
+    def test_setup_history_never_walks_swapped_excluded_directory(self):
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.c["read_excludes"] = {"api": ["private"]}
+        self.save("contract.json", self.c)
+        self.save("run.json", {"schema_version": 2, "run_id": "run-1", "workflow": "fix", "repos": ["api"]})
+        state.validate_run(self.contract, "first", workflow)
+        private = self.repo / "private"
+        private.mkdir()
+        (private / "protected.txt").write_text("secret")
+        allowed = self.run / "safe"
+        allowed.mkdir()
+        (allowed / "input.txt").write_text("allowed")
+        original_open = os.open
+        swapped = False
+
+        def swap(name, flags, *args, **kwargs):
+            nonlocal swapped
+            if name == "safe" and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                allowed.rename(self.run / "moved")
+                allowed.symlink_to(private, target_is_directory=True)
+            return original_open(name, flags, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=swap):
+            with self.assertRaises((ValueError, OSError)):
+                workflow.setup_history(self.contract, self.c)
+        self.assertTrue(swapped)
+
+    def test_failed_setup_can_be_replaced_without_rewriting_telemetry(self):
+        plans = self.root / "plans/.fix-runs"
+        old_run, new_run = plans / "bad", plans / "good"
+        old_run.mkdir(parents=True)
+        (new_run / "inputs").mkdir(parents=True)
+        old = {**self.c, "run_id": "bad", "budget_work_items": {"api": "work-1"}, "criteria": [],
+               "read_excludes": {"api": ["private"]}}
+        new = {**self.c, "run_id": "good", "budget_work_items": {"api": "work-1"},
+               "read_excludes": {"api": ["private"]}}
+        for run in (old_run, new_run):
+            (run / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": run.name,
+                                                       "workflow": "fix", "repos": ["api"]}))
+        old_contract = old_run / "contract.json"
+        old_contract.write_text(json.dumps(old))
+        with self.assertRaises(ValueError):
+            state.validate_run(str(old_contract), "first", workflow)
+        originals = {p: p.read_bytes() for p in old_run.rglob("*") if p.is_file()}
+        draft = new_run / "inputs/replacement-contract.json"
+        draft.write_text(json.dumps(new))
+        with self.assertRaisesRegex(ValueError, "Bootstrap read policy omits"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct invalid criteria", bootstrap_policy=())
+        workflow.replace_setup(str(old_contract), str(draft), "Correct invalid criteria",
+                               bootstrap_policy=((str(self.repo), ("private",)),))
+        state.validate_run(str(new_run / "contract.json"), "new", workflow)
+        self.assertEqual(originals, {p: p.read_bytes() for p in originals})
+
+    def test_failed_setup_preserves_malformed_declared_slice_schedule(self):
+        group = self.root / "plans/.fix-runs"
+        old, new = group / "old", group / "new"
+        old.mkdir(parents=True)
+        (new / "inputs").mkdir(parents=True)
+        for run in (old, new):
+            (run / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": run.name,
+                                                       "workflow": "fix", "repos": ["api"]}))
+        schedule = old / "slices-approved.json"
+        schedule.write_text("{")
+        base = {**self.c, "budget_work_items": {"api": "work-1"}}
+        old_contract = old / "contract.json"
+        old_contract.write_text(json.dumps({**base, "run_id": "old", "slice_schedules": {
+            "api": {"path": str(schedule), "sha256": workflow.sha(schedule)}}}))
+        with self.assertRaises(json.JSONDecodeError):
+            state.validate_run(str(old_contract), "first", workflow)
+        draft = new / "inputs/replacement-contract.json"
+        draft.write_text(json.dumps({**base, "run_id": "new"}))
+        workflow.replace_setup(str(old_contract), str(draft), "Correct slice schedule", bootstrap_policy=())
+        self.assertEqual(b"{", schedule.read_bytes())
+        workflow.contract(new / "contract.json")
+
+    def test_concurrent_replacements_have_one_winner(self):
+        group = self.root / "plans/.fix-runs"
+        old = group / "old"
+        old.mkdir(parents=True)
+        metadata = {"schema_version": 2, "workflow": "fix", "repos": ["api"]}
+        (old / "run.json").write_text(json.dumps({**metadata, "run_id": "old"}))
+        old_contract = old / "contract.json"
+        original = {**self.c, "run_id": "old", "budget_work_items": {"api": "work-1"}}
+        old_contract.write_text(json.dumps(original))
+        state.validate_run(str(old_contract), "first", workflow)
+        processes = []
+        for identifier in ("one", "two"):
+            run = group / identifier
+            (run / "inputs").mkdir(parents=True)
+            (run / "run.json").write_text(json.dumps({**metadata, "run_id": identifier}))
+            draft = run / "inputs/replacement-contract.json"
+            draft.write_text(json.dumps({**original, "run_id": identifier}))
+            processes.append(subprocess.Popen(["python3", "-I", "-B", str(SCRIPT), "replace-setup",
+                                              "--contract", str(old_contract), "--successor-draft", str(draft),
+                                              "--reason", "Correct scope", "--read-policy", "{}"], stdout=subprocess.PIPE,
+                                             stderr=subprocess.PIPE, text=True))
+        results = [process.communicate(timeout=30) for process in processes]
+        self.assertEqual([0, 1], sorted(process.returncode for process in processes), results)
+        winners = [group / name / "contract.json" for name in ("one", "two") if (group / name / "contract.json").exists()]
+        self.assertEqual(1, len(winners))
+        workflow.contract(winners[0])
+
+    def test_predecessor_repair_telemetry_requires_charged_state(self):
+        group = self.root / "plans/.fix-runs"
+        self.new_budget_run("actual", run_group=group)
+        self.ready()
+        source = self.contract
+        start = self.run / "telemetry/repair-start.json"
+        end = self.run / "telemetry/repair-end.json"
+        workflow.phase_from_flags(source, str(start), phase_id="repair", phase="review-fix", event="phase-start",
+                                  repo="api", at="2025-01-01T00:00:00Z")
+        self.new_budget_run("new", predecessor=source, run_group=group)
+        self.c["budget_work_items"] = {"api": "work-1"}
+        with self.assertRaisesRegex(ValueError, "open work phase"):
+            workflow.reserve_predecessors(self.c, Path(self.contract), "a" * 64, self.c)
+        workflow.phase_from_flags(source, str(end), phase_id="repair", phase="review-fix", event="phase-end",
+                                  repo="api", status="passed", at="2025-01-01T00:01:00Z")
+        with self.assertRaisesRegex(ValueError, "repair phase is missing"):
+            workflow.reserve_predecessors(self.c, Path(self.contract), "a" * 64, self.c)
+        self.assertFalse((Path(source).parent / "api/successor-reservation.json").exists())
+
+    def test_generic_capture_refuses_reserved_legacy_run(self):
+        reservation = self.run / "api/successor-reservation.json"
+        reservation.write_text("{}")
+        output = self.run / "unexpected.json"
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "capture", "--repo", str(self.repo),
+                                 "--scope", self.scope, "--out", str(output)], capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("reserved for a successor", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_replacement_applies_bootstrap_exclusions_before_reading_contracts(self):
+        group = self.root / "plans/.fix-runs"
+        old, new = group / "old", group / "new"
+        old.mkdir(parents=True)
+        (new / "inputs").mkdir(parents=True)
+        contract = old / "contract.json"
+        draft = new / "inputs/replacement-contract.json"
+        contract.write_text("{}")
+        draft.write_text("{}")
+        for protected in (contract, draft):
+            relative = protected.relative_to(self.root).as_posix()
+            with self.subTest(protected=protected):
+                with patch.object(workflow.state, "load", side_effect=AssertionError("excluded file was read")):
+                    with self.assertRaisesRegex(ValueError, "read_excludes"):
+                        workflow.replace_setup(str(contract), str(draft), "correct scope",
+                                               bootstrap_policy=((str(self.root), (relative,)),))
+
+    def test_replace_setup_keeps_predecessor_gate_budget(self):
+        group = self.root / "plans/.fix-runs"
+        self.new_budget_run("actual", run_group=group)
+        self.ready()
+        self.implement()
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Warning", "status": "new",
+                   "category": "Logic", "description": "wrong output", "recommendation": "fix result",
+                   "failure_scenario": "null returns wrong result", "verification_expectation": "assert null output",
+                   "criterion_ids": ["fix.ac-1"], "verification_kind": "empirical"}
+        self.move("needs-fix", review_path=self.review([finding]))
+        self.source.write_text("review repair\n")
+        proof = self.evidence("fix.ac-1")
+        proof_record = state.load(proof)
+        proof_record["claims"] = [{"id": "api-1", "assertion": "observable fix verified"}]
+        self.save(Path(proof).name, proof_record)
+        applied = self.save("round-1-applied.json", self.artifact(round=1, applied=[{
+            "id": "api-1", "verified": "observable result checked", "verification_kind": "empirical",
+            "evidence_paths": [proof]}], failed=[], skipped=[]))
+        self.move("edited-unverified", action="review-fix", applied_path=applied)
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        disposition = [{"id": "api-1", "status": "resolved", "reason": "fix checked", "evidence_paths": [proof]}]
+        self.move("reviewed", review_path=self.review(dispositions=disposition))
+        failed = self.evidence("gate.tests", status="failed")
+        self.source.write_text("gate repair\n")
+        self.move("edited-unverified", action="gate-fix", gate_failure_path=failed)
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        actual = self.contract
+        audit = workflow.validate_history(actual, "api")
+        self.assertEqual(1, audit["gate_fix_budget"]["current_used_attempts"])
+        phase_start = self.run / "telemetry/legacy-review-start.json"
+        phase_end = self.run / "telemetry/legacy-review-end.json"
+        workflow.phase_from_flags(actual, str(phase_start), phase_id="legacy-review", phase="review", event="phase-start",
+                                  repo="api", at="2025-01-01T00:00:00Z")
+        workflow.phase_from_flags(actual, str(phase_end), phase_id="legacy-review", phase="review", event="phase-end",
+                                  repo="api", status="passed", at="2025-01-01T00:01:00Z")
+        self.new_budget_run("setup", predecessor=actual, run_group=group)
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.c["budget_continuity"][0]["used_passes"] = 2
+        self.save("contract.json", self.c)
+        self.save("run.json", {"schema_version": 2, "run_id": "setup", "workflow": "fix", "repos": ["api"]})
+        setup = self.contract
+        state.validate_run(setup, "setup", workflow)
+        self.new_budget_run("replacement", predecessor=actual, run_group=group)
+        self.c["budget_continuity"][0]["used_passes"] = 1
+        self.save("run.json", {"schema_version": 2, "run_id": "replacement", "workflow": "fix", "repos": ["api"]})
+        self.c["telemetry_policy"] = {"repair_phase_required": True, "run_local_seals": True}
+        draft = self.save("inputs/replacement-contract.json", self.c)
+        Path(self.contract).unlink()
+        missing = copy.deepcopy(self.c)
+        missing.pop("budget_continuity")
+        missing.pop("successor_scopes")
+        Path(draft).write_text(json.dumps(missing))
+        with self.assertRaisesRegex(ValueError, "predecessor is missing"):
+            workflow.replace_setup(setup, draft, "Correct extraction", bootstrap_policy=())
+        Path(draft).write_text(json.dumps(self.c))
+        with self.assertRaisesRegex(ValueError, "cannot reduce carried budget"):
+            workflow.replace_setup(setup, draft, "Correct extraction", bootstrap_policy=())
+        self.c["budget_continuity"][0]["used_passes"] = 2
+        Path(draft).write_text(json.dumps(self.c))
+        workflow.replace_setup(setup, draft, "Correct extraction", bootstrap_policy=())
+        reservation = Path(actual).parent / "api/successor-reservation.json"
+        self.assertTrue(reservation.is_file())
+        with self.assertRaisesRegex(ValueError, "reserved for a successor"):
+            workflow.mark_work_started(actual, "api")
+        reserved_bytes = reservation.read_bytes()
+        reservation.unlink()
+        with self.assertRaisesRegex(ValueError, "reservation is missing"):
+            workflow.contract(self.contract)
+        reservation.write_bytes(reserved_bytes)
+        end_before = phase_end.read_bytes()
+        phase_end.write_bytes(end_before + b" ")
+        with self.assertRaisesRegex(ValueError, "already reserved|reservation mismatch"):
+            workflow.contract(self.contract)
+        phase_end.write_bytes(end_before)
+        value = workflow.contract(self.contract)
+        lineage = workflow.GateFixLineage(value, "api")
+        workflow.budget_continuity(value, "api", self.contract, gate_lineage=lineage)
+        self.assertEqual(1, lineage.summary(0)["historical_used_attempts"])
+        self.assertEqual(audit["history_sha256"], self.c["budget_continuity"][0]["source_history_sha256"])
+        self.ready()
+        setup_closure = Path(setup).parent / "setup-replacement.json"
+        closure_before = setup_closure.read_bytes()
+        setup_closure.write_bytes(closure_before + b" ")
+        with self.assertRaisesRegex(ValueError, "closure mismatch"):
+            workflow.validate_history(self.contract, "api")
+        setup_closure.write_bytes(closure_before)
+        self.implement()
+        self.verify()
+        completion = self.run / "completion.json"
+        workflow.complete(self.contract, str(completion))
+        certificate = state.load(completion)
+        self.assertEqual("setup", certificate["setup_replacements"][0]["run_id"])
+        self.assertEqual(1, certificate["repos"]["api"]["gate_fix_budget"]["historical_used_attempts"])
+        self.assertEqual(2, certificate["repos"]["api"]["review_budget"]["historical_used_passes"])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        replacement = self.contract
+        self.new_budget_run("later", predecessor=replacement, run_group=group)
+        self.c["budget_continuity"][0]["used_passes"] = 2
+        self.save("contract.json", self.c)
+        summary = workflow.digest(self.contract, "api")
+        self.assertEqual("ok", summary["status"], summary.get("errors"))
+        self.assertEqual("setup", summary["setup_replacements"][0]["run_id"])
+        self.ready()
+        self.implement()
+        self.verify()
+        workflow.complete(self.contract, str(self.run / "completion.json"))
+        later = state.load(self.run / "completion.json")
+        self.assertEqual("setup", later["setup_replacements"][0]["run_id"])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        completion_path = self.run / "completion.json"
+        original_certificate = completion_path.read_bytes()
+        altered = dict(later)
+        altered.pop("setup_replacements")
+        completion_path.write_text(json.dumps(altered))
+        with self.assertRaisesRegex(ValueError, "Completion replacement chain mismatch"):
+            workflow.validate_history(self.contract, "api")
+        completion_path.write_bytes(original_certificate)
+        later_contract = self.contract
+        self.new_budget_run("setup-again", predecessor=later_contract, run_group=group)
+        self.c["budget_continuity"][0]["used_passes"] = 2
+        self.save("contract.json", self.c)
+        self.save("run.json", {"schema_version": 2, "run_id": "setup-again", "workflow": "fix", "repos": ["api"]})
+        setup_again = self.contract
+        state.validate_run(setup_again, "first", workflow)
+        self.new_budget_run("replacement-again", predecessor=later_contract, run_group=group)
+        self.c["budget_continuity"][0]["used_passes"] = 2
+        self.save("run.json", {"schema_version": 2, "run_id": "replacement-again", "workflow": "fix", "repos": ["api"]})
+        draft_again = self.save("inputs/replacement-contract.json", self.c)
+        Path(self.contract).unlink()
+        workflow.replace_setup(setup_again, draft_again, "Correct scope again", bootstrap_policy=())
+        value = workflow.contract(self.contract)
+        self.assertEqual("setup-again", value["_setup_replacements"][0]["run_id"])
+        state.validate_run(self.contract, "first", workflow)
+        third_run = group / "replacement-third"
+        (third_run / "inputs").mkdir(parents=True)
+        (third_run / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": "replacement-third",
+                                                         "workflow": "fix", "repos": ["api"]}))
+        third_draft = third_run / "inputs/replacement-contract.json"
+        third_draft.write_text(json.dumps({**self.c, "run_id": "replacement-third"}))
+        workflow.replace_setup(self.contract, str(third_draft), "Correct scope once more", bootstrap_policy=())
+        third = workflow.contract(third_run / "contract.json")
+        self.assertEqual(["replacement-again", "setup-again"],
+                         [entry["run_id"] for entry in third["_setup_replacements"]])
+
     def test_ship_contract_with_exclusions_and_deliverables_keeps_contract_path(self):
         plan = self.root / 'plan.md'
         plan.write_text('approved requirement')
@@ -151,6 +613,25 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires matching budget continuity"):
             workflow.contract(self.contract)
 
+    def test_slice_history_digest_changes_when_an_earlier_state_changes(self):
+        prior = self.root / "prior-slice"
+        directory = prior / "api/slices/s1"
+        directory.mkdir(parents=True)
+        source = prior / "contract.json"
+        source.write_text(json.dumps({"schema_version": 2, "workflow": "fix", "run_id": prior.name,
+                                      "repos": ["api"], "repo_paths": {"api": str(self.repo)}}))
+        base = {"schema_version": 2, "run_id": prior.name, "repo": "api", "slice_id": "s1",
+                "review_fix_count": 0, "artifact_hashes": {str(source): workflow.sha(source)}}
+        first = directory / "state-1.json"
+        first.write_text(json.dumps({**base, "status": "implemented", "note": "original"}))
+        latest = directory / "state-2.json"
+        latest.write_text(json.dumps({**base, "status": "pre-review-passed"}))
+        before = workflow.audit_slice_history(source, "api", "s1")
+        first.write_text(json.dumps({**base, "status": "implemented", "note": "changed"}))
+        after = workflow.audit_slice_history(source, "api", "s1")
+        self.assertEqual(before["state_sha256"], after["state_sha256"])
+        self.assertNotEqual(before["history_sha256"], after["history_sha256"])
+
     def test_budget_continuity_preserves_human_decision_and_rejects_changed_source(self):
         prior = self.root / "prior-run"
         prior.mkdir()
@@ -176,6 +657,17 @@ class LifecycleTests(unittest.TestCase):
         self.c["successor_scopes"] = [{"repo": "api", "slice_id": "s2", "work_item": "work-1"}]
         self.save("contract.json", self.c)
         workflow.contract(self.contract)
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "validate-history",
+                                 "--contract", str(contract), "--repo", "api", "--slice", "s2"],
+                                capture_output=True, text=True, check=True)
+        audit = json.JSONDecoder().raw_decode(result.stdout)[0]
+        self.assertEqual((str(source), 0), (audit["state_path"], audit["review_fix_count"]))
+        item["source_history_sha256"] = audit["history_sha256"]
+        workflow.budget_continuity(self.c, "api", self.contract, "s2")
+        item["source_history_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "Slice history SHA-256 mismatch"):
+            workflow.budget_continuity(self.c, "api", self.contract, "s2")
+        item["source_history_sha256"] = audit["history_sha256"]
         self.assertEqual(2, item["effective_limit"] - workflow.budget_continuity(
             self.c, "api", self.contract, "s2")["used_passes"])
         original = source.read_bytes()
@@ -2641,6 +3133,95 @@ class SliceLifecycleTests(unittest.TestCase):
         workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo,
                             self.cap(["a.txt", "b.txt"]), str(out))
         return str(out)
+
+    def test_replacement_carries_slice_started_before_repo_state(self):
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.save("contract.json", self.c)
+        self.accept("a", "a.txt")
+        touched = ["a.txt"]
+        self.move_slice("a", "edited-unverified", touched, action="integration-fix", author_agent_id="author-a")
+        self.move_slice("a", "pre-review-passed", touched,
+                        pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(touched))])
+        finding = {"id": "api-1", "file": "a.txt", "line": 1, "severity": "Warning", "status": "new",
+                   "category": "Logic", "description": "wrong", "recommendation": "fix",
+                   "failure_scenario": "x", "verification_expectation": "assert", "criterion_ids": [],
+                   "verification_kind": "static"}
+        self.move_slice("a", "needs-fix", touched, review_path=self.slice_review("a", touched, 2, [finding]))
+        applied = self.save("slice-fix-applied.json", self.artifact(round=2, applied=[],
+                            failed=[{"id": "api-1", "reason": "pending"}], skipped=[]))
+        self.move_slice("a", "edited-unverified", touched, action="review-fix", applied_path=applied)
+        self.assertFalse(workflow.history(self.run / "api"))
+        actual = self.contract
+        audited = workflow.audit_slice_history(actual, "api", "a")
+        group = self.run.parent
+        setup, successor = group / "setup", group / "successor"
+        setup.mkdir()
+        (successor / "inputs").mkdir(parents=True)
+        for run in (setup, successor):
+            (run / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": run.name,
+                                                       "workflow": "fix", "repos": ["api"]}))
+        old = {**self.c, "run_id": "setup"}
+        old.pop("slice_schedules")
+        old_contract = setup / "contract.json"
+        old_contract.write_text(json.dumps(old))
+        with self.assertRaisesRegex(ValueError, "missing from budget continuity"):
+            state.validate_run(str(old_contract), "first", workflow)
+        schedule = state.load(self.schedule)
+        schedule["run_id"] = "successor"
+        schedule_path = successor / "slices-approved.json"
+        schedule_path.write_text(json.dumps(schedule))
+        decision = successor / "inputs/decision.json"
+        decision.write_text(json.dumps({"decision": "continue"}))
+        item = {"repo": "api", "slice_id": "a", "source_slice_id": "a", "work_item": "work-1",
+                "approved_by": "user", "user_authorization": "continue", "reason": "same work",
+                "approved_at": "2026-01-01T00:00:00Z", "used_passes": 1, "effective_limit": 3,
+                "source_contract_path": actual, "source_contract_sha256": workflow.sha(actual),
+                "source_state_path": audited["state_path"], "source_state_sha256": audited["state_sha256"],
+                "source_history_sha256": audited["history_sha256"], "decision_path": str(decision),
+                "decision_sha256": workflow.sha(decision)}
+        new = {**old, "run_id": "successor", "budget_continuity": [item],
+               "successor_scopes": [{"repo": "api", "slice_id": "a", "work_item": "work-1"}],
+               "slice_schedules": {"api": {"path": str(schedule_path), "sha256": workflow.sha(schedule_path)}}}
+        draft = successor / "inputs/replacement-contract.json"
+        draft.write_text(json.dumps({**new, "budget_continuity": [], "successor_scopes": []}))
+        with self.assertRaisesRegex(ValueError, "missing from budget continuity"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the scope", bootstrap_policy=())
+        self.assertFalse((setup / "setup-replacement.json").exists())
+        draft.write_text(json.dumps(new))
+        workflow.replace_setup(str(old_contract), str(draft), "Correct the scope", bootstrap_policy=())
+        value = workflow.contract(successor / "contract.json")
+        self.assertEqual(item, workflow.budget_continuity(value, "api", successor / "contract.json", "a"))
+        self.run = successor
+        self.contract = str(successor / "contract.json")
+        self.c = state.load(self.contract)
+        self.schedule = str(schedule_path)
+        self.base = successor / "api/baselines"
+        state.baseline(self.repo, self.base, "a.txt")
+        self.bases = {"a": self.cap(["a.txt"], "next-base.json")}
+        self.accept("a", "a.txt")
+        next_audit = workflow.audit_slice_history(self.contract, "api", "a", strict=True)
+        next_run = group / "next"
+        next_run.mkdir()
+        next_schedule = dict(schedule, run_id="next")
+        next_schedule_path = next_run / "slices-approved.json"
+        next_schedule_path.write_text(json.dumps(next_schedule))
+        next_decision = next_run / "decision.json"
+        next_decision.write_text(json.dumps({"decision": "continue"}))
+        next_item = {**item, "source_contract_path": self.contract, "source_contract_sha256": workflow.sha(self.contract),
+                     "source_state_path": next_audit["state_path"], "source_state_sha256": next_audit["state_sha256"],
+                     "source_history_sha256": next_audit["history_sha256"], "decision_path": str(next_decision),
+                     "decision_sha256": workflow.sha(next_decision)}
+        next_contract = {**new, "run_id": "next", "budget_continuity": [next_item],
+                         "slice_schedules": {"api": {"path": str(next_schedule_path), "sha256": workflow.sha(next_schedule_path)}}}
+        next_path = next_run / "contract.json"
+        next_path.write_text(json.dumps(next_contract))
+        workflow.contract(next_path)
+        reservation = Path(actual).parent / "api/successor-reservation.json"
+        reservation.unlink()
+        with self.assertRaisesRegex(ValueError, "reservation is missing"):
+            workflow.audit_slice_history(self.contract, "api", "a", strict=True)
+        with self.assertRaisesRegex(ValueError, "reservation is missing"):
+            workflow.contract(next_path)
 
     def reviewed_artifact(self, path, manifest_path):
         record = state.load(path)

@@ -1,11 +1,17 @@
 """Versioned workflow validation; never executes checks or launches agents."""
 
 from datetime import datetime, timezone
+import copy
+from contextlib import contextmanager, ExitStack
+import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
+import stat
 
 import importlib.util
 
@@ -87,12 +93,746 @@ def guard_path(path, value, *, scope=False):
     return Path(path)
 
 
+def guarded_resolve(path, value):
+    require(isinstance(path, (str, Path)) and Path(path).is_absolute(), "Expected absolute path")
+    policies = read_policy(value)
+    resolved = state.guard_excluded_paths(Path(path).absolute(), policies, pinned=bool(policies))
+    return resolved if policies else resolved.resolve()
+
+
+def require_writable_run(path, contract_path, value):
+    path = Path(path).absolute()
+    policies = read_policy(value)
+    state.guard_excluded_paths(path, policies, pinned=bool(policies))
+    output_run = state.output_run_root(path, policies)
+    require(output_run is None or output_run == guarded_resolve(contract_path, value).parent,
+            "Writable path cannot be inside a different run")
+
+
+def guarded_entries(directory, value):
+    """List names and types through a pinned descriptor after applying the read policy."""
+    directory = Path(directory).absolute()
+    policies = read_policy(value)
+    guarded = state.guard_excluded_paths(directory, policies, pinned=bool(policies))
+    if not policies:
+        guarded = guarded.resolve()
+    try:
+        with state.open_directory(guarded) as fd:
+            with os.scandir(fd) as entries:
+                names = sorted(entry.name for entry in entries)
+            result = []
+            for name in names:
+                state.guard_excluded_paths(directory / name, policies, pinned=bool(policies))
+                result.append((name, os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode))
+            return result
+    except FileNotFoundError:
+        return []
+
+
+def guarded_names(directory, value):
+    return [name for name, _ in guarded_entries(directory, value)]
+
+
+def guarded_history(directory, value):
+    directory = Path(directory).absolute()
+    events = []
+    for name in guarded_names(directory, value):
+        match = re.fullmatch(r"state-(\d+)\.json", name)
+        if match:
+            path = directory / name
+            policies = read_policy(value)
+            guarded = state.guard_excluded_paths(path, policies, pinned=bool(policies))
+            if not policies:
+                guarded = guarded.resolve()
+            with state.capture_open(guarded) as handle:
+                record = json.load(handle)
+            require(isinstance(record, dict), "Malformed lifecycle event")
+            events.append((int(match[1]), path, record))
+    events.sort()
+    require([event[0] for event in events] == list(range(1, len(events) + 1)), "Broken lifecycle event sequence")
+    return events
+
+
+def guarded_sha(path, value):
+    policies = read_policy(value)
+    if not policies:
+        return sha(path)
+    guarded = state.guard_excluded_paths(Path(path).absolute(), policies, pinned=True)
+    with state.capture_open(guarded) as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def guarded_load(path, value):
+    policies = read_policy(value)
+    if not policies:
+        return state.load(path)
+    guarded = state.guard_excluded_paths(Path(path).absolute(), policies, pinned=True)
+    with state.capture_open(guarded) as handle:
+        return json.load(handle)
+
+
+def guarded_bytes(path, value):
+    policies = read_policy(value)
+    if not policies:
+        return Path(path).read_bytes()
+    guarded = state.guard_excluded_paths(Path(path).absolute(), policies, pinned=True)
+    return state.capture_bytes(guarded)
+
+
+def guarded_exists(path, value):
+    path = Path(path).absolute()
+    policies = read_policy(value)
+    if not policies:
+        require(not path.is_symlink(), f"Artifact cannot be a symlink: {path}")
+        return path.exists()
+    state.guard_excluded_paths(path, policies, pinned=True)
+    parent = state.guard_excluded_paths(path.parent, policies, pinned=True)
+    try:
+        with state.open_directory(parent) as fd:
+            info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+            require(not stat.S_ISLNK(info.st_mode), f"Artifact cannot be a symlink: {path}")
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def setup_history(contract_path, value, *, closed=False, require_telemetry=True, transaction_temp=None):
+    """Inspect all run artifacts before permitting a setup-only replacement."""
+    root = Path(contract_path).parent
+    policies = read_policy(value)
+    pinned = bool(policies)
+    state.guard_excluded_paths(root.absolute(), policies, pinned=pinned)
+    files, telemetry, seals = {}, {}, []
+    prohibited = {"evidence", "reviews", "review", "rounds", "batches", "budget-grants", "activity-started.json",
+                  "completion.json"}
+    def scan(directory_fd, directory):
+        before = os.fstat(directory_fd)
+        with os.scandir(directory_fd) as entries:
+            names = sorted(entry.name for entry in entries)
+        for name in names:
+            path = directory / name
+            state.guard_excluded_paths(path.absolute(), policies, pinned=pinned)
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            require(not stat.S_ISLNK(info.st_mode), f"Setup history contains a symlink: {path}")
+            relative = path.relative_to(root)
+            if closed and relative == Path("setup-replacement.json"):
+                continue
+            if transaction_temp is not None and path == transaction_temp:
+                require(stat.S_ISREG(info.st_mode), "Invalid replacement transaction temporary file")
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    require(os.path.samestat(info, os.fstat(child)), "Setup directory changed during inspection")
+                    scan(child, path)
+                finally:
+                    os.close(child)
+                continue
+            require(relative != Path("setup-replacement.json") and not any(part in prohibited for part in relative.parts)
+                    and not re.fullmatch(r"state-\d+\.json", name),
+                    f"Run contains lifecycle or work artifacts: {path}")
+            require(stat.S_ISREG(info.st_mode), f"Unexpected setup artifact: {path}")
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            with os.fdopen(fd, "rb") as handle:
+                opened = os.fstat(handle.fileno())
+                require(os.path.samestat(info, opened) and stat.S_ISREG(opened.st_mode),
+                        "Setup artifact changed during inspection")
+                content = handle.read() if path.suffix == ".json" else None
+                digest = hashlib.sha256(content).hexdigest() if content is not None else hashlib.file_digest(handle, "sha256").hexdigest()
+                after = os.fstat(handle.fileno())
+                require((opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                        == (after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                        "Setup artifact changed during inspection")
+            files[str(path)] = digest
+            if relative.parts[0] == "telemetry":
+                require(len(relative.parts) == 2 and path.suffix == ".json", "Invalid setup telemetry path")
+                event = json.loads(content)
+                require(isinstance(event, dict) and event.get("schema_version") == VERSION
+                        and event.get("run_id") == value["run_id"] and event.get("workflow") == value["workflow"]
+                        and event.get("repo") is None and event.get("phase") == "setup"
+                        and event.get("event") in {"phase-start", "phase-end"}, "Non-setup telemetry exists")
+                identifier = event.get("phase_id")
+                require(isinstance(identifier, str) and re.fullmatch(r"setup-[A-Za-z0-9_.-]+", identifier),
+                        "Invalid setup phase identifier")
+                suffix = "start" if event["event"] == "phase-start" else "end"
+                require(path.name == f"{identifier}-{suffix}.json", "Invalid setup telemetry filename")
+                telemetry.setdefault(identifier, {})[suffix] = (path, event)
+            elif path.suffix == ".json" and relative not in {Path("run.json"), Path("contract.json")}:
+                try:
+                    record = json.loads(content)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    schedules = value.get("slice_schedules", {})
+                    declared = [item.get("path") for item in schedules.values() if isinstance(item, dict)] if isinstance(schedules, dict) else []
+                    require(relative.parts[0] != "setup-seals" and str(path) in declared,
+                            f"Cannot inspect malformed setup artifact: {path}")
+                    lifecycle_states = (set(TRANSITIONS) - {None}) | TERMINAL | {"accepted", "reviewed-with-findings"}
+                    status_pattern = rb'"status"\s*:\s*"(' + b"|".join(
+                        re.escape(status.encode()) for status in sorted(lifecycle_states)) + rb')"'
+                    require(re.search(status_pattern, content) is None,
+                            f"Malformed setup artifact contains a work event: {path}")
+                    continue
+                if relative.parts[0] == "setup-seals":
+                    require(len(relative.parts) == 2, "Invalid setup seal path")
+                    seals.append((path, record))
+                pending = [record]
+                while pending:
+                    item = pending.pop()
+                    if isinstance(item, list):
+                        pending.extend(item)
+                    elif isinstance(item, dict):
+                        is_event = item.get("run_id") == value["run_id"] or "event" in item
+                        if is_event:
+                            require(not ({"review_fix_count", "gate_fix_count", "budget_grant_applied", "original_agent_id",
+                                          "author_agent_id", "review_path", "gate_evidence_paths", "gate_fix_budget",
+                                          "review_budget"} & item.keys()),
+                                    f"Run contains work or budget evidence: {path}")
+                            status = item.get("status")
+                            require(item.get("phase", "setup") == "setup"
+                                    and (not isinstance(status, str) or status not in
+                                         (set(TRANSITIONS) | TERMINAL | {"accepted", "reviewed-with-findings"})),
+                                    f"Run contains a work event: {path}")
+                        pending.extend(item.values())
+        after = os.fstat(directory_fd)
+        require((before.st_mtime_ns, before.st_ctime_ns) == (after.st_mtime_ns, after.st_ctime_ns),
+                "Setup directory changed during inspection")
+
+    guarded_root = guarded_resolve(root.absolute(), value)
+    with state.open_directory(guarded_root) as root_fd:
+        scan(root_fd, root)
+    require(telemetry or not require_telemetry, "Run has no setup telemetry")
+    for pair in telemetry.values():
+        require("start" in pair, "Setup telemetry is missing its start")
+        if "end" in pair:
+            start, end = pair["start"], pair["end"]
+            require(end[1].get("start_sha256") == files[str(start[0])]
+                    and end[1].get("status") in {"passed", "failed"}
+                    and all(start[1].get(key) == end[1].get(key) for key in
+                            ("run_id", "workflow", "repo", "phase", "phase_id", "session_id"))
+                    and timestamp(start[1].get("at")) <= timestamp(end[1].get("at")), "Invalid setup telemetry end")
+    for path, seal in seals:
+        require(isinstance(seal, dict) and seal.get("schema_version") == VERSION
+                and seal.get("run_id") == value["run_id"] and seal.get("phase_id") in telemetry
+                and path.name == seal["phase_id"] + ".json"
+                and seal.get("contract_sha256") == files.get(str(contract_path)), "Setup contract seal mismatch")
+    return dict(sorted(files.items()))
+
+
+def replacement_chain(value, contract_path, *, pending=None):
+    """Verify the immutable links back through replaced setup runs."""
+    records, seen = [], {guarded_resolve(contract_path, value)}
+    current, current_path = value, Path(contract_path).absolute()
+    policy = read_policy(value)
+    while current.get("setup_replacement") is not None:
+        link = current["setup_replacement"]
+        require(isinstance(link, dict) and set(link) == {"contract_path", "contract_sha256", "reason", "files"},
+                "Invalid setup replacement declaration")
+        state.text(link["reason"], "setup replacement reason")
+        previous = absolute_file(link["contract_path"], {"_read_policy": policy})
+        previous_identity = guarded_resolve(previous, {"_read_policy": policy})
+        require(previous.name == "contract.json" and previous_identity not in seen,
+                "Setup replacement cycle or invalid contract path")
+        seen.add(previous_identity)
+        require(guarded_sha(previous, {"_read_policy": policy}) == link["contract_sha256"], "Replaced contract SHA-256 mismatch")
+        old = guarded_load(previous, {"_read_policy": policy})
+        require(isinstance(old, dict) and old.get("schema_version") == VERSION
+                and old.get("run_id") == previous.parent.name
+                and old.get("workflow") == current.get("workflow")
+                and old.get("repos") == current.get("repos"), "Setup replacement identity mismatch")
+        old = with_read_policy(old, policy)
+        policy = read_policy(old)
+        guard_path(previous, old)
+        meta_path = guard_path(previous.parent / "run.json", old)
+        meta = guarded_load(meta_path, old)
+        require(meta.get("schema_version") == VERSION and meta.get("run_id") == old["run_id"]
+                and meta.get("workflow") == old["workflow"] and meta.get("repos") == old["repos"],
+                "Replaced run metadata mismatch")
+        for repo in old["repos"]:
+            require(old.get("budget_work_items", {}).get(repo)
+                    and old["budget_work_items"][repo] == current.get("budget_work_items", {}).get(repo),
+                    "Setup replacement work item mismatch")
+            state.text(old["budget_work_items"][repo], "setup replacement work item")
+            old_repo = old.get("repo_paths", {}).get(repo)
+            new_repo = current.get("repo_paths", {}).get(repo)
+            require(isinstance(old_repo, str) and Path(old_repo).is_absolute()
+                    and isinstance(new_repo, str) and Path(new_repo).is_absolute(),
+                    "Setup replacement requires absolute repository paths")
+            require(guarded_resolve(old_repo, old) == guarded_resolve(new_repo, old),
+                    "Setup replacement repository mismatch")
+        closure_path = guard_path(previous.parent / "setup-replacement.json", old)
+        guard_path(current_path, old)
+        pending_link = pending is not None and previous == pending["old"]
+        successor_hash = pending["successor_sha256"] if pending_link else guarded_sha(current_path, old)
+        closure = {"schema_version": VERSION, "status": "replaced", "run_id": old["run_id"],
+                   "workflow": old["workflow"], "replacement": link,
+                   "work_items": old["budget_work_items"], "repo_paths": old["repo_paths"],
+                   "successor_run_id": current["run_id"], "successor_contract_path": str(guarded_resolve(current_path, old)),
+                   "successor_contract_sha256": successor_hash}
+        if pending_link:
+            actual = pending["closure"]
+        else:
+            actual = guarded_load(closure_path, old)
+        require(actual == closure and (pending_link or guarded_bytes(closure_path, old) == json_bytes(closure)),
+                "Setup replacement closure mismatch")
+        require(setup_history(previous, old, closed=True,
+                              transaction_temp=pending.get("temporary_path") if pending_link else None)
+                == link["files"], "Replaced setup artifacts changed")
+        records.append({"run_id": old["run_id"], "reason": link["reason"],
+                        "contract_path": str(previous), "contract_sha256": link["contract_sha256"],
+                        "closure_path": str(closure_path), "closure_sha256":
+                        (pending["closure_sha256"] if pending_link
+                         else guarded_sha(closure_path, old)), "files": link["files"]})
+        current, current_path = old, previous
+    return records
+
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, ensure_ascii=True, sort_keys=True) + "\n").encode()
+
+
+def publish_once(path, payload, value, *, temporary_path=None):
+    policies = read_policy(value)
+    path = state.guard_excluded_paths(path.absolute(), policies, pinned=bool(policies))
+    temporary = state.guard_excluded_paths(temporary_path or path.parent / (".setup-replacement-" + secrets.token_hex(16)),
+                                           policies, pinned=bool(policies))
+    require(temporary.parent == path.parent, "Temporary file must share the destination directory")
+    parent_path = guarded_resolve(path.parent, value)
+    with state.open_directory(parent_path) as parent:
+        created = False
+        try:
+            fd = os.open(temporary.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
+            created = True
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary.name, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+            os.fsync(parent)
+        finally:
+            if created:
+                os.unlink(temporary.name, dir_fd=parent)
+
+
+def mark_work_started(contract_path, repo=None):
+    """Record that an external helper may perform work after releasing the run lock."""
+    initial = state.load(contract_path)
+    require(isinstance(initial, dict), "Invalid contract")
+    root = guarded_resolve(contract_path, initial).parent
+    state.guard_excluded_paths(root, read_policy(initial), pinned=bool(read_policy(initial)))
+    with ExitStack() as stack:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        stack.callback(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        stack.callback(fcntl.flock, fd, fcntl.LOCK_UN)
+        value = guarded_load(contract_path, initial)
+        require(value == initial, "Contract changed while acquiring the run lock")
+        closure = state.guard_excluded_paths(root / "setup-replacement.json", read_policy(value),
+                                             pinned=bool(read_policy(value)))
+        require(not guarded_exists(closure, value), "This setup run has been replaced")
+        require_unreserved(value, contract_path, repo)
+        marker = state.guard_excluded_paths(root / "activity-started.json", read_policy(value),
+                                            pinned=bool(read_policy(value)))
+        if not guarded_exists(marker, value):
+            publish_once(marker, json_bytes({"schema_version": VERSION, "run_id": value.get("run_id", root.name),
+                                             "contract_sha256": guarded_sha(contract_path, value)}), value)
+
+
+@contextmanager
+def prepare_run_artifact(contract_path, repo=None):
+    value = state.load(contract_path)
+    root = guarded_resolve(contract_path, value).parent
+    policies = read_policy(value)
+    state.guard_excluded_paths(root, policies, pinned=bool(policies))
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        current = guarded_load(contract_path, value)
+        require(current == value, "Contract changed while acquiring the run lock")
+        require(not guarded_exists(root / "setup-replacement.json", value), "This setup run has been replaced")
+        require_unreserved(value, contract_path, repo)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def require_unreserved(value, contract_path, repo=None):
+    repos = [repo] if repo else value.get("repos", [])
+    root = guarded_resolve(contract_path, value).parent
+    for name in repos:
+        state.relative_path(name)
+        path = state.guard_excluded_paths(root / name / "successor-reservation.json",
+                                          read_policy(value), pinned=bool(read_policy(value)))
+        require(not guarded_exists(path, value), "Predecessor has been reserved for a successor")
+
+
+def reserve_predecessors(draft, new_path, successor_hash, policy_value, *, lineage_cache=None):
+    draft = with_read_policy(draft, read_policy(policy_value))
+    if lineage_cache is None:
+        lineage_cache = {}
+    groups = {}
+    prepared = []
+    replaced = set()
+    previous = draft
+    inherited = read_policy(draft)
+    while previous.get("setup_replacement") is not None:
+        link = previous["setup_replacement"]
+        source = absolute_file(link.get("contract_path"), {"_read_policy": inherited})
+        identity = guarded_resolve(source, {"_read_policy": inherited})
+        require(identity not in replaced, "Setup replacement cycle")
+        replaced.add(identity)
+        previous = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+        inherited = read_policy(previous)
+
+    def add(source, repo, work_item, contract_hash, state_path, state_hash, history_hash, slice_id, source_policy=None):
+        source_policy = source_policy or policy_value
+        source = absolute_file(source, source_policy)
+        policies = read_policy(source_policy)
+        source = state.guard_excluded_paths(source.absolute(), policies, pinned=bool(policies))
+        if not policies:
+            source = source.resolve()
+        state_file = state.guard_excluded_paths(Path(state_path).absolute(), policies, pinned=bool(policies))
+        if not policies:
+            state_file = state_file.resolve()
+        scope = {"slice_id": slice_id, "state_path": str(state_file), "state_sha256": state_hash,
+                 "history_sha256": history_hash}
+        key = (source, repo, work_item, contract_hash)
+        group = groups.setdefault(key, {"scopes": [], "policies": []})
+        group["policies"].extend(policies)
+        existing = group["scopes"]
+        duplicate = next((entry for entry in existing if entry["slice_id"] == slice_id), None)
+        require(duplicate is None or duplicate == scope, "Conflicting predecessor scope snapshots")
+        if duplicate is None:
+            existing.append(scope)
+
+    for item in draft.get("budget_continuity", []):
+        repo = item["repo"]
+        if "recovery_sources" in item:
+            references = [(source["contract_path"], source["contract_sha256"], source["state_path"],
+                           source["state_sha256"], source["history_sha256"], None)
+                          for source in item["recovery_sources"]]
+        else:
+            references = [(item["source_contract_path"], item["source_contract_sha256"], item["source_state_path"],
+                           item["source_state_sha256"], item.get("source_history_sha256"), item.get("source_slice_id"))]
+        for raw, contract_hash, state_path, state_hash, history_hash, slice_id in references:
+            add(raw, repo, item["work_item"], contract_hash, state_path, state_hash, history_hash, slice_id)
+    for repo in draft["repos"]:
+        lineage = GateFixLineage(draft, repo, lineage_cache)
+        budget_continuity(draft, repo, new_path, gate_lineage=lineage)
+        for (source, cached_repo, inherited_policy), (audited, _, _, _) in lineage.cache.items():
+            if cached_repo == repo:
+                source_policy = {"_read_policy": inherited_policy}
+                add(source, repo, draft["budget_work_items"][repo], guarded_sha(source, source_policy),
+                    audited["state_path"], audited["state_sha256"], audited["history_sha256"], None, source_policy)
+        for item in draft.get("budget_continuity", []):
+            if item.get("repo") != repo or item.get("slice_id") is None:
+                continue
+            current = item
+            inherited = read_policy(policy_value)
+            while current:
+                source = absolute_file(current["source_contract_path"], {"_read_policy": inherited})
+                source_value = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+                inherited = read_policy(source_value)
+                slice_id = current["source_slice_id"]
+                audited = audit_slice_history(source, repo, slice_id, inherited_policy=inherited, strict=True)
+                add(source, repo, item["work_item"], guarded_sha(source, source_value), audited["state_path"],
+                    audited["state_sha256"], audited["history_sha256"], slice_id, source_value)
+                current = next((entry for entry in source_value.get("budget_continuity", [])
+                                if entry.get("repo") == repo and entry.get("slice_id") == slice_id), None)
+    for (source, repo, work_item, contract_hash), group in groups.items():
+        scopes = group["scopes"]
+        inherited = (*read_policy(policy_value), *group["policies"])
+        old = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+        scope_states = {scope["slice_id"]: guarded_load(absolute_file(scope["state_path"], old), old) for scope in scopes}
+        telemetry = source.parent / "telemetry"
+        phases = {}
+        phase_seals = {}
+        for name in guarded_names(telemetry, old):
+            if not name.endswith(".json"):
+                continue
+            event = guarded_load(telemetry / name, old)
+            require(isinstance(event, dict), "Malformed predecessor telemetry")
+            require(event.get("schema_version") == VERSION and event.get("run_id") == old.get("run_id")
+                    and event.get("workflow") == old.get("workflow") and event.get("repo") in {None, *old["repos"]},
+                    "Predecessor telemetry identity mismatch")
+            require(event.get("phase") in {"setup", "preflight", "implement", "pre-review", "review", "review-fix",
+                                           "gate-fix", "checker", "gates", "checkpoint-wait"},
+                    "Unknown predecessor telemetry phase")
+            if event.get("repo") in {None, repo} and event.get("action") in {"review-fix", "plan-gap", "gate-fix"}:
+                expected_phase = "gate-fix" if event["action"] == "gate-fix" else "review-fix"
+                require(event.get("phase") == expected_phase, "Conflicting predecessor phase action")
+            if event.get("repo") not in {None, repo} or event.get("phase") not in {"implement", "review", "review-fix", "gate-fix"}:
+                continue
+            identifier = event.get("phase_id")
+            require(isinstance(identifier, str), "Invalid predecessor phase")
+            phase_seals[str(telemetry / name)] = guarded_sha(telemetry / name, old)
+            pair = phases.setdefault(identifier, {})
+            kind = event.get("event")
+            require(kind in {"phase-start", "phase-end"} and kind not in pair, "Invalid predecessor phase event")
+            suffix = "start" if kind == "phase-start" else "end"
+            require(name == f"{identifier}-{suffix}.json", "Invalid predecessor phase filename")
+            pair[kind] = (telemetry / name, event)
+        matched_repairs = set()
+        for phase in phases.values():
+            require("phase-start" in phase and "phase-end" in phase, "Predecessor has an open work phase")
+            start_path, start = phase["phase-start"]
+            _, end = phase["phase-end"]
+            require(not (start.get("phase") == "implement" and start.get("action") in
+                         {"review-fix", "plan-gap", "gate-fix"}), "Conflicting predecessor phase action")
+            require(start.get("schema_version") == VERSION and start.get("run_id") == old.get("run_id")
+                    and start.get("workflow") == old.get("workflow")
+                    and end.get("schema_version") == VERSION and end.get("status") in {"passed", "failed", "blocked", "interrupted"}
+                    and end.get("start_sha256") == guarded_sha(start_path, old)
+                    and all(start.get(key) == end.get(key) for key in
+                            ("run_id", "workflow", "repo", "phase", "phase_id", "slice_id", "session_id"))
+                    and timestamp(start.get("at")) <= timestamp(end.get("at")), "Invalid predecessor phase pair")
+            phase_slice = start.get("slice_id")
+            latest = scope_states.get(phase_slice)
+            if latest is None and phase_slice is not None:
+                slice_events = guarded_history(source.parent / repo / "slices" / state.relative_path(phase_slice), old)
+                latest = slice_events[-1][2] if slice_events else None
+            require(latest is not None and timestamp(end["at"]) <= timestamp(latest.get("at")),
+                    "Predecessor work has not been recorded in lifecycle history")
+            if start["phase"] in {"review-fix", "gate-fix"}:
+                scope_directory = source.parent / repo
+                if phase_slice is not None:
+                    scope_directory = scope_directory / "slices" / state.relative_path(phase_slice)
+                events = guarded_history(scope_directory, old)
+                actions = {"gate-fix"} if start["phase"] == "gate-fix" else {"review-fix", "plan-gap"}
+                matches = []
+                for index, (_, _, event) in enumerate(events):
+                    if not index or event.get("status") != "edited-unverified" or event.get("action") not in actions:
+                        continue
+                    identifier = event.get("repair_phase_id")
+                    if identifier is not None and identifier != start["phase_id"]:
+                        continue
+                    previous = events[index - 1][2]
+                    if timestamp(previous.get("at")) <= timestamp(start.get("at")) <= timestamp(end.get("at")) <= timestamp(event.get("at")):
+                        matches.append((index, event))
+                require(len(matches) == 1, "Predecessor repair phase is missing from lifecycle history")
+                index, event = matches[0]
+                key = (phase_slice, index)
+                require(key not in matched_repairs, "Multiple repair phases claim the same lifecycle state")
+                matched_repairs.add(key)
+                for field in ("action", "previous_state_path", "previous_state_sha256", "round", "attempt"):
+                    require(start.get(field) == end.get(field), "Predecessor repair phase boundary mismatch")
+                if start.get("action") is not None:
+                    require(event.get("action") == start["action"], "Predecessor repair phase action mismatch")
+                if start.get("previous_state_path") is not None:
+                    require(absolute_file(start["previous_state_path"], old).resolve() == events[index - 1][1].resolve()
+                            and start.get("previous_state_sha256") == guarded_sha(events[index - 1][1], old),
+                            "Predecessor repair phase binding mismatch")
+                previous = events[index - 1][2]
+                counter = "gate_fix_count" if event["action"] == "gate-fix" else "review_fix_count"
+                require(event.get(counter, 0) == previous.get(counter, 0) + 1,
+                        "Predecessor repair phase counter mismatch")
+                if start.get("attempt") is not None:
+                    require(start["attempt"] == previous.get("gate_fix_count", 0) + 1,
+                            "Predecessor repair phase attempt mismatch")
+                if start.get("round") is not None:
+                    require(start["round"] == previous.get("latest_review_round", 0),
+                            "Predecessor repair phase round mismatch")
+        reservation = {"schema_version": VERSION, "source_contract_path": str(source),
+                       "source_contract_sha256": contract_hash, "repo": repo, "work_item": work_item,
+                       "successor_contract_path": str(guarded_resolve(new_path, policy_value)), "successor_contract_sha256": successor_hash,
+                       "scopes": sorted(scopes, key=lambda scope: scope["slice_id"] or ""), "telemetry": phase_seals}
+        target = state.guard_excluded_paths((source.parent / repo / "successor-reservation.json").absolute(),
+                                            read_policy(old), pinned=bool(read_policy(old)))
+        payload = json_bytes(reservation)
+        if guarded_exists(target, old):
+            existing = guarded_load(target, old)
+            if guarded_bytes(target, old) != payload:
+                earlier = absolute_file(existing.get("successor_contract_path"), old)
+                earlier_identity = guarded_resolve(earlier, old)
+                require(earlier_identity in replaced or
+                        any(path == earlier_identity and source_repo == repo
+                            and source_work == work_item and digest == existing.get("successor_contract_sha256")
+                            for path, source_repo, source_work, digest in groups),
+                        "Predecessor already reserved for a different successor")
+                require(existing.get("schema_version") == VERSION
+                        and guarded_resolve(existing.get("source_contract_path"), old) == source
+                        and guarded_sha(earlier, old) == existing.get("successor_contract_sha256")
+                        and existing.get("source_contract_sha256") == contract_hash and existing.get("repo") == repo
+                        and existing.get("work_item") == work_item
+                        and existing.get("telemetry") == reservation["telemetry"]
+                        and isinstance(existing.get("scopes"), list)
+                        and all(scope in reservation["scopes"] for scope in existing["scopes"]),
+                        "Historical predecessor reservation mismatch")
+        else:
+            with state.open_directory(guarded_resolve(target.parent, old)):
+                pass
+            prepared.append((target, payload, old))
+    return prepared
+
+
+def replace_setup(contract_path, draft_path, reason, *, bootstrap_policy):
+    state.text(reason, "setup replacement reason")
+    old_path = Path(contract_path).absolute()
+    draft_path = Path(draft_path).absolute()
+    require(old_path.name == "contract.json" and draft_path.name == "replacement-contract.json"
+            and draft_path.parent.name == "inputs", "Invalid replacement paths")
+    new_root = draft_path.parent.parent
+    new_path = new_root / "contract.json"
+    require(old_path.parent != new_root and old_path.parent.parent.parent == new_root.parent.parent,
+            "Replacement runs must belong to the same project")
+    state.guard_excluded_paths(old_path, bootstrap_policy, pinned=bool(bootstrap_policy))
+    state.guard_excluded_paths(draft_path, bootstrap_policy, pinned=bool(bootstrap_policy))
+    initial_old = guarded_load(old_path, {"_read_policy": bootstrap_policy})
+    require(isinstance(initial_old, dict), "Invalid replaced contract")
+    old_policy = declared_read_policy(initial_old)
+    state.guard_excluded_paths(draft_path, old_policy, pinned=bool(old_policy))
+    initial_draft = guarded_load(draft_path, {"_read_policy": (*bootstrap_policy, *old_policy)})
+    require(isinstance(initial_draft, dict), "Invalid replacement draft")
+    draft_policy = declared_read_policy(initial_draft)
+    supplied = {(root, path) for root, paths in bootstrap_policy for path in paths}
+    required = {(root, path) for root, paths in (*old_policy, *draft_policy) for path in paths}
+    require(required <= supplied, "Bootstrap read policy omits a contract exclusion")
+    guard_path(old_path, {"_read_policy": draft_policy})
+    combined = with_read_policy(initial_old, (*draft_policy, *bootstrap_policy))
+    for path in (old_path, old_path.parent, draft_path, new_root, new_path):
+        state.guard_excluded_paths(path, read_policy(combined), pinned=bool(read_policy(combined)))
+    policies = read_policy(combined)
+    lock_roots = set()
+    for path in (old_path.parent, new_root):
+        guarded_root = state.guard_excluded_paths(path, policies, pinned=bool(policies))
+        lock_roots.add(guarded_root if policies else guarded_root.resolve())
+    for item in initial_draft.get("budget_continuity", []):
+        references = (item.get("recovery_sources") if "recovery_sources" in item
+                      else [{"contract_path": item.get("source_contract_path")}])
+        require(isinstance(references, list), "Invalid predecessor sources")
+        for reference in references:
+            source = absolute_file(reference.get("contract_path"), combined)
+            guarded_root = state.guard_excluded_paths(source.parent, read_policy(combined), pinned=bool(read_policy(combined)))
+            lock_roots.add(guarded_root if policies else guarded_root.resolve())
+    preliminary = with_read_policy(initial_draft, read_policy(combined))
+    for repo in preliminary.get("repos", []):
+        lineage = GateFixLineage(preliminary, repo)
+        budget_continuity(preliminary, repo, new_path, gate_lineage=lineage)
+        for (source, _, inherited_policy), (_, _, _, cached_source) in lineage.cache.items():
+            combined_policy = (*inherited_policy, *read_policy(cached_source))
+            require({(root, path) for root, paths in combined_policy for path in paths} <= supplied,
+                    "Bootstrap read policy omits a predecessor exclusion")
+            guarded_root = state.guard_excluded_paths(source.parent, read_policy(combined), pinned=bool(policies))
+            lock_roots.add(guarded_root if policies else guarded_root.resolve())
+        for item in preliminary.get("budget_continuity", []):
+            if item.get("repo") != repo or item.get("slice_id") is None:
+                continue
+            budget_continuity(preliminary, repo, new_path, item["slice_id"])
+            current = item
+            inherited = read_policy(preliminary)
+            while current:
+                source = absolute_file(current["source_contract_path"], {"_read_policy": inherited})
+                source_value = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+                inherited = read_policy(source_value)
+                require({(root, path) for root, paths in inherited for path in paths} <= supplied,
+                        "Bootstrap read policy omits a predecessor exclusion")
+                guarded_root = state.guard_excluded_paths(source.parent, inherited, pinned=bool(inherited))
+                lock_roots.add(guarded_root if inherited else guarded_root.resolve())
+                source_slice = current["source_slice_id"]
+                current = next((entry for entry in source_value.get("budget_continuity", [])
+                                if entry.get("repo") == repo and entry.get("slice_id") == source_slice), None)
+    with ExitStack() as stack:
+        for root in sorted(lock_roots, key=str):
+            guarded_root = state.guard_excluded_paths(root, read_policy(combined), pinned=bool(read_policy(combined)))
+            fd = os.open(guarded_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            stack.callback(os.close, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            stack.callback(fcntl.flock, fd, fcntl.LOCK_UN)
+        draft = guarded_load(draft_path, combined)
+        require(isinstance(draft, dict) and "setup_replacement" not in draft, "Invalid replacement draft")
+        old = guarded_load(old_path, combined)
+        require(isinstance(old, dict), "Invalid replaced contract")
+        require(draft == initial_draft and old == initial_old, "Replacement inputs changed while acquiring locks")
+        require(old_path.parent.parent.name == f".{old.get('workflow')}-runs"
+                and new_root.parent.name == f".{draft.get('workflow')}-runs",
+                "Replacement requires standard workflow run directories")
+        old = with_read_policy(old, (*declared_read_policy(draft), *bootstrap_policy))
+        for path in (old_path, draft_path, new_path, new_root / "run.json"):
+            guard_path(path, old)
+        new_meta = guarded_load(new_root / "run.json", old)
+        require(new_meta.get("schema_version") == VERSION and new_meta.get("run_id") == new_root.name
+                and new_meta.get("workflow") == draft.get("workflow") and new_meta.get("repos") == draft.get("repos"),
+                "Replacement run metadata mismatch")
+        if draft.get("workflow") == "ship":
+            require(new_meta.get("plan_path") == draft.get("plan_path"), "Replacement run plan mismatch")
+        setup_history(new_path, with_read_policy(draft, read_policy(old)), require_telemetry=False)
+        closure_path = old_path.parent / "setup-replacement.json"
+        journal_path = guard_path(new_root / "inputs/setup-replacement-transaction.json", old)
+        journal = guarded_load(journal_path, old) if guarded_exists(journal_path, old) else None
+        temporary = None
+        if journal is not None:
+            require(isinstance(journal, dict) and journal.get("old_contract_path") == str(old_path)
+                    and journal.get("new_contract_path") == str(new_path) and journal.get("reason") == reason,
+                    "Conflicting replacement transaction")
+            temporary = Path(journal.get("temporary_path", ""))
+            require(temporary.parent == old_path.parent
+                    and re.fullmatch(r"\.setup-replacement-[0-9a-f]{32}", temporary.name),
+                    "Invalid replacement transaction temporary path")
+            guard_path(temporary, old)
+        files = setup_history(old_path, old, closed=guarded_exists(closure_path, old), transaction_temp=temporary)
+        draft["setup_replacement"] = {"contract_path": str(old_path), "contract_sha256": guarded_sha(old_path, old),
+                                      "reason": reason, "files": files}
+        payload = json_bytes(draft)
+        successor_hash = hashlib.sha256(payload).hexdigest()
+        closure = {"schema_version": VERSION, "status": "replaced", "run_id": old["run_id"],
+                   "workflow": old["workflow"], "replacement": draft["setup_replacement"],
+                   "work_items": old["budget_work_items"], "repo_paths": old["repo_paths"],
+                   "successor_run_id": draft["run_id"], "successor_contract_path": str(guarded_resolve(new_path, old)),
+                   "successor_contract_sha256": successor_hash}
+        closure_payload = json_bytes(closure)
+        transaction = {"old_contract_path": str(old_path), "new_contract_path": str(new_path),
+                       "reason": reason, "files": files, "closure_sha256": hashlib.sha256(closure_payload).hexdigest(),
+                       "successor_sha256": successor_hash,
+                       "temporary_path": str(temporary or old_path.parent / (".setup-replacement-" + secrets.token_hex(16)))}
+        if journal is not None:
+            require(journal == transaction, "Conflicting replacement transaction")
+        else:
+            temporary = Path(transaction["temporary_path"])
+            guard_path(temporary, old)
+            require(not guarded_exists(temporary, old), "Replacement temporary path already exists")
+        pending = {"old": old_path, "closure": closure, "successor_sha256": successor_hash,
+                   "closure_sha256": hashlib.sha256(closure_payload).hexdigest(), "temporary_path": temporary}
+        checked = contract(new_path, draft=draft, pending_replacement=pending, inherited_policy=read_policy(old))
+        validate_store_roots(checked)
+        for repo, declaration in checked.get("slice_schedules", {}).items():
+            checked_slice_schedule(checked, repo, declaration.get("path"))
+        reservations = reserve_predecessors(draft, new_path, successor_hash, old)
+        for target, _, predecessor in reservations:
+            guarded_root = state.guard_excluded_paths(target.parent.parent, read_policy(predecessor),
+                                                       pinned=bool(read_policy(predecessor)))
+            require((guarded_root if read_policy(predecessor) else guarded_root.resolve()) in lock_roots,
+                    "Predecessor lineage changed while acquiring locks")
+        if journal is None:
+            publish_once(journal_path, json_bytes(transaction), old)
+        for target, reservation_payload, predecessor in reservations:
+            publish_once(target, reservation_payload, predecessor)
+        if guarded_exists(temporary, old):
+            parent = guarded_resolve(temporary.parent, old)
+            with state.open_directory(parent) as fd:
+                info = os.stat(temporary.name, dir_fd=fd, follow_symlinks=False)
+                require(stat.S_ISREG(info.st_mode), "Invalid replacement transaction temporary file")
+                os.unlink(temporary.name, dir_fd=fd)
+        for path, expected, writer in ((closure_path, closure_payload, old), (new_path, payload, checked)):
+            if guarded_exists(path, writer):
+                require(guarded_bytes(path, writer) == expected, f"Conflicting replacement artifact: {path}")
+            else:
+                publish_once(path, expected, writer, temporary_path=temporary if path == closure_path else None)
+        return {"status": "replaced", "closure_path": str(closure_path), "contract_path": str(new_path)}
+
+
 def absolute_file(path, value=None):
     require(isinstance(path, (str, Path)) and Path(path).is_absolute(), f"Missing absolute file: {path}")
     path = guard_path(path, value)
     if value and value.get("external_stores"):
         require_local_mode(path, value)
-    require(path.is_file(), f"Missing absolute file: {path}")
+    if value is not None and read_policy(value):
+        guarded = state.guard_excluded_paths(path, read_policy(value), pinned=True)
+        try:
+            with state.capture_open(guarded):
+                pass
+        except OSError as error:
+            raise ValueError(f"Missing absolute file: {path}") from error
+    else:
+        require(path.is_file(), f"Missing absolute file: {path}")
     return path
 
 
@@ -360,12 +1100,14 @@ def continuity_declarations(value, *, historical=False):
     return continuity, work_items
 
 
-def contract(path):
-    path = absolute_file(path)
-    value = state.load(path)
+def contract(path, *, draft=None, pending_replacement=None, inherited_policy=()):
+    path = absolute_file(path) if draft is None else Path(path).absolute()
+    value = state.load(path) if draft is None else copy.deepcopy(draft)
     require(isinstance(value, dict), "Contract must be an object")
-    require(not {"_amendment", "_contract_path", "_read_policy"} & value.keys(),
+    require(not {"_amendment", "_contract_path", "_read_policy", "_setup_replacements", "_pending_replacement"} & value.keys(),
             "Contract cannot define internal state")
+    if inherited_policy:
+        value = with_read_policy(value, inherited_policy)
     require(value.get("schema_version") == VERSION, "Expected workflow contract v2")
     require(value.get("workflow") in {"ship", "fix"}, "Invalid workflow")
     state.relative_path(value.get("run_id"))
@@ -393,6 +1135,9 @@ def contract(path):
         for excluded_path in paths:
             state.relative_path(excluded_path)
     guard_path(path, value)
+    closure_path = guard_path(path.parent / "setup-replacement.json", value)
+    require(not guarded_exists(closure_path, value),
+            "This setup run has been replaced")
     for repo in repos:
         require(guard_path(value["repo_paths"][repo], value).is_dir(), f"Missing absolute repo path: {repo}")
     validate_store_declarations(value, path.parent)
@@ -548,6 +1293,9 @@ def contract(path):
         if value["_amendments"]:
             value["_amendment"] = value["_amendments"][-1]
     value["_contract_path"] = str(path)
+    value["_setup_replacements"] = replacement_chain(value, path, pending=pending_replacement)
+    if pending_replacement is not None:
+        value["_pending_replacement"] = True
     for repo in repos:
         entries = value.get("deliverables", {}).get(repo, [])
         if any(delivery_scope(entry) and delivery_scope(entry)["scope"] == "slice" for entry in entries):
@@ -588,7 +1336,7 @@ def spec(value, repo, identifier):
 
 
 def manifest(value, repo, path):
-    result = state.checked_manifest(absolute_file(path, value))
+    result = state.checked_manifest(absolute_file(path, value), loader=lambda item: guarded_load(item, value))
     require(result["repo_path"] == str(guard_path(value["repo_paths"][repo], value).resolve()), "Wrong manifest repo")
     return result
 
@@ -705,6 +1453,7 @@ def local_digest(raw, value):
 
 def snapshot_deliverables(contract_path, repo, out_dir, criterion_ids=None, *, slice_item=None):
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     entries, pending = deliverable_selection(value, repo, slice_item, criterion_ids)
     staged = staged_deliverables(value, repo)
     require(entries or (staged and pending), "No deliverables declared")
@@ -754,35 +1503,41 @@ def snapshot_deliverables(contract_path, repo, out_dir, criterion_ids=None, *, s
     return str(output / "manifest.json")
 
 
-def snapshot_inputs(paths, out_dir, repo_root, read_excludes, *, value=None):
+def snapshot_inputs(paths, out_dir, repo_root, read_excludes, *, value=None, pinned_out_dir=None):
     if not paths:
         return []
     output = Path(out_dir)
-    require(not output.exists(), "Input snapshot directory already exists")
+    policy = value or {"_read_policy": ((repo_root, read_excludes),) if read_excludes else ()}
+    physical_output = Path(pinned_out_dir) if pinned_out_dir is not None else guarded_resolve(output.absolute(), policy)
+    try:
+        with state.open_directory(physical_output):
+            raise ValueError("Input snapshot directory already exists")
+    except FileNotFoundError:
+        pass
     payload = []
     for item in paths:
-        policy = value or {"_read_policy": ((repo_root, read_excludes),) if read_excludes else ()}
         source = local_snapshot_source(item, policy)
         read = state.capture_bytes if snapshot_reads_pinned(policy) else Path.read_bytes
         data = read(source)
         require(data == read(source), "Check input changed while snapshotting")
         payload.append((str(Path(item)), data))
-    output.mkdir(parents=True)
     rows = []
-    for index, (source, data) in enumerate(payload):
-        target = output / f"{index}.input"
-        with target.open("xb") as handle:
-            handle.write(data)
-        rows.append({"path": source, "snapshot": str(target), "sha256": hashlib.sha256(data).hexdigest()})
+    with state.open_directory(physical_output, create=True) as directory:
+        for index, (source, data) in enumerate(payload):
+            target = output / f"{index}.input"
+            fd = os.open(target.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=directory)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            rows.append({"path": source, "snapshot": str(target), "sha256": hashlib.sha256(data).hexdigest()})
     registry = output / "manifest.json"
-    state.write_once(registry, rows)
+    state.write_once(physical_output / "manifest.json", rows, pinned=True)
     return [str(registry), *[row["snapshot"] for row in rows]]
 
 
 def check_inputs_unchanged(paths, value=None):
     if not paths:
         return
-    for row in state.load(paths[0]):
+    for row in (guarded_load(paths[0], value) if value is not None else state.load(paths[0])):
         require(local_digest(row["path"], value or {}) == row["sha256"],
                 "Check input changed during execution")
 
@@ -798,21 +1553,22 @@ def artifact_reference(path):
     return {"path": str(path), "sha256": sha(path)}
 
 
-def before_check_inputs(value, repo, check, out_dir):
+def before_check_inputs(value, repo, check, out_dir, *, pinned_out_dir=None):
     external = check.get("external_input_stores", {})
     if external:
         out_dir = run_local_path(value, str(out_dir))
         out_dir = canonical_run_artifact(value, out_dir)
     paths = snapshot_inputs([path for path in check.get("input_paths", []) if path not in external],
-                            out_dir, value["repo_paths"][repo], repo_read_excludes(value, repo), value=value)
+                            out_dir, value["repo_paths"][repo], repo_read_excludes(value, repo), value=value,
+                            pinned_out_dir=pinned_out_dir)
     if not external:
         return paths, None
     before = {"schema_version": VERSION, "run_id": value["run_id"], "repo": repo,
               "check_id": check["id"], "boundary": "before",
               "inputs": external_input_rows(value, check, command_input=True)}
     path = Path(out_dir) / "external-before.json"
-    state.write_once(path, before, pinned=True)
-    return paths, (artifact_reference(path), before)
+    state.write_once(Path(pinned_out_dir) / path.name if pinned_out_dir is not None else path, before, pinned=True)
+    return paths, ({"path": str(path), "sha256": guarded_sha(path, value)}, before)
 
 
 def after_check_inputs(value, check, paths, observation):
@@ -820,18 +1576,20 @@ def after_check_inputs(value, check, paths, observation):
     if observation is None:
         return paths, None
     reference, before = observation
-    require(reference == artifact_reference(reference["path"]), "External input observation changed")
+    require(reference == {"path": reference["path"], "sha256": guarded_sha(reference["path"], value)},
+            "External input observation changed")
     rows = external_input_rows(value, check, command_input=True)
     after = Path(reference["path"]).with_name("external-after.json")
     state.write_once(after, {**before, "boundary": "after", "inputs": rows}, pinned=True)
     require(rows == before["inputs"], "External check input changed during execution")
-    return [*paths, reference["path"], str(after)], {"before": reference, "after": artifact_reference(after)}
+    return [*paths, reference["path"], str(after)], {"before": reference,
+            "after": {"path": str(after), "sha256": guarded_sha(after, value)}}
 
 
 def checked_reference(value, reference):
     require(isinstance(reference, dict) and set(reference) == {"path", "sha256"}, "Invalid artifact binding")
     path = checked_local_artifact(value, reference["path"])
-    require(reference == artifact_reference(path), "Bound artifact hash changed")
+    require(reference == {"path": str(path), "sha256": guarded_sha(path, value)}, "Bound artifact hash changed")
     return path
 
 
@@ -846,7 +1604,7 @@ def validate_input_binding(value, repo, record, *, historical=False):
             "External check needs input bindings before and after execution")
     execution_path = checked_local_artifact(value, record.get("execution_record"))
     require(str(execution_path) in record["artifact_paths"], "External input execution record must be sealed")
-    execution = state.load(execution_path)
+    execution = guarded_load(execution_path, value)
     check_id = execution.get("check_id")
     require(check_id in checks and claimed <= {check_id}, "Evidence has the wrong external input check")
     check = checks[check_id]
@@ -855,7 +1613,7 @@ def validate_input_binding(value, repo, record, *, historical=False):
     for boundary, reference in binding.items():
         path = checked_reference(value, reference)
         require(str(path) in record["artifact_paths"], "External input manifest must be sealed")
-        observation = state.load(path)
+        observation = guarded_load(path, value)
         bound(value, repo, observation)
         require(observation.get("check_id") == check_id and observation.get("boundary") == boundary,
                 "Wrong external input check or observation boundary")
@@ -872,11 +1630,11 @@ def validate_input_binding(value, repo, record, *, historical=False):
     if local:
         registry = checked_local_artifact(value, str(Path(binding["before"]["path"]).with_name("manifest.json")))
         require(str(registry) in record["artifact_paths"], "Local input registry must be sealed")
-        snapshots = state.load(registry)
+        snapshots = guarded_load(registry, value)
         require([row["path"] for row in snapshots] == local, "Missing or unexpected local check inputs")
         for row in snapshots:
             path = checked_local_artifact(value, row["snapshot"])
-            require(str(path) in record["artifact_paths"] and sha(path) == row["sha256"],
+            require(str(path) in record["artifact_paths"] and guarded_sha(path, value) == row["sha256"],
                     "Local input snapshot must match its seal")
         if not historical:
             check_inputs_unchanged([registry], value)
@@ -973,7 +1731,7 @@ def bound(value, repo, record):
 
 
 def seal_files(paths, value=None):
-    return {str(absolute_file(p, value)): sha(p) for p in paths}
+    return {str(absolute_file(p, value)): (guarded_sha(p, value) if value is not None else sha(p)) for p in paths}
 
 
 def extend_seals(value, previous, paths, delivery):
@@ -990,7 +1748,9 @@ def extend_seals(value, previous, paths, delivery):
 
 def check_seals(seals, value=None):
     for path, expected in seals.items():
-        require(sha(absolute_file(path, value)) == expected, f"Immutable artifact changed: {path}")
+        source = absolute_file(path, value)
+        require((guarded_sha(source, value) if value is not None else sha(source)) == expected,
+                f"Immutable artifact changed: {path}")
 
 
 def check_event_seals(value, repo, event, inherited_seals=None):
@@ -1040,7 +1800,7 @@ def execution_binding(record, value=None):
         return
     execution_path = str(absolute_file(record["execution_record"], value))
     require(execution_path in record.get("artifact_paths", []), "Execution record must be sealed")
-    execution = state.load(execution_path)
+    execution = guarded_load(execution_path, value) if value is not None else state.load(execution_path)
     for field in ("producer", "command", "exit_code"):
         require(execution.get(field) == record.get(field), "Execution record differs: " + field)
     if "input_bindings" in execution or "input_bindings" in record:
@@ -1428,6 +2188,8 @@ def assessment(value, repo, path, final, initial=None, *, delivery=None):
 
 
 def history(directory, value=None):
+    if value is not None and read_policy(value):
+        return guarded_history(directory, value)
     events = []
     for path in guard_path(directory, value).glob("state-*.json"):
         match = re.fullmatch(r"state-(\d+)\.json", path.name)
@@ -1476,12 +2238,12 @@ class GateFixLineage:
 
     def audit(self, path, visited, *, work_item=None, expected=None):
         guard_path(path, self.value)
-        resolved = path.resolve()
+        resolved = guarded_resolve(path, self.value)
         require(resolved not in visited, "Historical budget reference cycle/current-run ancestry detected")
         repo = self.repo
         root = self.value["repo_paths"][repo]
         inherited = read_policy(self.value)
-        source = with_read_policy(state.load(path), inherited)
+        source = with_read_policy(guarded_load(path, {"_read_policy": inherited}), inherited)
         guard_path(path, source)
         require(guard_path(source.get("repo_paths", {}).get(repo, ""), source).resolve()
                 == guard_path(root, self.value).resolve(),
@@ -1538,7 +2300,7 @@ class GateFixLineage:
 
     @staticmethod
     def snapshot(path, repo, value):
-        return (sha(guard_path(path, value)), [(event_path.name, sha(event_path))
+        return (guarded_sha(guard_path(path, value), value), [(event_path.name, guarded_sha(event_path, value))
                                               for _, event_path, _ in history(path.parent / repo, value)])
 
 
@@ -1636,7 +2398,107 @@ def historical_budget_used(grants):
     return max((item.get("historical_used_passes", 0) for item in grants), default=0)
 
 
-def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_contracts=(), gate_lineage=None):
+def audit_slice_history(contract_path, repo, slice_id, *, inherited_policy=(), visited_contracts=(), strict=False,
+                        cache=None):
+    """Audit a slice and bind every state and continuity source to one history hash."""
+    source = absolute_file(contract_path, {"_read_policy": inherited_policy})
+    resolved = guarded_resolve(source, {"_read_policy": inherited_policy})
+    visited = set(visited_contracts)
+    require(resolved not in visited, "Historical slice reference cycle/current run")
+    visited.add(resolved)
+    cache = {} if cache is None else cache
+    cache_key = (resolved, repo, slice_id, tuple(inherited_policy), strict)
+    if cache_key in cache:
+        return cache[cache_key]
+    old = with_read_policy(guarded_load(source, {"_read_policy": inherited_policy}), inherited_policy)
+    guard_path(source, old)
+    require(old.get("schema_version") == VERSION and old.get("workflow") in {"ship", "fix"}
+            and source.parent.name == old.get("run_id") and repo in old.get("repos", []),
+            "Invalid historical slice contract")
+    if old.get("setup_replacement") is not None:
+        replacement_chain(old, source)
+        pending = reserve_predecessors(old, source, guarded_sha(source, old), old)
+        require(not pending, "Predecessor reservation is missing")
+    state.relative_path(repo)
+    state.relative_path(slice_id)
+    events = guarded_history(source.parent / repo / "slices" / slice_id, old)
+    require(events, "Continuity source history missing")
+    inherited, prior_count, prior_status = {}, 0, None
+    for index, (_, _, event) in enumerate(events):
+        bound(old, repo, event)
+        require(event.get("artifact_hashes", {}).get(str(source)) == guarded_sha(source, old),
+                "Continuity history does not seal its contract")
+        require(event.get("slice_id") == slice_id, "Continuity slice mismatch")
+        status = event.get("status")
+        require((prior_status is None and status == "implemented") or
+                (prior_status is not None and (status in SLICE_TRANSITIONS.get(prior_status, set())
+                    or status in {"blocked", "capped"}
+                    or recorded_binding_recheck(old, repo, event, events[index - 1][2], slice=True)
+                    or (prior_status == "capped" and status == "needs-fix"
+                        and event.get("is_continuation") is True))), "Invalid continuity slice transition")
+        prior_status = status
+        if status == "edited-unverified" and event.get("action") == "review-fix":
+            prior_count += 1
+        require(event.get("review_fix_count", 0) == prior_count,
+                "Continuity slice counter is inconsistent with events")
+        check_event_seals(old, repo, event, inherited)
+        inherited = event.get("artifact_hashes", {})
+    prior = budget_continuity(old, repo, source, slice_id, visited_contracts=visited - {resolved}, slice_cache=cache)
+    if strict:
+        limit = prior["effective_limit"] - prior["used_passes"] if prior else SLICE_REVIEW_FIX_BUDGET
+        used_authorizations = set()
+        for index, (_, path, event) in enumerate(events):
+            if event.get("is_continuation"):
+                require(index > 0 and events[index - 1][2].get("status") == "capped"
+                        and event.get("status") == "needs-fix", "Invalid slice budget continuation")
+                authorization = absolute_file(event.get("continuation_path"), old)
+                require(authorization.resolve().is_relative_to(source.parent.resolve())
+                        and authorization not in used_authorizations
+                        and event.get("artifact_hashes", {}).get(str(authorization)) == guarded_sha(authorization, old),
+                        "Invalid slice continuation authorization seal")
+                used_authorizations.add(authorization)
+                record = guarded_load(authorization, old)
+                bound(old, repo, record)
+                previous_path, previous = events[index - 1][1:]
+                require(record.get("slice_id") == slice_id and record.get("previous_state_path") == str(previous_path)
+                        and record.get("previous_state_sha256") == guarded_sha(previous_path, old)
+                        and record.get("author_agent_id") == previous.get("author_agent_id"),
+                        "Invalid slice continuation authorization binding")
+                state.text(record.get("user_authorization"), "slice continuation authorization")
+                require(timestamp(previous["at"]) <= timestamp(record.get("approved_at")) <= timestamp(event["at"]),
+                        "Invalid historical slice continuation approval time")
+                review = guarded_load(absolute_file(previous.get("review_path"), old), old)
+                require(set(record.get("finding_ids", [])) == {finding["id"] for finding in review["findings"]},
+                        "Slice continuation finding scope differs")
+                extra = record.get("additional_passes")
+                require(type(extra) is int and extra > 0, "Invalid slice continuation allowance")
+                limit = max(limit, previous.get("review_fix_count", 0)) + extra
+            require(event.get("review_fix_limit", limit) == limit
+                    and event.get("review_fix_count", 0) <= limit, "Slice review budget differs from history")
+            if index:
+                previous_path = str(events[index - 1][1])
+                require(event.get("artifact_hashes", {}).get(previous_path) == guarded_sha(previous_path, old),
+                        "Slice history does not seal its predecessor")
+    sources = []
+    if prior:
+        previous = audit_slice_history(prior["source_contract_path"], repo, prior["source_slice_id"],
+                                       inherited_policy=read_policy(old), visited_contracts=visited, strict=strict,
+                                       cache=cache)
+        sources.append([str(guarded_resolve(prior["source_contract_path"], old)), previous["history_sha256"]])
+    latest = events[-1][2]
+    result = {"run_id": old["run_id"], "repo": repo, "slice_id": slice_id,
+            "state_path": str(events[-1][1]), "state_sha256": guarded_sha(events[-1][1], old),
+            "review_fix_count": prior_count, "historical_used_passes": prior["used_passes"] if prior else 0,
+            "review_fix_limit": latest.get("review_fix_limit", SLICE_REVIEW_FIX_BUDGET),
+            "history_sha256": state.digest({"contract_sha256": guarded_sha(source, old),
+                "states": [(path.name, guarded_sha(path, old)) for _, path, _ in events], "sources": sources}),
+            "states": len(events), "status": "valid"}
+    cache[cache_key] = result
+    return result
+
+
+def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_contracts=(), gate_lineage=None,
+                      slice_cache=None):
     """Validate an explicitly approved carryover without changing historical counters."""
     entries = value.get("budget_continuity", [])
     require(isinstance(entries, list), "Invalid budget continuity")
@@ -1646,7 +2508,7 @@ def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_cont
     if not matches:
         return None
     item = matches[0]
-    visited = set(visited_contracts) | {Path(contract_path).resolve()}
+    visited = set(visited_contracts) | {guarded_resolve(contract_path, value)}
     if "recovery_sources" in item:
         return recovery_continuity(value, repo, item, slice_id, visited, gate_lineage)
     require(item.get("approved_by") == "user", "Budget continuity requires user approval")
@@ -1657,9 +2519,9 @@ def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_cont
     require(type(used) is int and type(limit) is int and 0 <= used <= limit,
             "Invalid continuity usage or limit")
     source = absolute_file(item.get("source_contract_path"), value)
-    require(source.resolve() not in visited, "Budget continuity cycle/current run reference")
-    require(sha(source) == item.get("source_contract_sha256"), "Continuity contract seal mismatch")
-    old = state.load(source)
+    require(guarded_resolve(source, value) not in visited, "Budget continuity cycle/current run reference")
+    require(guarded_sha(source, value) == item.get("source_contract_sha256"), "Continuity contract seal mismatch")
+    old = guarded_load(source, value)
     require(old.get("workflow") == value["workflow"] and repo in old.get("repos", [])
             and source.parent.name == old.get("run_id"), "Continuity source run mismatch")
     old = with_read_policy(old, read_policy(value))
@@ -1674,10 +2536,10 @@ def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_cont
     events = history(directory, old)
     require(events, "Continuity source history missing")
     source_state = absolute_file(item.get("source_state_path"), old)
-    require(source_state.resolve() == events[-1][1].resolve()
-            and sha(source_state) == item.get("source_state_sha256"), "Continuity state seal mismatch")
+    require(guarded_resolve(source_state, old) == guarded_resolve(events[-1][1], old)
+            and guarded_sha(source_state, old) == item.get("source_state_sha256"), "Continuity state seal mismatch")
     decision = absolute_file(item.get("decision_path"), value)
-    require(sha(decision) == item.get("decision_sha256"), "Continuity decision seal mismatch")
+    require(guarded_sha(decision, value) == item.get("decision_sha256"), "Continuity decision seal mismatch")
     require(used >= events[-1][2].get("review_fix_count", 0), "Continuity cannot reduce recorded usage")
     if source_slice is None:
         prior = [entry for entry in old.get("budget_continuity", [])
@@ -1690,37 +2552,26 @@ def budget_continuity(value, repo, contract_path, slice_id=None, *, visited_cont
         lineage = gate_lineage if gate_lineage is not None else GateFixLineage(value, repo)
         audited = lineage.audit(source, visited, work_item=item["work_item"],
                                 expected=history_seal(item, "source_history_sha256"))
-        require(Path(audited["state_path"]).resolve() == source_state.resolve()
+        require(guarded_resolve(audited["state_path"], old) == guarded_resolve(source_state, old)
                 and audited["state_sha256"] == item["source_state_sha256"],
                 "Continuity state seal mismatch")
         return item
-    inherited = {}
-    prior_count = 0
-    prior_status = None
-    for index, (_, _, event) in enumerate(events):
-        bound(old, repo, event)
-        require(event.get("artifact_hashes", {}).get(str(source)) == item["source_contract_sha256"],
-                "Continuity history does not seal its contract")
-        require(event.get("slice_id") == source_slice, "Continuity slice mismatch")
-        status = event.get("status")
-        require((prior_status is None and status == "implemented") or
-                (prior_status is not None and (status in SLICE_TRANSITIONS.get(prior_status, set())
-                                               or status in {"blocked", "capped"}
-                                               or recorded_binding_recheck(old, repo, event, events[index - 1][2], slice=True)
-                                               or (prior_status == "capped" and status == "needs-fix"
-                                                   and event.get("is_continuation") is True))),
-                "Invalid continuity slice transition")
-        prior_status = status
-        if status == "edited-unverified" and event.get("action") == "review-fix":
-            prior_count += 1
-        require(event.get("review_fix_count", 0) == prior_count,
-                "Continuity slice counter is inconsistent with events")
-        check_event_seals(old, repo, event, inherited)
-        inherited = event.get("artifact_hashes", {})
-    prior = budget_continuity(old, repo, source, source_slice, visited_contracts=visited)
+    audited = audit_slice_history(source, repo, source_slice, inherited_policy=read_policy(value),
+                                  visited_contracts=visited, cache=slice_cache)
+    expected = history_seal(item, "source_history_sha256")
+    require(expected is None or expected == audited["history_sha256"], "Slice history SHA-256 mismatch")
+    if expected is not None:
+        require(guarded_resolve(old.get("repo_paths", {}).get(repo, ""), old)
+                == guarded_resolve(value.get("repo_paths", {}).get(repo, ""), old),
+                "Slice continuity repository mismatch")
+        old_item = old.get("budget_work_items", {}).get(repo)
+        require(not old_item or old_item == item["work_item"], "Continuity work item mismatch")
+    prior = next((entry for entry in old.get("budget_continuity", [])
+                  if entry.get("repo") == repo and entry.get("slice_id") == source_slice), None)
     if prior:
         require(prior["work_item"] == item["work_item"], "Continuity work item mismatch")
-        require(used >= prior["used_passes"] + prior_count, "Continuity cannot reduce cumulative usage")
+        require(used >= prior["used_passes"] + audited["review_fix_count"],
+                "Continuity cannot reduce cumulative usage")
     return item
 
 
@@ -1747,8 +2598,8 @@ def recovery_continuity(value, repo, item, slice_id, visited, gate_lineage):
     root = value["repo_paths"][repo]
     state.text(item.get("decision_path"), "budget recovery decision path")
     decision = absolute_file(item.get("decision_path"), value)
-    require(sha(decision) == item.get("decision_sha256"), "Budget recovery decision seal mismatch")
-    approved = state.load(decision)
+    require(guarded_sha(decision, value) == item.get("decision_sha256"), "Budget recovery decision seal mismatch")
+    approved = guarded_load(decision, value)
     for key in ("work_item", "repo", "approved_by", "user_authorization", "approval_question",
                 "approved_at", "reason", "additional_passes", "recovery_sources", "used_passes", "effective_limit"):
         require(approved.get(key) == item.get(key), "Budget recovery decision does not match accounting")
@@ -1757,14 +2608,14 @@ def recovery_continuity(value, repo, item, slice_id, visited, gate_lineage):
     for source, expected in zip(sources, history_seals):
         state.text(source.get("contract_path"), "budget recovery source path")
         source_path = absolute_file(source.get("contract_path"), value)
-        resolved = source_path.resolve()
+        resolved = guarded_resolve(source_path, value)
         require(resolved not in visited and resolved not in seen,
                 "Duplicate or cyclic budget recovery source")
         seen.add(resolved)
-        require(sha(source_path) == source.get("contract_sha256"), "Budget recovery contract seal mismatch")
-        old = state.load(source_path)
+        require(guarded_sha(source_path, value) == source.get("contract_sha256"), "Budget recovery contract seal mismatch")
+        old = guarded_load(source_path, value)
         require(repo in old.get("repos", []) and
-                guard_path(old.get("repo_paths", {}).get(repo, ""), value).resolve() == guard_path(root, value).resolve(),
+                guarded_resolve(old.get("repo_paths", {}).get(repo, ""), value) == guarded_resolve(root, value),
                 "Budget recovery repository mismatch")
         require(old.get("budget_work_items", {}).get(repo, item["work_item"]) == item["work_item"],
                 "Budget recovery work item mismatch")
@@ -1803,40 +2654,272 @@ def check_related_budgets(value, repo, contract_path):
     if not work_item:
         return
     root = Path(contract_path).parent.parent.parent
-    current = Path(contract_path).resolve()
+    current = guarded_resolve(contract_path, value)
     lineage = GateFixLineage(value, repo)
     events = history(Path(contract_path).parent / repo, value)
     if any(event.get("budget_grant_applied") for _, _, event in events):
         validate_history(contract_path, repo, lineage_cache=lineage.cache, lineage_out=lineage.runs)
     else:
         budget_continuity(value, repo, contract_path, gate_lineage=lineage)
+    inherited_policies = tuple(policy for (_, _, policies) in lineage.cache for policy in policies)
+    value = with_read_policy(value, inherited_policies)
     covered = {snapshot[0] for snapshot in lineage.runs.values()}
-    for run_group in (root / ".ship-runs", root / ".fix-runs"):
-        guard_path(run_group, value)
-        if not run_group.exists():
+    replacement_records = list(value.get("_setup_replacements", []))
+    has_replacement = bool(replacement_records)
+    for replacement in replacement_records:
+        path = absolute_file(replacement["contract_path"], value)
+        ancestor = with_read_policy(guarded_load(path, value), read_policy(value))
+        value = with_read_policy(value, read_policy(ancestor))
+    covered.update(guarded_resolve(item["contract_path"], value) for item in replacement_records)
+    for source in list(covered):
+        if source in {guarded_resolve(item["contract_path"], value) for item in value.get("_setup_replacements", [])}:
             continue
-        for directory in run_group.iterdir():
-            guard_path(directory, value)
-            if not directory.is_dir():
+        ancestor = with_read_policy(guarded_load(absolute_file(source, value), value), read_policy(value))
+        replacements = replacement_chain(ancestor, source)
+        value = with_read_policy(value, read_policy(ancestor))
+        for replacement in replacements:
+            path = absolute_file(replacement["contract_path"], value)
+            replaced = with_read_policy(guarded_load(path, value), read_policy(value))
+            value = with_read_policy(value, read_policy(replaced))
+        replacement_records.extend(replacements)
+        has_replacement = has_replacement or bool(replacements)
+        covered.update(guarded_resolve(item["contract_path"], value) for item in replacements)
+    for item in value.get("budget_continuity", []):
+        if item.get("repo") != repo or item.get("slice_id") is None:
+            continue
+        current_slice = item
+        inherited = read_policy(value)
+        visited = set()
+        while current_slice:
+            source = absolute_file(current_slice.get("source_contract_path"), {"_read_policy": inherited})
+            source_key = (guarded_resolve(source, {"_read_policy": inherited}), current_slice.get("source_slice_id"))
+            require(source_key not in visited, "Historical slice reference cycle")
+            visited.add(source_key)
+            ancestor = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+            inherited = read_policy(ancestor)
+            value = with_read_policy(value, inherited)
+            replacements = replacement_chain(ancestor, source)
+            replacement_records.extend(replacements)
+            has_replacement = has_replacement or bool(replacements)
+            covered.update(guarded_resolve(record["contract_path"], value) for record in replacements)
+            slice_id = current_slice.get("source_slice_id")
+            current_slice = next((entry for entry in ancestor.get("budget_continuity", [])
+                                  if entry.get("repo") == repo and entry.get("slice_id") == slice_id), None)
+    if has_replacement:
+        for item in value.get("budget_continuity", []):
+            if item.get("repo") != repo or item.get("slice_id") is None:
+                continue
+            require(history_seal(item, "source_history_sha256"), "Replacement slice requires a history SHA-256")
+            budget_continuity(value, repo, contract_path, item["slice_id"])
+            source_item = item
+            while source_item:
+                source = absolute_file(source_item.get("source_contract_path"), value)
+                old = with_read_policy(guarded_load(source, value), read_policy(value))
+                value = with_read_policy(value, read_policy(old))
+                if not guarded_history(source.parent / repo, old):
+                    telemetry = source.parent / "telemetry"
+                    for name in guarded_names(telemetry, old):
+                        if not name.endswith(".json"):
+                            continue
+                        event_path = telemetry / name
+                        policies = read_policy(old)
+                        guarded = state.guard_excluded_paths(event_path.absolute(), policies, pinned=bool(policies))
+                        if not policies:
+                            guarded = guarded.resolve()
+                        with state.capture_open(guarded) as handle:
+                            event = json.load(handle)
+                        require(not (event.get("repo") in {None, repo} and event.get("slice_id") is None
+                                     and event.get("phase") in {"review-fix", "gate-fix"}),
+                                "Repo repair telemetry exists without repository history")
+                    covered.add(guarded_resolve(source, value))
+                old_slice = source_item.get("source_slice_id")
+                prior = [entry for entry in old.get("budget_continuity", [])
+                         if entry.get("repo") == repo and entry.get("slice_id") == old_slice]
+                require(len(prior) <= 1, "Duplicate prior slice continuity")
+                source_item = prior[0] if prior else None
+    related_paths = []
+    for run_group in (root / ".ship-runs", root / ".fix-runs"):
+        for name in guarded_names(run_group, value):
+            directory = run_group / name
+            try:
+                names = guarded_names(directory, value)
+            except NotADirectoryError:
                 continue
             candidate = directory / "contract.json"
             guard_path(candidate, value)
-            if not candidate.exists():
+            if "contract.json" not in names:
                 continue
-            if candidate.resolve() == current:
+            if guarded_resolve(candidate, value) == current:
                 continue
-            other = state.load(candidate)
+            other = guarded_load(candidate, value)
             other_work = dict(other.get("budget_work_items", {}))
             for item in other.get("budget_continuity", []):
                 if item.get("slice_id") is None:
                     other_work.setdefault(item["repo"], item["work_item"])
             related = any(identifier == work_item and
-                          guard_path(other.get("repo_paths", {}).get(name, ""), value).resolve()
-                          == guard_path(value["repo_paths"][repo], value).resolve()
+                          guarded_resolve(other.get("repo_paths", {}).get(name, ""), value)
+                          == guarded_resolve(value["repo_paths"][repo], value)
                           for name, identifier in other_work.items())
             if related:
-                require(candidate.resolve() in covered,
+                require(guarded_resolve(candidate, value) in covered,
                         f"Related run is missing from budget continuity: {candidate}")
+                related_paths.append(candidate)
+    if has_replacement:
+        related_paths.extend(path for path in covered if path != current)
+        carried = []
+        for replacement in replacement_records:
+            old_path = absolute_file(replacement["contract_path"], value)
+            old = with_read_policy(guarded_load(old_path, value), read_policy(value))
+            declarations = old.get("budget_continuity", [])
+            require(isinstance(declarations, list), "Invalid replaced setup continuity")
+            for entry in declarations:
+                require(isinstance(entry, dict), "Invalid replaced setup continuity entry")
+                if entry.get("repo") == repo:
+                    budget_continuity(old, repo, old_path, entry.get("slice_id"))
+                    carried.append((old, entry))
+        slices = check_replacement_slice_coverage(value, repo, contract_path, related_paths, carried)
+        repo_sources = {snapshot[0] for snapshot in lineage.runs.values()}
+        for old, entry in carried:
+            require(entry.get("work_item") == work_item, "Replaced setup continuity work item mismatch")
+            if "recovery_sources" in entry:
+                sources = entry["recovery_sources"]
+                require(isinstance(sources, list) and sources, "Invalid replaced setup recovery sources")
+                references = [(source.get("contract_path"), source.get("contract_sha256")) for source in sources]
+            else:
+                references = [(entry.get("source_contract_path"), entry.get("source_contract_sha256"))]
+            for raw, expected in references:
+                source = absolute_file(raw, old)
+                require(guarded_sha(source, old) == expected, "Replaced setup predecessor contract seal mismatch")
+                identity = guarded_resolve(source, old)
+                if entry.get("slice_id") is None:
+                    require(identity in repo_sources,
+                            "Replaced setup predecessor is missing from budget continuity")
+                    successor = budget_continuity(value, repo, contract_path)
+                else:
+                    require((identity, entry.get("source_slice_id")) in slices,
+                            "Replaced setup slice predecessor is missing from budget continuity")
+                    successor = slices[(identity, entry.get("source_slice_id"))]
+                require(successor is not None and successor["used_passes"] >= entry["used_passes"]
+                        and successor["effective_limit"] >= entry["effective_limit"],
+                        "Replacement cannot reduce carried budget usage or allowance")
+        if value.get("setup_replacement") is not None and not value.get("_pending_replacement"):
+            pending = reserve_predecessors(value, Path(contract_path), guarded_sha(contract_path, value), value,
+                                           lineage_cache=lineage.cache)
+            require(not pending, "Predecessor reservation is missing")
+
+
+def check_replacement_slice_coverage(value, repo, contract_path, related_paths, carried):
+    """Require every related started slice to appear in a validated continuity chain."""
+    covered = {}
+    for item in value.get("budget_continuity", []):
+        if item.get("repo") != repo or item.get("slice_id") is None:
+            continue
+        require(item.get("work_item") == value.get("budget_work_items", {}).get(repo),
+                "Replacement slice work item mismatch")
+        require(history_seal(item, "source_history_sha256"), "Replacement slice requires a history SHA-256")
+        budget_continuity(value, repo, contract_path, item["slice_id"])
+        schedule = value.get("slice_schedules", {}).get(repo)
+        require(isinstance(schedule, dict), "Replacement slice requires an approved schedule")
+        selected_slice(value, repo, item["slice_id"], schedule.get("path"))
+        source = absolute_file(item["source_contract_path"], value)
+        ancestor = with_read_policy(guarded_load(source, value), read_policy(value))
+        require(guarded_resolve(ancestor.get("repo_paths", {}).get(repo, ""), ancestor)
+                == guarded_resolve(value["repo_paths"][repo], ancestor), "Slice continuity repository mismatch")
+        audited = audit_slice_history(source, repo, item["source_slice_id"], inherited_policy=read_policy(value),
+                                      strict=True)
+        direct_totals = (item["used_passes"] == audited["historical_used_passes"] + audited["review_fix_count"]
+                         and item["effective_limit"] == audited["historical_used_passes"] + audited["review_fix_limit"])
+        fields = ("source_contract_sha256", "source_state_sha256", "used_passes", "effective_limit",
+                  "approved_by", "user_authorization", "reason", "approved_at", "decision_path", "decision_sha256")
+        carried_totals = any(previous.get("slice_id") is not None
+                             and guarded_resolve(previous.get("source_contract_path", ""), value) == guarded_resolve(source, value)
+                             and previous.get("source_slice_id") == item["source_slice_id"]
+                             and all(previous.get(key) == item.get(key) for key in fields)
+                             for _, previous in carried)
+        require(direct_totals or carried_totals,
+                "Slice continuity totals differ from audited history")
+        current = item
+        inherited = read_policy(value)
+        while current:
+            source = absolute_file(current.get("source_contract_path"), {"_read_policy": inherited})
+            slice_id = state.relative_path(current.get("source_slice_id"))
+            key = (guarded_resolve(source, {"_read_policy": inherited}), slice_id)
+            require(key not in covered, "Duplicate or cyclic slice history import")
+            covered[key] = item
+            ancestor = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+            inherited = read_policy(ancestor)
+            prior = [entry for entry in ancestor.get("budget_continuity", [])
+                     if entry.get("repo") == repo and entry.get("slice_id") == slice_id]
+            require(len(prior) <= 1, "Duplicate prior slice continuity")
+            require(not prior or prior[0].get("work_item") == item["work_item"], "Slice ancestor work item mismatch")
+            current = prior[0] if prior else None
+    for source in related_paths:
+        slices = source.parent / repo / "slices"
+        for name, mode in guarded_entries(slices, value):
+            directory = slices / name
+            guard_path(directory, value)
+            require(not stat.S_ISLNK(mode), "Slice history directory cannot be a symlink")
+            if not stat.S_ISDIR(mode):
+                continue
+            events = guarded_history(directory, value)
+            if events:
+                require((guarded_resolve(source, value), directory.name) in covered,
+                        f"Related slice history is missing from budget continuity: {directory}")
+    return covered
+
+
+def collect_setup_replacements(value, contract_path, repo, *, lineage=None, lineage_cache=None):
+    """Collect replacement links from this contract and audited predecessor contracts."""
+    if lineage is None:
+        lineage = GateFixLineage(value, repo, lineage_cache)
+        events = history(Path(contract_path).parent / repo, value)
+        review_budget(events, contract_path, value, repo, gate_lineage=lineage)
+    records = list(replacement_chain(value, contract_path))
+    seen = {item["closure_path"]: item for item in records}
+    sources = {}
+    for (source, cached_repo, policy), _ in lineage.cache.items():
+        if cached_repo == repo:
+            sources.setdefault(source, []).extend(policy)
+    for item in value.get("budget_continuity", []):
+        if item.get("repo") != repo or item.get("slice_id") is None:
+            continue
+        current = item
+        visited = set()
+        inherited = read_policy(value)
+        while current:
+            source = absolute_file(current.get("source_contract_path"), {"_read_policy": inherited})
+            key = (guarded_resolve(source, {"_read_policy": inherited}), current.get("source_slice_id"))
+            require(key not in visited, "Historical slice reference cycle")
+            visited.add(key)
+            old = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+            inherited = read_policy(old)
+            sources.setdefault(guarded_resolve(source, {"_read_policy": inherited}), []).extend(inherited)
+            source_slice = current.get("source_slice_id")
+            current = next((entry for entry in old.get("budget_continuity", [])
+                            if entry.get("repo") == repo and entry.get("slice_id") == source_slice), None)
+    for source, inherited in sorted(sources.items()):
+        inherited = tuple(inherited)
+        old = with_read_policy(guarded_load(absolute_file(source, {"_read_policy": inherited}),
+                                            {"_read_policy": inherited}), inherited)
+        for item in replacement_chain(old, source):
+            previous = seen.setdefault(item["closure_path"], item)
+            require(previous == item, "Conflicting setup replacement snapshots")
+            if item not in records:
+                records.append(item)
+    return records
+
+
+def all_setup_replacements(value, contract_path, *, lineage_cache=None):
+    if lineage_cache is None:
+        lineage_cache = {}
+    records, seen = [], {}
+    for repo in value["repos"]:
+        for item in collect_setup_replacements(value, contract_path, repo, lineage_cache=lineage_cache):
+            previous = seen.setdefault(item["closure_path"], item)
+            require(previous == item, "Conflicting setup replacement snapshots")
+            if item not in records:
+                records.append(item)
+    return records
 
 
 def review_budget(events, contract_path=None, value=None, repo=None, visited_contracts=None, *,
@@ -2383,6 +3466,7 @@ def accept_review_findings(contract_path, value, repo, events, request, final, s
 
 def transition(contract_path, repo, request_path, out):
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     require(repo in value["repos"], "Unknown transition repo")
     check_related_budgets(value, repo, contract_path)
     directory = Path(contract_path).parent / repo
@@ -3161,6 +4245,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     final review/fix budget over the whole repo diff.
     """
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     plan = slice_schedule(contract_path, repo, schedule_path)
     items = {i["id"]: i for i in state.load(absolute_file(schedule_path))["slices"]}
     require(slice_id in items, "Unknown slice")
@@ -3600,6 +4685,7 @@ def slice_gate(contract_path, repo, schedule_path, initial_path, source_path, ou
 def prepare_slice_gate(contract_path, repo, schedule_path, initial_path, source_path, amendment_path=None):
     """Certify that every slice is accepted, current and not stale before the repo-level lifecycle starts."""
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     plan = slice_schedule(contract_path, repo, schedule_path)
     schedule = state.load(absolute_file(schedule_path))
     initial = manifest(value, repo, initial_path)
@@ -3894,6 +4980,7 @@ def batches(contract_path, repo):
 def batch_start(contract_path, repo, schedule_path, members, base_path, baseline_dir, scope, out):
     """Open one shared-checkout write window for a computed group; the orchestrator alone calls this."""
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     plan = slice_schedule(contract_path, repo, schedule_path)
     schedule = state.load(absolute_file(schedule_path))
     require(sorted(members) == sorted(next((g for g in plan["groups"] if set(members) <= set(g)), [])),
@@ -3926,6 +5013,7 @@ def batch_start(contract_path, repo, schedule_path, members, base_path, baseline
 def batch_barrier(contract_path, repo, schedule_path, start_path, manifest_path, results_path, out):
     """Close a write window: all writers stopped, every change attributed to exactly one member, nothing else moved."""
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     plan = slice_schedule(contract_path, repo, schedule_path)
     start = state.load(absolute_file(start_path))
     bound(value, repo, start)
@@ -4123,15 +5211,24 @@ def checked_slice_schedule(value, repo, schedule_path):
     return schedule, {"groups": groups, "cross_slice_criteria": sorted(cross), "schedule_sha256": sha(path)}
 
 
-def gate_budget_certificate(contract_path, value, repo, events):
+def gate_budget_certificate(contract_path, value, repo, events, *, lineage_cache=None):
     certificate_path = guard_path(contract_path.parent / "completion.json", value)
     if not certificate_path.is_file():
         return None
-    record = state.load(certificate_path)
+    record = guarded_load(certificate_path, value)
     require(isinstance(record, dict), "Invalid completion certificate")
     require(record.get("schema_version") == VERSION and record.get("run_id") == value["run_id"]
             and record.get("workflow") == value["workflow"] and record.get("status") == "completed",
             "Invalid completion certificate identity")
+    replacements = all_setup_replacements(value, contract_path, lineage_cache=lineage_cache)
+    if replacements or "setup_replacements" in record:
+        require(record.get("setup_replacements") == replacements, "Completion replacement chain mismatch")
+        for replacement in replacements:
+            require(record.get("artifact_hashes", {}).get(replacement["closure_path"]) == replacement["closure_sha256"]
+                    and record.get("artifact_hashes", {}).get(replacement["contract_path"]) == replacement["contract_sha256"],
+                    "Completion replacement seal mismatch")
+            require(all(record.get("artifact_hashes", {}).get(path) == digest
+                        for path, digest in replacement["files"].items()), "Completion setup artifact seal mismatch")
     repos = record.get("repos")
     require(isinstance(repos, dict) and set(value["repos"]) <= repos.keys(),
             "Completion certificate is missing a contract repository")
@@ -4142,7 +5239,8 @@ def gate_budget_certificate(contract_path, value, repo, events):
     anchor = next(((path, event) for _, path, event in events if str(path) == certified_state), None)
     seals = record.get("artifact_hashes")
     require(isinstance(seals, dict) and anchor is not None and anchor[1]["status"] == "verified"
-            and seals.get(certified_state) == sha(anchor[0]) and seals.get(str(contract_path)) == sha(contract_path),
+            and seals.get(certified_state) == guarded_sha(anchor[0], value)
+            and seals.get(str(contract_path)) == guarded_sha(contract_path, value),
             "Completion certificate state/contract seal mismatch")
     state_dir = anchor[0].parent
     sealed_states = []
@@ -4160,12 +5258,15 @@ def gate_budget_certificate(contract_path, value, repo, events):
 def validate_history(contract_path, repo, visited_contracts=None, read_excludes=(), *,
                      inherited_policy=(), lineage_cache=None, lineage_out=None):
     """Audit immutable lifecycle state and grant chains without recapturing today's source."""
+    if lineage_cache is None:
+        lineage_cache = {}
     contract_file = absolute_file(contract_path, {"_read_policy": inherited_policy})
     visited = set(visited_contracts or ())
-    require(contract_file.resolve() not in visited,
+    identity = guarded_resolve(contract_file, {"_read_policy": inherited_policy})
+    require(identity not in visited,
             "Historical budget reference cycle/current-run ancestry detected")
-    visited.add(contract_file.resolve())
-    value = state.load(contract_file)
+    visited.add(identity)
+    value = guarded_load(contract_file, {"_read_policy": inherited_policy})
     require(isinstance(value, dict) and value.get("schema_version") == VERSION
             and value.get("workflow") in {"ship", "fix"}, "Invalid historical workflow contract")
     require(contract_file.parent.name == value.get("run_id"), "Contract/run directory mismatch")
@@ -4174,6 +5275,11 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
         inherited_policy = (*inherited_policy, (value["repo_paths"][repo], read_excludes))
     value = with_read_policy(value, inherited_policy)
     guard_path(contract_file, value)
+    if value.get("setup_replacement") is not None:
+        replacement_chain(value, contract_file)
+        pending = reserve_predecessors(value, contract_file, guarded_sha(contract_file, value), value,
+                                       lineage_cache=lineage_cache)
+        require(not pending, "Predecessor reservation is missing")
     continuity, _ = continuity_declarations(value, historical=True)
     events = history(contract_file.parent / state.relative_path(repo), value)
     require(events, "No lifecycle history")
@@ -4252,7 +5358,7 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
                     and event.get("applied_path") == references["applied"]
                     and set(seals) <= inherited.keys(),
                     "Historical slice repair recovery proof is not sealed")
-    certificate = gate_budget_certificate(contract_file, value, repo, events)
+    certificate = gate_budget_certificate(contract_file, value, repo, events, lineage_cache=lineage_cache)
     lineage = GateFixLineage(value, repo, lineage_cache)
     limit, grants = review_budget(events, contract_file, value, repo, visited,
                                   gate_lineage=lineage, certificate=certificate)
@@ -4365,6 +5471,7 @@ def review_budget_status(contract_path, repo, slice_id=None):
 
 def complete(contract_path, out):
     value = contract(contract_path)
+    require_unreserved(value, contract_path)
     root = Path(contract_path).parent
     require(Path(out).resolve() == (root / "completion.json").resolve(), "Invalid completion path")
     repos = {}
@@ -4459,12 +5566,17 @@ def complete(contract_path, out):
         paths += [str(events[-1][1]), *latest["artifact_hashes"]]
     if value.get("telemetry_policy", {}).get("run_local_seals"):
         require_run_local(value, root, paths)
+    replacements = all_setup_replacements(value, contract_path, lineage_cache=lineages)
+    for replacement in replacements:
+        paths.extend([replacement["closure_path"], *replacement["files"]])
     for repo, entry in repos.items():
         current = history(root / repo)
         require(current and str(current[-1][1]) == entry["state_path"]
                 and sha(current[-1][1]) == certified_state_hashes[repo], "Completion state changed during checks")
     check_gate_sources_current(lineages)
-    seals = seal_files(paths, value if value.get("external_stores") else None)
+    require(all_setup_replacements(value, contract_path, lineage_cache=lineages) == replacements,
+            "Setup replacement changed during completion")
+    seals = seal_files(paths, value)
     if value.get("external_stores"):
         confirm_completion_versions(value, repos)
     state.write_once(out, {"schema_version": VERSION, "run_id": value["run_id"],
@@ -4472,11 +5584,13 @@ def complete(contract_path, out):
                           "amendment": value.get("_amendment"),
                           "amendments": [dict(applied) for applied in value.get("_amendments", [])],
                           "at": datetime.now(timezone.utc).isoformat(), "repos": repos,
+                          **({"setup_replacements": replacements} if replacements else {}),
                           "artifact_hashes": seals})
 
 
 def packet(contract_path, repo, scope_path, baseline_dir, out):
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     require(repo in value["repos"], "Unknown packet repo")
     scope = scope_input(Path(scope_path).absolute(), value)
     directory = Path(out)
@@ -4516,13 +5630,15 @@ def packet(contract_path, repo, scope_path, baseline_dir, out):
 
 
 def record_evidence(contract_path, repo, request_path, out):
-    record = state.load(absolute_file(request_path))
+    value = contract(contract_path)
+    record = guarded_load(absolute_file(request_path, value), value)
     return record_evidence_record(contract_path, repo, record, out)
 
 
 def prepare_evidence_record(contract_path, repo, record):
     """Validate one evidence record and seal its artifacts without writing it yet."""
     value = contract(contract_path)
+    require_unreserved(value, contract_path, repo)
     require(repo in value["repos"], "Unknown evidence repo")
     require(isinstance(record, dict), "Evidence input must be an object")
     prepared = dict(record)
@@ -4540,22 +5656,25 @@ def prepare_evidence_record(contract_path, repo, record):
         require(prepared.get("amendment_sha256") in suffix, "Evidence lacks amendment binding")
     prepared["criterion_id"] = claims[0]["id"]
     final = manifest(value, repo, prepared["after_manifest"])
-    state.evidence(prepared, final, repo_read_excludes(value, repo), guard=lambda p: guard_path(p, value))
+    state.evidence(prepared, final, repo_read_excludes(value, repo), guard=lambda p: guard_path(p, value),
+                   loader=lambda p: guarded_load(p, value), file_check=lambda p: bool(absolute_file(p, value)))
     for path in prepared["artifact_paths"]:
         absolute_file(path, value)
     execution_binding(prepared, value)
     validate_input_binding(value, repo, prepared)
     validate_delivery_reference(value, repo, prepared)
     prepared["artifact_hashes"] = seal_files([
-        prepared["before_manifest"], prepared["after_manifest"], *prepared["artifact_paths"]])
+        prepared["before_manifest"], prepared["after_manifest"], *prepared["artifact_paths"]], value)
     return prepared
 
 
 def record_evidence_record(contract_path, repo, record, out):
     prepared = prepare_evidence_record(contract_path, repo, record)
-    require(Path(out).resolve().is_relative_to(Path(contract_path).parent.resolve()),
+    value = contract(contract_path)
+    output = guarded_resolve(out, value)
+    require(output.is_relative_to(guarded_resolve(contract_path, value).parent),
             "Evidence must remain in run directory")
-    state.write_once(out, prepared)
+    state.write_once(output, prepared, pinned=True)
     return prepared
 
 
@@ -4597,13 +5716,17 @@ def record_evidence_batch(contract_path, records, stop_on_fail=False):
             out = entry.get("out")
             require(isinstance(out, str) and Path(out).is_absolute(),
                     "Batch evidence record needs an absolute out path")
-            require(not Path(out).exists(), f"Evidence output already exists: {out}")
+            value = contract(contract_path)
+            output = guarded_resolve(out, value)
+            require(output.is_relative_to(guarded_resolve(contract_path, value).parent),
+                    "Evidence must remain in run directory")
+            require(not guarded_exists(output, value), f"Evidence output already exists: {out}")
             record = resolve_batch_record(entry)
             identifier = record.get("criterion_id") or \
                 (record["claims"][0]["id"] if isinstance(record.get("claims"), list) and record["claims"] else None)
             prepared_record = prepare_evidence_record(contract_path, repo, record)
             identifier = prepared_record["criterion_id"]
-            prepared.append((out, prepared_record))
+            prepared.append((output, prepared_record))
             results.append({"id": identifier, "status": "ok", "path": out, "error": None})
         except (ValueError, OSError, KeyError, TypeError) as error:
             failed = True
@@ -4615,7 +5738,7 @@ def record_evidence_batch(contract_path, records, stop_on_fail=False):
             if stop_on_fail:
                 break
     for out, record in prepared:
-        state.write_once(out, record)
+        state.write_once(out, record, pinned=True)
     return results, not failed
 
 
@@ -4642,6 +5765,7 @@ def phase_from_flags(contract_path, out, *, phase_id, phase, event, repo=None, s
 def phase_from_record(contract_path, record, out):
     value = contract(contract_path)
     require(isinstance(record, dict), "Telemetry request must be an object")
+    require_unreserved(value, contract_path, record.get("repo"))
     record.setdefault("run_id", value["run_id"])
     record.setdefault("workflow", value["workflow"])
     require(record.get("run_id") == value["run_id"] and record.get("workflow") == value["workflow"],
@@ -4751,8 +5875,24 @@ def digest(contract_path, repo, verbose=False):
                "checks": {}, "review_budget": None, "gate_fix_budget": None}
     errors = {}
     try:
+        raw = state.load(absolute_file(contract_path))
+        closure_path = guard_path(Path(contract_path).absolute().parent / "setup-replacement.json", raw)
+        if closure_path.is_file():
+            closure = state.load(closure_path)
+            successor_path = absolute_file(closure.get("successor_contract_path"), raw)
+            successor = with_read_policy(state.load(successor_path), read_policy(raw))
+            replacements = replacement_chain(successor, successor_path)
+            require(replacements and Path(replacements[0]["contract_path"]).resolve() == Path(contract_path).resolve(),
+                    "Invalid replacement successor")
+            require(repo in raw.get("repos", []), "Unknown digest repo")
+            summary.update(run_id=raw["run_id"], current_status="replaced",
+                           setup_replacements=replacements[:1])
+            summary["checks"]["replacement"] = "passed"
+            return summary
         value = contract(contract_path)
         summary["run_id"] = value["run_id"]
+        if value.get("_setup_replacements"):
+            summary["setup_replacements"] = value["_setup_replacements"]
         require(repo in value["repos"], "Unknown digest repo")
         summary["checks"]["contract"] = "passed"
     except (ValueError, OSError, KeyError, TypeError) as error:
@@ -4819,6 +5959,9 @@ def digest(contract_path, repo, verbose=False):
     try:
         lineage = GateFixLineage(value, repo)
         limit, grants = review_budget(events, contract_path, value, repo, gate_lineage=lineage)
+        replacements = collect_setup_replacements(value, contract_path, repo, lineage=lineage)
+        if replacements:
+            summary["setup_replacements"] = replacements
         summary["gate_fix_budget"] = lineage.summary((latest or {}).get("gate_fix_count", 0))
         used = latest.get("review_fix_count", 0) if latest else 0
         continuity = budget_continuity(value, repo, contract_path)
@@ -4917,7 +6060,9 @@ def digest_all_repos(contract_path, verbose=False):
     """Read-only digest for every repo in the contract in one process; never writes run artifacts."""
     result = {"run_id": None, "status": "failed", "repos": {}, "checks": {}, "summary": {}}
     try:
-        value = contract(contract_path)
+        raw = state.load(absolute_file(contract_path))
+        closed = guard_path(Path(contract_path).absolute().parent / "setup-replacement.json", raw).is_file()
+        value = raw if closed else contract(contract_path)
     except (ValueError, OSError, KeyError, TypeError) as error:
         result["checks"]["contract"] = "failed"
         result["errors"] = {"contract": str(error)}
@@ -4933,7 +6078,8 @@ def digest_all_repos(contract_path, verbose=False):
         else:
             result["repos"][repo] = {key: summary[key] for key in
                                      ("status", "current_status", "next_transitions",
-                                      "remaining_findings", "artifacts", "checks", "review_budget", "gate_fix_budget")
+                                      "remaining_findings", "artifacts", "checks", "review_budget", "gate_fix_budget",
+                                      "setup_replacements")
                                      if key in summary}
             if "errors" in summary:
                 result["repos"][repo]["errors"] = summary["errors"]
