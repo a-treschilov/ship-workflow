@@ -336,6 +336,13 @@ immediately before the DB-backed gates (also usable with `--group required_gates
 unchanged, saves the log and real exit code, captures before/after manifests and records orchestrator evidence through
 `record-evidence`, keeping failed results with a `reason`. Output directories are write-once; use a new one per run.
 
+For `gates`, phase-end includes `gate_results` for every required ID, with selection, status and actual exit code.
+The phase passes only when all required checks passed in that invocation. An unsupported `command` check requires
+an independent execution and evidence via `record-evidence`; a static check requires independent inspection and
+evidence. The runner does not execute shell strings. A successful `--ids` subset exits zero for the selected checks
+and records the incomplete phase as blocked. Failed checks make the phase failed; unsupported or unselected checks
+make an otherwise incomplete phase blocked. Evidence for every required ID remains necessary for certification.
+
 Implementer writes a bound matrix JSON with `criteria` rows:
 `criterion_id, implementation, assertion, status: verified|unverified, reason, evidence_paths`.
 Every mandatory repo criterion appears. Check fixture domain identity, defect-sensitive assertions,

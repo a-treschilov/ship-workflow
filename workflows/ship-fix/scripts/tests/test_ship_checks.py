@@ -269,6 +269,42 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(workflow.sha(str(self.run_dir / "telemetry/gates-1-start.json")),
                          end["start_sha256"])
 
+    def test_gates_cli_reports_all_required_checks(self):
+        legacy = {"id": "gate.legacy", "kind": "empirical", "command": "false", "verification": "exit zero"}
+        argv = [self.entry("gate.one"), self.entry("gate.two")]
+        cases = [
+            ("command", [legacy], [], 1, "blocked", ["unsupported"], "0/1 required"),
+            ("mixed", [argv[0], legacy], [], 1, "blocked", ["passed", "unsupported"], "1/2 required"),
+            ("full", argv, [], 0, "passed", ["passed", "passed"], "2/2 required"),
+            ("partial", argv, ["--ids", "gate.one"], 0, "blocked", ["passed", "not-selected"], "1/2 required"),
+            ("explicit-command", [legacy], ["--ids", "gate.legacy"], 1, "blocked", ["unsupported"], "0/1 required"),
+            ("static", [{"id": "gate.static", "kind": "static", "verification": "inspect"}],
+             [], 1, "blocked", ["unsupported"], "0/1 required"),
+        ]
+        for name, entries, extra, code, phase, statuses, summary in cases:
+            with self.subTest(name=name):
+                self.contract["required_gates"]["api"] = entries
+                self.persist()
+                out = self.run_dir / name
+                result = subprocess.run([sys.executable, "-I", "-B", str(RUNNER_SCRIPT), "gates",
+                    "--contract", str(self.path), "--repo", "api", "--scope", self.scope,
+                    "--out-dir", str(out), "--phase-id", name, *extra], capture_output=True, text=True)
+                self.assertEqual(code, result.returncode, result.stderr)
+                self.assertIn(summary, result.stdout)
+                end = state.load(self.run_dir / f"telemetry/{name}-end.json")
+                self.assertEqual(phase, end["status"])
+                self.assertEqual("done", end["end_reason"])
+                self.assertEqual(statuses, [end["gate_results"][c["id"]]["status"] for c in entries])
+                self.assertEqual(workflow.sha(str(self.run_dir / f"telemetry/{name}-start.json")), end["start_sha256"])
+                for entry, expected in zip(entries, statuses):
+                    recorded = end["gate_results"][entry["id"]]
+                    self.assertEqual(expected != "not-selected", recorded["selected"])
+                    self.assertEqual(0 if expected == "passed" else None, recorded["exit_code"])
+                    self.assertEqual(expected == "passed", (out / f"{entry['id']}-record.json").exists())
+                    if expected == "unsupported":
+                        self.assertIn("record-evidence", recorded["action"])
+                        self.assertIn(entry["id"] + ": unsupported", result.stdout)
+
     def add_gates_repo(self, name, code):
         other = self.root / name
         other.mkdir()
@@ -279,6 +315,67 @@ class CheckTests(unittest.TestCase):
             self.contract[group][name] = [self.entry(f"{group}-{name}", code)]
         self.contract["required_passes"][name] = ["logic"]
         self.persist()
+
+    def test_gates_stop_on_fail_reports_unrun_checks(self):
+        self.contract["required_gates"]["api"] = [self.entry("gate.fail", "raise SystemExit(23)"),
+                                                    self.entry("gate.later")]
+        self.persist()
+        result = subprocess.run([sys.executable, "-I", "-B", str(RUNNER_SCRIPT), "gates",
+            "--contract", str(self.path), "--repo", "api", "--scope", self.scope,
+            "--out-dir", str(self.run_dir / "stop"), "--phase-id", "stop", "--stop-on-fail"],
+            capture_output=True, text=True)
+        self.assertEqual(1, result.returncode)
+        end = state.load(self.run_dir / "telemetry/stop-end.json")
+        self.assertEqual("failed", end["status"])
+        self.assertEqual("not-run", end["gate_results"]["gate.later"]["status"])
+        self.assertEqual("stopped after a failed check", end["gate_results"]["gate.later"]["reason"])
+        self.assertIn("gate.later: not-run", result.stdout)
+
+    def test_gates_cli_rejects_unknown_id_before_starting_phase(self):
+        result = subprocess.run([sys.executable, "-I", "-B", str(RUNNER_SCRIPT), "gates",
+            "--contract", str(self.path), "--repo", "api", "--scope", self.scope,
+            "--out-dir", str(self.run_dir / "unknown-gate"), "--phase-id", "unknown-gate",
+            "--ids", "missing"], capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Unknown check id requested", result.stderr)
+        self.assertFalse((self.run_dir / "telemetry/unknown-gate-start.json").exists())
+
+    def test_gates_cli_preserves_exit_when_evidence_recording_is_refused(self):
+        out = self.run_dir / "refused"
+        out.mkdir()
+        existing = out / "gate.tests-record.json"
+        existing.write_text("existing evidence\n")
+        result = subprocess.run([sys.executable, "-I", "-B", str(RUNNER_SCRIPT), "gates",
+            "--contract", str(self.path), "--repo", "api", "--scope", self.scope,
+            "--out-dir", str(out), "--phase-id", "refused"], capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("record-evidence refused", result.stderr)
+        self.assertIn("gate.tests: unverified exit=0", result.stdout)
+        self.assertEqual("existing evidence\n", existing.read_text())
+        self.assertEqual("0\n", (out / "gate.tests.exit").read_text())
+        start = self.run_dir / "telemetry/refused-start.json"
+        end = state.load(self.run_dir / "telemetry/refused-end.json")
+        self.assertEqual(("blocked", "unknown"), (end["status"], end["end_reason"]))
+        self.assertEqual(workflow.sha(str(start)), end["start_sha256"])
+        gate = end["gate_results"]["gate.tests"]
+        self.assertEqual((True, "unverified", 0), (gate["selected"], gate["status"], gate["exit_code"]))
+        self.assertIn("evidence recording did not complete", gate["reason"])
+
+    def test_batch_partial_selection_reports_blocked_phases(self):
+        self.add_gates_repo("web", "pass")
+        for repo in ("api", "web"):
+            self.contract["required_gates"][repo] = [self.entry("gate.one"), self.entry("gate.two")]
+        self.persist()
+        inputs = self.run_dir / "inputs"
+        self.write_scope_files(inputs)
+        result = subprocess.run([sys.executable, "-I", "-B", str(RUNNER_SCRIPT), "gates",
+            "--contract", str(self.path), "--all-repos", "--scope-dir", str(inputs),
+            "--out-dir", str(self.run_dir / "batch"), "--ids", "gate.one", "--stop-on-fail"],
+            capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        for repo in ("api", "web"):
+            self.assertIn(f"gates {repo}: passed; phase blocked", result.stdout)
+            self.assertEqual("blocked", state.load(self.run_dir / f"telemetry/{repo}-gates-1-end.json")["status"])
 
     def write_scope_files(self, directory):
         directory.mkdir(exist_ok=True)

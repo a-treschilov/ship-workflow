@@ -69,7 +69,7 @@ def write_text_once(state, path, text):
 
 
 def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop_on_fail, *,
-              deliverable_manifest=None, slice_id=None, schedule=None):
+              deliverable_manifest=None, slice_id=None, schedule=None, progress=None):
     repo_path = contract["repo_paths"][repo]
     workflow = workflow_module()
     if contract.get("external_stores") or workflow.staged_deliverables(contract, repo) or deliverable_manifest:
@@ -114,6 +114,9 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
         inputs, observed = workflow.before_check_inputs(contract, repo, check, out_dir / f"{cid}-inputs",
                                                         pinned_out_dir=out_dir / f"{cid}-inputs")
         done = run(check["argv"], cwd=repo_path)
+        if progress is not None:
+            progress[cid].update(status="unverified", exit_code=done.returncode,
+                                 reason="execution completed; evidence recording did not complete")
         write_text_once(workflow.state, log, sanitize((done.stdout + "\n--- stderr ---\n" + done.stderr).encode()))
         write_text_once(workflow.state, marker, f"{done.returncode}\n")
         inputs, bindings = workflow.after_check_inputs(contract, check, inputs, observed)
@@ -147,6 +150,9 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
         print(f"{cid}: exit={done.returncode} {note[0]}", flush=True)
         if rec.returncode != 0:
             raise SystemExit(f"{cid}: record-evidence refused: {note[0]}")
+        if progress is not None:
+            progress[cid]["status"] = status
+            progress[cid].pop("reason", None)
         if status == "failed" and stop_on_fail:
             break
     return results
@@ -159,9 +165,24 @@ def gates(contract_path, repo, scope, out_dir, phase_id, ids="", stop_on_fail=Fa
         raise SystemExit("Unknown repo")
     workflow = workflow_module()
     wanted = {i for i in ids.split(",") if i}
-    available = {check["id"] for check in contract["required_gates"][repo] if "argv" in check}
+    checks = contract["required_gates"][repo]
+    available = {check["id"] for check in checks}
     if not wanted <= available:
-        raise SystemExit("Unknown or non-argv check id requested")
+        raise SystemExit("Unknown check id requested")
+    selected = wanted or available
+    gate_results = {}
+    for check in checks:
+        cid = check["id"]
+        entry = {"selected": cid in selected, "status": "not-selected", "exit_code": None}
+        if cid in selected:
+            if "argv" in check:
+                entry.update(status="not-run", reason="execution did not complete")
+            else:
+                action = ("Run the declared command independently and record evidence with record-evidence"
+                          if check["kind"] == "empirical" else
+                          "Perform the declared inspection independently and record evidence with record-evidence")
+                entry.update(status="unsupported", action=action)
+        gate_results[cid] = entry
     workflow.mark_work_started(contract_path, repo)
     run_dir = Path(contract_path).resolve().parent
     start_path = run_dir / "telemetry" / f"{phase_id}-start.json"
@@ -169,19 +190,36 @@ def gates(contract_path, repo, scope, out_dir, phase_id, ids="", stop_on_fail=Fa
     workflow.phase_from_flags(contract_path, str(start_path), phase_id=phase_id, phase="gates",
                               event="phase-start", repo=repo, session_id=session_id, at=at)
     try:
-        results = run_group(contract_path, contract, repo, scope, out_dir, "required_gates", wanted, stop_on_fail)
+        runnable = {cid for cid in selected if gate_results[cid]["status"] == "not-run"}
+        results = run_group(contract_path, contract, repo, scope, out_dir, "required_gates", runnable, stop_on_fail,
+                            progress=gate_results) if runnable else {}
     except (Exception, SystemExit):
+        for cid, result in gate_results.items():
+            print(f"{cid}: {result['status']} exit={result['exit_code']} "
+                  f"{result.get('action', result.get('reason', ''))}".rstrip(), flush=True)
         workflow.phase_from_flags(contract_path, str(end_path), phase_id=phase_id, phase="gates",
                                   event="phase-end", repo=repo, status="blocked",
-                                  end_reason="unknown", session_id=session_id)
+                                  end_reason="unknown", session_id=session_id, gate_results=gate_results)
         raise
-    passed = all(code == 0 for code, _ in results.values())
+    if stop_on_fail and any(result["status"] == "failed" for result in gate_results.values()):
+        for result in gate_results.values():
+            if result["status"] == "not-run":
+                result["reason"] = "stopped after a failed check"
+    for cid, result in gate_results.items():
+        if result["status"] in {"unsupported", "not-selected", "not-run"}:
+            print(f"{cid}: {result['status']} {result.get('action', result.get('reason', ''))}".rstrip(), flush=True)
+    selected_passed = all(gate_results[cid]["status"] == "passed" for cid in selected)
+    statuses = {entry["status"] for entry in gate_results.values()}
+    phase_status = "failed" if "failed" in statuses else "passed" if statuses == {"passed"} else "blocked"
     workflow.phase_from_flags(contract_path, str(end_path), phase_id=phase_id, phase="gates",
                               event="phase-end", repo=repo,
-                              status="passed" if passed else "failed",
-                              end_reason="done", session_id=session_id)
-    print(f"gates: {sum(1 for code, _ in results.values() if code == 0)}/{len(results)} passed", flush=True)
-    return results, "passed" if passed else "failed"
+                              status=phase_status, end_reason="done", session_id=session_id,
+                              gate_results=gate_results)
+    count = sum(entry["status"] == "passed" for entry in gate_results.values())
+    if wanted:
+        print(f"gates: {count}/{len(selected)} selected checks passed", flush=True)
+    print(f"gates: {count}/{len(checks)} required checks passed; phase {phase_status}", flush=True)
+    return results, "passed" if selected_passed else "failed"
 
 
 def gates_all_repos(contract_path, repos, scope_dir, out_dir, phase_id_template="{repo}-gates-1",
@@ -205,12 +243,15 @@ def gates_all_repos(contract_path, repos, scope_dir, out_dir, phase_id_template=
         try:
             _, status = gates(contract_path, repo, str(scope), str(repo_out), phase_id,
                               ids, stop_on_fail, session_id, at)
+            phase_end = Path(contract_path).resolve().parent / "telemetry" / f"{phase_id}-end.json"
+            phase_status = json.loads(phase_end.read_text())["status"]
         except (Exception, SystemExit):
             if stop_on_fail:
                 raise
             status = "blocked"
+            phase_status = "blocked"
         results[repo] = status
-        print(f"gates {repo}: {status}", flush=True)
+        print(f"gates {repo}: {status}; phase {phase_status}", flush=True)
         if status != "passed" and stop_on_fail:
             break
     passed = sum(1 for value in results.values() if value == "passed")

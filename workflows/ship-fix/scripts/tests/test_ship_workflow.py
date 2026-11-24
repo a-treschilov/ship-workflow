@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1088,6 +1089,68 @@ class LifecycleTests(unittest.TestCase):
         self.move("reviewed", review_path=self.review())
         with self.assertRaisesRegex(ValueError, "Missing check"):
             self.move("gates-passed", gate_evidence_paths=[])
+
+    def test_all_required_gate_evidence_is_needed_for_completion(self):
+        argv = [sys.executable, "-I", "-B", "-c", "print('verified')"]
+        self.c["required_gates"]["api"] = [
+            {"id": "gate.tests", "kind": "empirical", "argv": argv, "verification": "exit zero"},
+            {"id": "gate.legacy", "kind": "empirical", "command": shlex.join(argv), "verification": "exit zero"},
+        ]
+        self.save("contract.json", self.c)
+        self.ready()
+        self.implement()
+        self.move("reviewed", review_path=self.review())
+        output = self.run / "gate-output"
+        result = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT.with_name("ship_run_checks.py")),
+            "gates", "--contract", self.contract, "--repo", "api", "--scope", self.scope,
+            "--out-dir", str(output), "--phase-id", "mixed"], capture_output=True, text=True)
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertIn("gate.legacy: unsupported", result.stdout)
+        first = str(output / "gate.tests-record.json")
+        request = self.save("incomplete-gates.json", {"status": "gates-passed",
+            "source_manifest": self.capture("gate-source.json"), "scope_path": self.scope,
+            "baseline_dir": str(self.base), "gate_evidence_paths": [first]})
+        next_state = self.run / "api" / f"state-{len(workflow.history(self.run / 'api')) + 1}.json"
+        transition = [sys.executable, "-I", "-B", str(SCRIPT), "transition", "--contract", self.contract,
+                      "--repo", "api", "--file", request, "--out", str(next_state)]
+        result = subprocess.run(transition, capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Missing check: gate.legacy", result.stderr)
+        certificate = self.run / "completion.json"
+        complete = [sys.executable, "-I", "-B", str(SCRIPT), "complete", "--contract", self.contract,
+                    "--out", str(certificate)]
+        result = subprocess.run(complete, capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Repo not verified", result.stderr)
+        self.assertFalse(certificate.exists())
+        before = self.capture("legacy-before.json")
+        executed = subprocess.run(argv, cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(0, executed.returncode)
+        log = self.run / "legacy.log"
+        log.write_text(executed.stdout + executed.stderr)
+        after = self.capture("legacy-after.json")
+        evidence_input = self.save("legacy-input.json", {"kind": "empirical", "status": "passed",
+            "producer": "orchestrator", "command": shlex.join(argv), "exit_code": executed.returncode,
+            "environment": "fixture", "data_scope": "fixture", "before_manifest": before,
+            "after_manifest": after, "artifact_paths": [str(log)],
+            "claims": [{"id": "gate.legacy", "assertion": "command exited zero"}]})
+        second = str(self.run / "legacy-record.json")
+        result = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "record-evidence", "--contract",
+            self.contract, "--repo", "api", "--file", evidence_input, "--out", second], capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        complete_request = state.load(request)
+        complete_request["gate_evidence_paths"].append(second)
+        complete_request_path = self.save("complete-gates.json", complete_request)
+        transition[transition.index("--file") + 1] = complete_request_path
+        result = subprocess.run(transition, capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        assessment = self.save("assessment.json", self.artifact(producer="orchestrator", requirements_match=True,
+            criteria=[{"criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                       "reason": "original scenario checked", "evidence_paths": [self.evidence("fix.ac-1")]}]))
+        self.move("verified", assessment_path=assessment)
+        result = subprocess.run(complete, capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("completed", state.load(certificate)["status"])
 
     def test_review_fix_rounds_proof_and_counters(self):
         self.ready()

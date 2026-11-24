@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+- Report unsupported and unselected required gates accurately in CLI results and phase telemetry.
+
 ## v1.6.0 - 2026-11-25
 
 ### New Features

@@ -5749,7 +5749,7 @@ def phase(contract_path, request_path, out):
 def phase_from_flags(contract_path, out, *, phase_id, phase, event, repo=None, status=None,
                      end_reason=None, agent_id=None, round=None, attempt=None, session_id=None, at=None,
                      action=None, previous_state_path=None, previous_state_sha256=None,
-                     checkpoint_path=None, capsule_path=None, slice_id=None):
+                     checkpoint_path=None, capsule_path=None, slice_id=None, gate_results=None):
     record = {"phase_id": phase_id, "phase": phase, "event": event, "repo": repo,
               "at": at or datetime.now(timezone.utc).isoformat()}
     for key, value in (("status", status), ("end_reason", end_reason), ("agent_id", agent_id),
@@ -5759,6 +5759,8 @@ def phase_from_flags(contract_path, out, *, phase_id, phase, event, repo=None, s
                        ("checkpoint_path", checkpoint_path), ("capsule_path", capsule_path), ("slice_id", slice_id)):
         if value is not None:
             record[key] = value
+    if gate_results is not None:
+        record["gate_results"] = gate_results
     return phase_from_record(contract_path, record, out)
 
 
