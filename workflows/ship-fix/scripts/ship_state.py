@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import socket
 import stat
 import struct
@@ -72,18 +73,34 @@ def read_policy_input(contract):
     return tuple(policies)
 
 
-def write_once(path, value, *, pinned=False):
+def publish_once(path, writer, *, pinned=False, temporary_path=None, sync=False, mode=0o666):
     path = Path(path)
-    if pinned:
-        with open_directory(path.parent, create=True) as parent:
-            fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
-        output = os.fdopen(fd, "w", encoding="utf-8")
-    else:
+    if not pinned:
         path.parent.mkdir(parents=True, exist_ok=True)
-        output = path.open("x", encoding="utf-8")
-    with output as handle:
-        json.dump(value, handle, indent=2, ensure_ascii=True)
-        handle.write("\n")
+        path = path.parent.resolve() / path.name
+    temporary = Path(temporary_path) if temporary_path else path.parent / (".ship-write-" + secrets.token_hex(16) + ".tmp")
+    require(temporary.parent == path.parent, "Temporary file must share the destination directory")
+    with open_directory(path.parent, create=True) as parent:
+        created = False
+        try:
+            fd = os.open(temporary.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+            created = True
+            with os.fdopen(fd, "wb") as handle:
+                writer(handle)
+                if sync:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            os.link(temporary.name, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+            if sync:
+                os.fsync(parent)
+        finally:
+            if created:
+                os.unlink(temporary.name, dir_fd=parent)
+
+
+def write_once(path, value, *, pinned=False):
+    payload = (json.dumps(value, indent=2, ensure_ascii=True) + "\n").encode()
+    publish_once(path, lambda handle: handle.write(payload), pinned=pinned)
 
 
 def init_run(run_dir, workflow, repos, description, plan_path, session_id):
@@ -106,15 +123,7 @@ def init_run(run_dir, workflow, repos, description, plan_path, session_id):
     payload = (json.dumps(record, indent=2, ensure_ascii=True) + "\n").encode()
     root.parent.mkdir(parents=True, exist_ok=True)
     root.mkdir()
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=root, prefix=".run-", delete=False) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-        os.link(temporary, root / "run.json")
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    publish_once(root / "run.json", lambda handle: handle.write(payload), pinned=True, mode=0o600)
     return record
 
 

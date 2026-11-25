@@ -942,6 +942,64 @@ class LifecycleTests(unittest.TestCase):
         pre = self.save("preflight.json", self.artifact(status="passed", evidence_paths=[proof]))
         self.move("ready", preflight_path=pre)
 
+    def test_transition_recovers_after_partial_publication(self):
+        self.move("initialized")
+        first = self.run / "api/state-1.json"
+        original = first.read_bytes()
+        proof = self.evidence("env.runtime", "static")
+        preflight = self.save("preflight.json", self.artifact(status="passed", evidence_paths=[proof]))
+        request = self.save("ready-request.json", {"status": "ready", "source_manifest": self.initial,
+                            "scope_path": self.scope, "baseline_dir": str(self.base), "preflight_path": preflight})
+        output = self.run / "api/state-2.json"
+        publish = state.publish_once
+
+        def interrupted(path, writer, **kwargs):
+            def partial(handle):
+                handle.write(b'{"status":')
+                handle.flush()
+                raise OSError("partial write")
+            return publish(path, partial, **kwargs)
+
+        with patch.object(state, "publish_once", interrupted):
+            with self.assertRaisesRegex(OSError, "partial write"):
+                workflow.transition(self.contract, "api", request, str(output))
+        self.assertFalse(output.exists())
+        self.assertEqual(original, first.read_bytes())
+        self.assertEqual(1, workflow.validate_history(self.contract, "api")["states"])
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "transition", "--contract", self.contract,
+                                 "--repo", "api", "--file", request, "--out", str(output)],
+                                capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "validate-history", "--contract",
+                                 self.contract, "--repo", "api"], capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(2, json.JSONDecoder().raw_decode(result.stdout)[0]["states"])
+
+    def test_guarded_history_ignores_disappearing_temporary_file(self):
+        self.move("initialized")
+        directory = self.run / "api"
+        temporary = directory / (".ship-write-" + "a" * 32 + ".tmp")
+        temporary.write_bytes(b"partial")
+        original_stat = os.stat
+
+        def disappearing(path, *args, **kwargs):
+            if path == temporary.name and kwargs.get("dir_fd") is not None:
+                temporary.unlink()
+            return original_stat(path, *args, **kwargs)
+
+        with patch.object(os, "stat", disappearing):
+            events = workflow.guarded_history(directory, self.c)
+        self.assertEqual(1, len(events))
+
+        state_path = directory / "state-1.json"
+        def missing_state(path, *args, **kwargs):
+            if path == state_path.name and kwargs.get("dir_fd") is not None:
+                raise FileNotFoundError(path)
+            return original_stat(path, *args, **kwargs)
+
+        with patch.object(os, "stat", missing_state), self.assertRaises(FileNotFoundError):
+            workflow.guarded_history(directory, self.c)
+
     def implement(self):
         self.source.write_text("after\n")
         matrix = self.save("matrix.json", self.artifact(criteria=[{

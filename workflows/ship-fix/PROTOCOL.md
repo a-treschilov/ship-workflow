@@ -67,6 +67,11 @@ change production, or run destructive/external checks without separate authoriza
 
 ## 2. Run setup and immutable contract
 
+Write-once JSON helpers publish a fully written temporary file under the final name without replacing an
+existing artifact. An interrupted process can leave a hidden temporary file. A transition interrupted before
+publication can be retried with the same output path. Ordinary artifact writes do not sync file and directory
+contents, so power loss can lose or damage a published artifact. Setup replacement publication syncs both.
+
 Create a unique RUN_DIR under `plans/.ship-runs/` or `.fix-runs/` with the following standalone helper; it
 creates the directory exclusively and atomically publishes valid `run.json`. Do not write `run.json` by hand or
 reuse an existing directory. Repeat `--repo REPO` for each assigned repo, supply a real description and for ship

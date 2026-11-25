@@ -123,17 +123,24 @@ def guarded_entries(directory, value):
     guarded = state.guard_excluded_paths(directory, policies, pinned=bool(policies))
     if not policies:
         guarded = guarded.resolve()
-    try:
-        with state.open_directory(guarded) as fd:
-            with os.scandir(fd) as entries:
-                names = sorted(entry.name for entry in entries)
-            result = []
-            for name in names:
-                state.guard_excluded_paths(directory / name, policies, pinned=bool(policies))
-                result.append((name, os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode))
-            return result
-    except FileNotFoundError:
-        return []
+    with ExitStack() as stack:
+        try:
+            fd = stack.enter_context(state.open_directory(guarded))
+        except FileNotFoundError:
+            return []
+        with os.scandir(fd) as entries:
+            names = sorted(entry.name for entry in entries)
+        result = []
+        for name in names:
+            state.guard_excluded_paths(directory / name, policies, pinned=bool(policies))
+            try:
+                mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+            except FileNotFoundError:
+                if re.fullmatch(r"\.ship-write-[0-9a-f]{32}\.tmp", name):
+                    continue
+                raise
+            result.append((name, mode))
+        return result
 
 
 def guarded_names(directory, value):
@@ -470,20 +477,8 @@ def publish_once(path, payload, value, *, temporary_path=None):
                                            policies, pinned=bool(policies))
     require(temporary.parent == path.parent, "Temporary file must share the destination directory")
     parent_path = guarded_resolve(path.parent, value)
-    with state.open_directory(parent_path) as parent:
-        created = False
-        try:
-            fd = os.open(temporary.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
-            created = True
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.link(temporary.name, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
-            os.fsync(parent)
-        finally:
-            if created:
-                os.unlink(temporary.name, dir_fd=parent)
+    state.publish_once(parent_path / path.name, lambda handle: handle.write(payload), pinned=True,
+                       temporary_path=parent_path / temporary.name, sync=True)
 
 
 def mark_work_started(contract_path, repo=None):

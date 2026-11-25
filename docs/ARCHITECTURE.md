@@ -109,7 +109,10 @@ artifacts and independently accounts for all lifecycle predecessor budgets. The 
 seal bind the contract when they are replaced. External work helpers record an activity marker before they
 execute so that a concurrent replacement cannot overlook their work.
 
-State transitions recapture source and verify earlier seals. Artifacts are write-once; a correction is a new
+State transitions recapture source and verify earlier seals. Write-once JSON helpers publish complete files
+atomically using a temporary file in the destination directory. Process interruption can leave a temporary
+file; ordinary writes do not guarantee persistence across power loss. Setup replacement publication syncs its
+file and directory. Artifacts are write-once; a correction is a new
 artifact, not an edit to history. Source files are bound by the manifest recorded in the event, while logs,
 reviews and other immutable proof are bound by hash. A later authorized edit makes earlier source proof stale;
 it does not make prior logs mutable.

@@ -1,12 +1,14 @@
 """Isolated workflow tests; set SHIP_TEST_TMPDIR to the session scratchpad."""
 
 import copy
+from contextlib import contextmanager
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -692,6 +694,97 @@ class WorkflowStateTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             state.write_once(path, {"overwrite": True})
         self.assertEqual({"original": True}, state.load(path))
+        path.write_bytes(b'{"incomplete":')
+        with self.assertRaises(FileExistsError):
+            state.write_once(path, {"overwrite": True})
+        self.assertEqual(b'{"incomplete":', path.read_bytes())
+
+    def test_partial_write_can_be_retried(self):
+        path = self.root.resolve() / "partial.json"
+        fdopen = os.fdopen
+
+        @contextmanager
+        def interrupted(fd, *args, **kwargs):
+            with fdopen(fd, *args, **kwargs) as handle:
+                class Partial:
+                    def write(self, payload):
+                        handle.write(payload[:5])
+                        handle.flush()
+                        raise OSError("partial write")
+                yield Partial()
+
+        with patch.object(state.os, "fdopen", interrupted):
+            with self.assertRaisesRegex(OSError, "partial write"):
+                state.write_once(path, {"value": 42}, pinned=True)
+        self.assertFalse(path.exists())
+        self.assertEqual([], list(self.root.glob(".ship-write-*.tmp")))
+        state.write_once(path, {"value": 42}, pinned=True)
+        self.assertEqual({"value": 42}, state.load(path))
+
+    def test_concurrent_writers_publish_one_complete_document(self):
+        path = self.root.resolve() / "race.json"
+        barrier = threading.Barrier(2)
+        link = os.link
+        results = []
+
+        def synchronized_link(*args, **kwargs):
+            barrier.wait(timeout=10)
+            return link(*args, **kwargs)
+
+        def writer(number):
+            try:
+                state.write_once(path, {"writer": number}, pinned=True)
+                results.append("published")
+            except FileExistsError:
+                results.append("exists")
+
+        with patch.object(state.os, "link", synchronized_link):
+            threads = [threading.Thread(target=writer, args=(number,)) for number in (1, 2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+        self.assertEqual(["exists", "published"], sorted(results))
+        self.assertIn(state.load(path), [{"writer": 1}, {"writer": 2}])
+        self.assertEqual([], list(self.root.glob(".ship-write-*.tmp")))
+
+    def test_process_exit_during_write_allows_retry(self):
+        path = self.root.resolve() / "crash.json"
+        script = '''
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("state", sys.argv[1])
+state = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(state)
+def crash(handle):
+    handle.write(b'{"partial":')
+    handle.flush()
+    os._exit(17)
+state.publish_once(sys.argv[2], crash, pinned=True)
+'''
+        result = subprocess.run(["python3", "-I", "-B", "-c", script, str(SCRIPT), str(path)])
+        self.assertEqual(17, result.returncode)
+        self.assertFalse(path.exists())
+        self.assertEqual(1, len(list(path.parent.glob(".ship-write-*.tmp"))))
+        state.write_once(path, {"recovered": True}, pinned=True)
+        self.assertEqual({"recovered": True}, state.load(path))
+
+    def test_pinned_publication_survives_parent_swap(self):
+        parent = self.root.resolve() / "parent"
+        parent.mkdir()
+        moved = self.root.resolve() / "moved"
+        outside = self.root.resolve() / "outside"
+        outside.mkdir()
+        link = os.link
+
+        def swap(*args, **kwargs):
+            parent.rename(moved)
+            parent.symlink_to(outside, target_is_directory=True)
+            return link(*args, **kwargs)
+
+        with patch.object(state.os, "link", swap):
+            state.write_once(parent / "result.json", {"value": 1}, pinned=True)
+        self.assertEqual({"value": 1}, state.load(moved / "result.json"))
+        self.assertFalse((outside / "result.json").exists())
 
     def test_manifest_tampering_is_rejected(self):
         value = copy.deepcopy(self.manifest)

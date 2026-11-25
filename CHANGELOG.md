@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- Preserve readable lifecycle history when an immutable JSON write fails before publication.
+
 ## v1.6.1 - 2026-11-25
 
 ### Bug Fixes
