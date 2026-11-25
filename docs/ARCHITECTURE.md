@@ -11,7 +11,7 @@ workflows/ship-fix/
   PROTOCOL.md          canonical lifecycle, schemas, budgets and telemetry rules
   HOST-ADAPTERS.md     mapping from workflow operations to host capabilities
   scripts/             lifecycle validators, artifact helpers and run-check executor
-  hooks/               trusted-command and worktree adapters
+  hooks/               trusted-command adapters
 skills/
   ship/                approved-plan workflow
   fix/                 bug-brief workflow
@@ -61,8 +61,7 @@ The trusted-command policy is an allowlist, not a sandbox. Commands outside it f
 permission prompt. The hook adapters `claude_pre_tool_use.py` and `codex_pre_tool_use.py` normalize host payloads
 and return the native response shape.
 
-The worktree hooks intentionally resolve to the existing project root. The workflow requires the author and
-reviewer to share the source being reviewed; a disposable worktree would break that binding.
+Workflow dispatch omits worktree isolation so the author and reviewer share the current source. Claude retains its normal worktree behavior for other tasks.
 
 ## Lifecycle
 

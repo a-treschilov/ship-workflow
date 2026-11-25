@@ -4,6 +4,7 @@
 
 ### Bug Fixes
 
+- Preserve Claude worktree isolation for ordinary tasks while workflow agents share their source.
 - Preserve readable lifecycle history when an immutable JSON write fails before publication.
 
 ## v1.6.1 - 2026-11-25

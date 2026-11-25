@@ -24,8 +24,6 @@ for event, entries in template.get("hooks", {}).items():
         known_codex = host == "codex" and any(".agents/workflows/ship-fix/hooks/codex_pre_tool_use.py" in c for c in commands)
         if entry in current or known_claude or known_codex:
             continue
-        if event in {"WorktreeCreate", "WorktreeRemove"} and current:
-            raise ValueError(f"{target_path}: existing {event} hook conflicts with ship-workflow")
         current.append(entry)
 if host == "claude":
     permissions = existing.setdefault("permissions", {})

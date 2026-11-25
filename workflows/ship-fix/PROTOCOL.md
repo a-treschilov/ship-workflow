@@ -53,7 +53,7 @@ semantics are genuinely shared and abstraction lowers maintenance cost, not mere
 look alike. Address substantive Suggestions during available repair passes and present remaining findings for
 the user's explicit decision at exhaustion.
 
-Implementers/checkpoints stay sequential: the safe worktree hook shares source. No real worktrees or
+Implementers/checkpoints stay sequential: agents share the source. No real worktrees or
 parallel implementers are introduced here. Claude frontmatter and Codex role files are generated from
 the shared role assignments in `.agents/agent-models.yaml` by the explicit `agent_models.py sync` command; `inherit`
 uses the host model configuration, while explicit IDs select pinned models. Do this outside an active run,

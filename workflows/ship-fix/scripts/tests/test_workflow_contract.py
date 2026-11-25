@@ -158,7 +158,7 @@ class InstructionContractTests(unittest.TestCase):
             self.assertIn("agent_models.py check", command)
             self.assertIn("stop;", command)
         self.assertIn("agent_models.py sync", self.protocol)
-        self.assertIn("safe worktree hook shares source", self.protocol)
+        self.assertIn("agents share the source", self.protocol)
         self.assertIn("--from-review", self.ship)
         self.assertIn("no implementer to resume", self.ship)
 

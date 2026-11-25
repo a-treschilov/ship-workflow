@@ -288,22 +288,6 @@ class TrustedHelpersTests(unittest.TestCase):
         response = json.loads(result.stdout)
         self.assertEqual("allow", response["hookSpecificOutput"]["permissionDecision"])
 
-    @unittest.skipUnless(INSTALLED, "project installation only")
-    def test_claude_worktree_adapters_resolve_the_shared_workspace_root(self):
-        workspace = WORKSPACE
-        create = subprocess.run([str(workspace / ".claude/hooks/worktree-create.sh")],
-                                input=json.dumps({"hook_event_name": "WorktreeCreate",
-                                                  "cwd": str(workspace), "name": "agent"}),
-                                text=True, capture_output=True, timeout=5)
-        self.assertEqual(0, create.returncode, create.stderr)
-        self.assertEqual(str(workspace), create.stdout.strip())
-
-        remove = subprocess.run([str(workspace / ".claude/hooks/worktree-remove.sh")],
-                                input=json.dumps({"hook_event_name": "WorktreeRemove",
-                                                  "worktree_path": str(workspace)}),
-                                text=True, capture_output=True, timeout=5)
-        self.assertEqual(0, remove.returncode, remove.stderr)
-
     def test_subprocess_json_protocol_and_malformed_input(self):
         hook_dir = self.root / ".agents/workflows/ship-fix/hooks"
         hook_copy = hook_dir / "trusted-ship-helpers.py"

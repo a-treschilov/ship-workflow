@@ -233,6 +233,10 @@ for item in "${managed[@]}"; do
   fi
 done
 txn_ready=1
+if [[ ( "$old_host" == claude || "$old_host" == both ) && -f "$project_root/.claude/settings.json" ]] &&
+   ! grep -q '"WorktreeCreate"' "$src/install/templates/claude-settings.json"; then
+  python3 -I -B "$package_root/install/migrate_worktree_settings.py" "$project_root"
+fi
 if [[ "$switching" -eq 1 ]]; then
   python3 -I -B "$package_root/install/uninstall.py" "$project_root"
 fi

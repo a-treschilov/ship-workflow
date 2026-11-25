@@ -85,7 +85,7 @@ Shared files are replaced on every install:
 ```
 
 The model configuration is created only when absent. Host settings are merged with the required workflow
-hooks and permissions; unrelated settings are retained. Conflicting worktree hooks stop installation:
+hooks and permissions; unrelated settings and worktree hooks are retained:
 
 ```text
 .agents/agent-models.yaml
@@ -150,7 +150,7 @@ Codex-only checks do not require Claude aliases.
 
 `ocx_models.py` refreshes the catalog from an OCX gateway. It is optional and does not assign models to roles.
 
-`.claude/settings.json` registers the trusted-command and worktree hooks and allows the canonical helper path.
+`.claude/settings.json` registers the trusted-command hook and allows the canonical helper path.
 `.codex/hooks.json` registers the Codex pre-tool-use hook. Keep those files project-local; do not copy secrets or
 machine-specific paths into the shared package.
 
@@ -162,6 +162,9 @@ make -C ~/ship-workflow install REF=v1.2.0 HOST=both PROJECT=/path/to/project
 
 The Make target invokes the same installer, so the tag verification and backup rules still apply. The shared
 workflow, skills, roles and platform metadata are replaced; per-project configuration is preserved.
+Obsolete ship-workflow worktree hook registrations are removed during upgrade. Restart Claude Code to load
+the updated settings. Registrations that cannot be identified as belonging to the installation require manual
+review before upgrade or uninstall.
 
 Existing runs keep their original state, manifests, baselines and review budgets. When upgrading to
 a snapshot that reconciles alternate path spellings, continue from the existing run directory.
@@ -193,6 +196,8 @@ Uninstall removes the shared `ship-fix` tree, installed workflow skills, matchin
 host links. It removes hook and permission entries recorded as added by the installer, preserving pre-existing
 entries and `.agents/agent-models.yaml`. If an unowned hook still points to the workflow, including hooks from
 legacy records without ownership metadata, uninstall stops before changes; remove that registration first.
+The original worktree registrations from legacy installations are recognized when the installed hooks link
+and scripts still identify them.
 
 ## Troubleshooting
 

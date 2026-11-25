@@ -19,6 +19,9 @@ if not marker.is_file():
     sys.exit(f"not installed: {root}")
 package = Path(__file__).resolve().parent
 version = json.loads(marker.read_text())
+spec = importlib.util.spec_from_file_location("worktree_migration", package / "worktree_migration.py")
+migration = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(migration)
 owned_settings = version.get("managed_settings", {})
 settings = {}
 for relative in (".claude/settings.json", ".codex/hooks.json"):
@@ -29,6 +32,11 @@ for relative in (".claude/settings.json", ".codex/hooks.json"):
         current = json.loads(path.read_text())
         if not isinstance(current, dict) or not isinstance(current.get("hooks", {}), dict):
             sys.exit(f"Cannot safely update malformed settings: {path}")
+        if relative == ".claude/settings.json":
+            try:
+                migration.migrate(root, current, version)
+            except ValueError as error:
+                sys.exit(str(error))
         permissions = current.get("permissions", {})
         if not isinstance(permissions, dict):
             sys.exit(f"Cannot safely update malformed permissions: {path}")

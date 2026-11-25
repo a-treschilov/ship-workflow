@@ -75,15 +75,6 @@ class InstallerTests(unittest.TestCase):
         version = json.loads((self.project / ".agents/.ship-version").read_text())
         self.assertEqual("HEAD", version["ref"])
         self.assertNotEqual("unknown", version["commit"])
-        create = subprocess.run([str(self.project / ".claude/hooks/worktree-create.sh")],
-                                cwd=self.project, input=json.dumps({"hook_event_name": "WorktreeCreate",
-                                "cwd": str(self.project), "name": "test"}), capture_output=True, text=True)
-        self.assertEqual(0, create.returncode, create.stderr)
-        self.assertEqual(str(self.project.resolve()), create.stdout.strip())
-        remove = subprocess.run([str(self.project / ".claude/hooks/worktree-remove.sh")],
-                                cwd=self.project, input=json.dumps({"hook_event_name": "WorktreeRemove",
-                                "worktree_path": str(self.project)}), capture_output=True, text=True)
-        self.assertEqual(0, remove.returncode, remove.stderr)
         settings = json.loads((self.project / ".claude/settings.json").read_text())
         command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         env = os.environ.copy()
@@ -124,7 +115,7 @@ class InstallerTests(unittest.TestCase):
         first = json.loads(path.read_text())
         self.assertEqual(["Bash(rm *)"], first["permissions"]["deny"])
         self.assertEqual("yes", first["env"]["CUSTOM"])
-        self.assertIn("WorktreeCreate", first["hooks"])
+        self.assertNotIn("WorktreeCreate", first["hooks"])
         self.assertIn("PreToolUse", first["hooks"])
         result = self.install()
         self.assertEqual(0, result.returncode, result.stderr)
@@ -182,15 +173,86 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(legacy, config.read_text())
         self.assertIn('model = "gpt-6-luna"', (self.project / ".codex/agents/implementer.toml").read_text())
 
-    def test_worktree_hook_conflict_rolls_back(self):
+    def test_existing_worktree_hooks_are_preserved(self):
         path = self.project / ".claude/settings.json"
         path.parent.mkdir()
-        original = '{"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":"custom"}]}]}}'
-        path.write_text(original)
+        custom = {"hooks": [{"type": "command", "command": "custom"}]}
+        path.write_text(json.dumps({"hooks": {"WorktreeCreate": [custom]}}))
         result = self.install()
-        self.assertNotEqual(0, result.returncode)
-        self.assertEqual(original, path.read_text())
-        self.assertFalse((self.project / ".agents/workflows/ship-fix").exists())
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual([custom], json.loads(path.read_text())["hooks"]["WorktreeCreate"])
+
+    def test_upgrade_removes_owned_worktree_commands_preserving_neighbors(self):
+        self.assertEqual(0, self.install().returncode)
+        path = self.project / ".claude/settings.json"
+        marker = self.project / ".agents/.ship-version"
+        settings = json.loads(path.read_text())
+        version = json.loads(marker.read_text())
+        managed = version["managed_settings"][".claude/settings.json"]["hooks"]
+        for event, name in (("WorktreeCreate", "worktree-create.sh"), ("WorktreeRemove", "worktree-remove.sh")):
+            hook = {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/" + name}
+            owned = {"hooks": [hook]}
+            managed[event] = [owned]
+            settings["hooks"][event] = [{"hooks": [hook, {"type": "command", "command": "custom"}]}]
+        path.write_text(json.dumps(settings))
+        marker.write_text(json.dumps(version))
+        result = self.install()
+        self.assertEqual(0, result.returncode, result.stderr)
+        result_settings = json.loads(path.read_text())
+        for event in ("WorktreeCreate", "WorktreeRemove"):
+            self.assertEqual([{"hooks": [{"type": "command", "command": "custom"}]}], result_settings["hooks"][event])
+        self.assertEqual(0, self.install().returncode)
+
+    def test_upgrade_migrates_legacy_hooks_without_ownership_metadata(self):
+        self.assertEqual(0, self.install().returncode)
+        path = self.project / ".claude/settings.json"
+        marker = self.project / ".agents/.ship-version"
+        settings = json.loads(path.read_text())
+        version = json.loads(marker.read_text())
+        del version["managed_settings"]
+        for event, name in (("WorktreeCreate", "worktree-create.sh"), ("WorktreeRemove", "worktree-remove.sh")):
+            (self.project / ".claude/hooks" / name).write_text("legacy")
+            settings["hooks"][event] = [{"hooks": [{"type": "command", "command":
+                "${CLAUDE_PROJECT_DIR}/.claude/hooks/" + name}]}]
+        path.write_text(json.dumps(settings))
+        marker.write_text(json.dumps(version))
+        result = self.install()
+        self.assertEqual(0, result.returncode, result.stderr)
+        hooks = json.loads(path.read_text())["hooks"]
+        self.assertNotIn("WorktreeCreate", hooks)
+        self.assertNotIn("WorktreeRemove", hooks)
+
+    def test_host_switch_removes_old_owned_worktree_hook(self):
+        self.assertEqual(0, self.install(host="both").returncode)
+        path = self.project / ".claude/settings.json"
+        marker = self.project / ".agents/.ship-version"
+        settings, version = json.loads(path.read_text()), json.loads(marker.read_text())
+        hook = {"hooks": [{"type": "command", "command":
+                          "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-create.sh"}]}
+        settings["hooks"]["WorktreeCreate"] = [hook, {"hooks": [{"type": "command", "command": "custom"}]}]
+        version["managed_settings"][".claude/settings.json"]["hooks"]["WorktreeCreate"] = [hook]
+        path.write_text(json.dumps(settings))
+        marker.write_text(json.dumps(version))
+        result = self.install(host="codex")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual([{"hooks": [{"type": "command", "command": "custom"}]}],
+                         json.loads(path.read_text())["hooks"]["WorktreeCreate"])
+
+    def test_uninstall_removes_owned_worktree_hook_from_mixed_group(self):
+        self.assertEqual(0, self.install(host="claude").returncode)
+        path = self.project / ".claude/settings.json"
+        marker = self.project / ".agents/.ship-version"
+        settings, version = json.loads(path.read_text()), json.loads(marker.read_text())
+        hook = {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-remove.sh"}
+        settings["hooks"]["WorktreeRemove"] = [{"hooks": [hook, {"type": "command", "command": "custom"}]}]
+        version["managed_settings"][".claude/settings.json"]["hooks"]["WorktreeRemove"] = [{"hooks": [hook]}]
+        path.write_text(json.dumps(settings))
+        marker.write_text(json.dumps(version))
+        result = subprocess.run(["python3", "-I", "-B", str(PACKAGE / "install/uninstall.py"), str(self.project)],
+                                cwd=self.project, capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual([{"hooks": [{"type": "command", "command": "custom"}]}],
+                         json.loads(path.read_text())["hooks"]["WorktreeRemove"])
 
     def test_unmanaged_agent_collision_refused_without_overwrite(self):
         path = self.project / ".claude/agents/implementer.md"
@@ -230,7 +292,7 @@ class InstallerTests(unittest.TestCase):
         path = self.project / ".claude/settings.json"
         path.parent.mkdir()
         defaults = json.loads((PACKAGE / "install/templates/claude-settings.json").read_text())
-        preserved_hook = defaults["hooks"]["WorktreeCreate"][0]
+        preserved_hook = {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-create.sh"}]}
         path.write_text(json.dumps({"hooks": {"WorktreeCreate": [preserved_hook]},
                                     "permissions": {"deny": ["Bash(rm *)"]}}))
         result = self.install()

@@ -36,10 +36,10 @@ independent review, user decisions, telemetry or evidence to make the run appear
   in `.agents/agent-models.yaml`, including `[1m]` when OCX advertises it.
 - Dispatch roles with Claude Code's agent tool; continue a running author with its messaging tool; collect
   required decisions through the user-question tool.
-- Every agent dispatch starts the native agent with fresh context; do not forward any parent-session history.
+- Every agent dispatch starts the native agent with fresh context; do not forward any parent-session history. Omit the Agent tool isolation field so workflow roles share the current working directory.
 - Native agent dispatch is blocking and returns the agent's result, so do not add polling around it. When continuing a running author through the messaging tool, wait once for that resumed task's actual result; a delivery acknowledgement is not completion.
 - Run helpers from the project root at `.agents/workflows/ship-fix/scripts/<script>.py`.
-- The trusted-command and worktree hooks load through `.claude/settings.json` and resolve to the shared
+- The trusted-command hook loads through `.claude/settings.json` and resolves to the shared
   implementation under `.agents/workflows/ship-fix/hooks/`.
 
 - New main session: an ordinary new Claude Code chat/session; there is no dedicated rotation command. The
