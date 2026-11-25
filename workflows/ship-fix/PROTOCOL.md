@@ -67,6 +67,11 @@ change production, or run destructive/external checks without separate authoriza
 
 ## 2. Run setup and immutable contract
 
+Before creating or replacing a run and before freezing its contract, inspect the current host's required
+agent capabilities using `HOST-ADAPTERS.md`. On resume repeat the inspection for remaining work before
+continuing. Stop with the missing capability, consequence and developer action if it cannot be established.
+This session inspection is distinct from the local role-file and model-assignment check.
+
 Write-once JSON helpers publish a fully written temporary file under the final name without replacing an
 existing artifact. An interrupted process can leave a hidden temporary file. A transition interrupted before
 publication can be retried with the same output path. Ordinary artifact writes do not sync file and directory

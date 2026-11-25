@@ -29,6 +29,26 @@ class InstructionContractTests(unittest.TestCase):
         self.agents = {name: (ROLES / f"{name}.md").read_text()
                        for name in ("implementer", "reviewer", "plan-checker", "slicer")}
 
+    def test_session_capability_scenarios_and_setup_order(self):
+        scenarios = (
+            ("`wait_agent(targets)` delivers final result", "Proceed using targeted wait."),
+            ("final message with sender ID", "Proceed using the identified final message."),
+            ("no named role selector", "Stop: named role selection is unavailable."),
+            ("fresh context is not guaranteed", "Stop: fresh context is unverified."),
+            ("only status or acknowledgement is available", "Stop: identified result is unavailable."),
+        )
+        for interface, decision in scenarios:
+            with self.subTest(interface=interface):
+                self.assertTrue(any(interface in line and decision in line
+                                    for line in self.host_adapters.splitlines()))
+        for skill in (self.ship, self.fix):
+            self.assertLess(skill.index("session capability check"), skill.index("init-run"))
+            self.assertIn("Repeat it on resume", skill)
+        self.assertIn("cannot see session tools", self.host_adapters)
+        self.assertIn("Do not launch a paid agent", self.host_adapters)
+        self.assertIn("An update from\n  another agent does not complete", self.host_adapters)
+        self.assertIn("Match the sender against\n  the recorded dispatch ID", self.host_adapters)
+
     def test_adapters_use_portable_paths_and_absolute_handoffs(self):
         for command in (self.ship, self.fix):
             self.assertIn(".agents/workflows/ship-fix/PROTOCOL.md", command)

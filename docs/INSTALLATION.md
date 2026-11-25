@@ -148,6 +148,10 @@ Both `sync` and `check` accept `--host claude`, `--host codex`, or `--host both`
 installed host from `.ship-version`, or both hosts for a legacy install.
 Codex-only checks do not require Claude aliases.
 
+The Codex orchestrator also inspects the active session's agent tools before run creation. Role selection,
+fresh context and identified results must be supported by that session. A successful file check does not
+verify its tool capabilities. See `HOST-ADAPTERS.md` for supported call forms and remediation.
+
 `ocx_models.py` refreshes the catalog from an OCX gateway. It is optional and does not assign models to roles.
 
 `.claude/settings.json` registers the trusted-command hook and allows the canonical helper path.

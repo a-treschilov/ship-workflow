@@ -12,6 +12,7 @@ Fix the bug or improvement described in the user's prompt. If it is missing, ask
 pipeline, redirection, shell chaining or unrelated command in the same shell invocation. Use the host's file-writing capability for JSON inputs;
 pass explicit paths from run context. If cwd must change, do so with a separate standalone shell invocation first.
 Repeat this exact constraint in every agent dispatch and resume prompt. Do not relax the trusted-tools hook.
+Before run creation, replacement, contract freezing or any agent dispatch, perform the session capability check in HOST-ADAPTERS.md. Repeat it on resume before continuing. Stop with the capability, consequence and developer action if unsupported or unverified.
 `--resume-run RUN_DIR` continues the same contract/history/counters after verifying brief and repo paths;
 do not initialize a replacement run to hide blocked work or reset budgets.
 Work from the project root. Before any agent dispatch, run

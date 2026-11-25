@@ -68,7 +68,7 @@ Workflow dispatch omits worktree isolation so the author and reviewer share the 
 `PROTOCOL.md` is the source of truth. The core path is:
 
 ```text
-run initialization -> contract setup -> preflight -> implementation -> pre-review -> fresh review
+host capability inspection -> run initialization -> contract setup -> preflight -> implementation -> pre-review -> fresh review
          -> gates -> acceptance assessment -> verified -> completion certificate
 ```
 

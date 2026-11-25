@@ -107,6 +107,10 @@ Open the project in Claude Code or Codex and invoke the skill:
 lifecycle. `fix` extracts a small acceptance brief from the bug description and uses the same review and gate
 contract. Both leave changes uncommitted.
 
+Before creating a run, the orchestrator checks the current host's agent capabilities. In Codex this includes
+selecting the installed roles, starting them with fresh context and collecting identified results. The separate
+`agent_models.py check` validates role files and model assignments.
+
 Run artifacts live under `plans/.ship-runs/` and `plans/.fix-runs/` by default. Treat them as append-only: the
 helpers seal contracts, state records, evidence, reviews, and completion certificates by hash. Do not hand-edit
 or delete an active run.

@@ -52,12 +52,62 @@ independent review, user decisions, telemetry or evidence to make the run appear
   The Codex session's configured provider routes the selected model.
 - Use Codex's custom subagent dispatch and follow-up controls for role dispatch and continuation. Preserve
   the returned agent ID and session/tool correlation IDs in run telemetry.
-- Every `spawn_agent` call must pass the role's `agent_type` and an explicit `fork_turns: "none"`.
-- Do not omit `fork_turns`: omitting it inherits the parent session's mode (legacy/full history in cli 0.169).
+### Session capability check
+
+Before creating or replacing a run, freezing a contract, or dispatching any agent, the orchestrator inspects
+the available tool schemas and descriptions in its own session. Repeat on resume before continuing. This is
+an inspection, not an agent dispatch. `agent_models.py check` validates generated files and model assignments;
+it cannot see session tools or establish these capabilities. Check each of the following against the current
+session, including permissions and any explicit host restrictions:
+
+1. **Named role selection.** The dispatch tool must select each installed role required for the work and load
+   its configured role behavior and model. `spawn_agent` with `agent_type` is one such interface. A documented
+   equivalent is acceptable. `task_name`, a model override, or copying role instructions into a generic agent
+   does not establish that guarantee. Check implementer and reviewer, plan-checker for ship or a complex fix,
+   and slicer when slicing may be needed. Check the remaining roles on resume.
+2. **Fresh context.** The dispatch interface must guarantee a new agent without parent-session history.
+   Use explicit `fork_turns: "none"` when supported. A different interface is acceptable only when its
+   description guarantees the same behavior. Omitting `fork_turns` does not establish this guarantee.
+3. **Identified result.** Dispatch must provide an actual agent ID, and the host must deliver that agent's
+   final result. A targeted wait, a blocking dispatch returning the identified result, or an untargeted wait
+   followed by a final message identifying its sender are acceptable. Status updates and delivery
+   acknowledgements are not results. Preserve results from other agents and associate each with its ID.
+4. **Author continuation.** When the chosen contract uses resume rotation, verify that the original author
+   can be continued by ID and that the resulting task's actual result can be collected by ID.
+
+If any required capability is absent or cannot be established, stop before run creation or contract freezing.
+Name the missing capability and affected phase, explain the consequence, and give an actionable next step,
+such as opening a session with custom role selection or updating the host configuration. Report unknown as
+unverified, never as supported. Do not launch a paid agent to probe the interface. If an operation later
+fails despite inspection, stop at that phase and report the exact error.
+
+For example, if files pass `agent_models.py check` but the schema lacks a role selector, report:
+"Cannot start: named role selection is unavailable. Independent review requires the configured reviewer role.
+Open the project in a Codex session that supports selecting custom roles from `.codex/agents/`, then retry."
+
+Use these independent synthetic examples when interpreting a session description:
+
+| Dispatch and result interface | Decision |
+| --- | --- |
+| `agent_type`, `fork_turns: none`, returned ID, `wait_agent(targets)` delivers final result | Proceed using targeted wait. |
+| `agent_type`, `fork_turns: none`, returned ID, untargeted `wait_agent` and final message with sender ID | Proceed using the identified final message. |
+| `fork_turns: none`, returned ID and identified result, but no named role selector | Stop: named role selection is unavailable. |
+| Named role selector and identified result, but fresh context is not guaranteed | Stop: fresh context is unverified. |
+| Named role selector and fresh context, but only status or acknowledgement is available | Stop: identified result is unavailable. |
+
+### Dispatch and waiting
+
+- Pass the selected role using the confirmed role selector and use the confirmed fresh-context mechanism.
 - `fork_turns: "all"` is forbidden for ship/fix roles.
 - A followup_task/resume of an existing author is not a new spawn; repairs use capsule rotation as before.
 - If a host version rejects `"none"`, record blocked with the exact error; do not substitute the behavior.
-- Wait for agent results with a single `wait_agent` call using `timeout_ms` (orient: implement/review/review-fix 600000 ms; gates/checker and known-long runs 900000 ms; never below 300000) and `targets` holding all active agents (returns on the first to finish). On `timed_out`: true, run one `list_agents` (or one repeated `wait_agent` for a legitimately long phase), never a new polling loop, and do not interrupt on the timeout alone.
+- When `wait_agent` accepts `targets`, pass all active IDs. When it has no target parameter, wait for an
+  update and collect the separately delivered final message whose sender identifies the agent. An update from
+  another agent does not complete the expected phase. After handling that update, wait again if the expected
+  result has not arrived; this is event-driven waiting, not a timeout polling loop. Match the sender against
+  the recorded dispatch ID and retain unrelated results for their own phases. Use `timeout_ms` within the host's supported range
+  (orient: implement/review/review-fix 600000 ms; gates/checker and known-long runs 900000 ms). Follow the
+  common timeout and polling rules above; never interrupt on timeout alone.
 - Run helpers from the project root at `.agents/workflows/ship-fix/scripts/<script>.py`.
 - The trusted-command hook is configured in `.codex/hooks.json`; its small host adapter calls the same
   policy implementation as Claude Code.
