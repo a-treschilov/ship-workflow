@@ -2,8 +2,11 @@
 
 ## Unreleased
 
+## v1.6.1 - 2026-11-25
+
 ### Bug Fixes
 
+- Reconcile closed unsuccessful repair attempts with source evidence and a recorded retry when replacing a setup-only run.
 - Report unsupported and unselected required gates accurately in CLI results and phase telemetry.
 
 ## v1.6.0 - 2026-11-25

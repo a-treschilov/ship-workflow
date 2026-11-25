@@ -125,6 +125,8 @@ flag form accepts (`--action`, `--agent-id`, `--round` or `--attempt`, `--previo
 `--previous-state-sha256`, `--capsule-path` for rotation, `--slice-id` for slice phases, `--checkpoint-path`) directly; use `--file` only for correlation fields the
 flags do not cover, and store any CLI inputs outside telemetry/. Put repair_phase_id in the current
 edited-unverified request. Never reuse IDs.
+When a slice review-fix stops with partial changes, retain the actual unfinished-finding checkpoint and
+bind a partial repair recovery record to the retry as specified in protocol §6.
 For --from-review preserve author_handoff instead of fabricating an implementer or closed repair.
 
 Validate the submission with the protocol's `validate-submission` command before dispatching each reviewer.

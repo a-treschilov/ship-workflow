@@ -100,6 +100,13 @@ def guarded_resolve(path, value):
     return resolved if policies else resolved.resolve()
 
 
+def run_local_evidence_path(path, root, value, label):
+    require(isinstance(path, str) and Path(path).is_absolute(), f"{label} needs an absolute path")
+    require(guarded_resolve(path, value).is_relative_to(guarded_resolve(root, value)),
+            f"{label} must be run-local")
+    return absolute_file(path, value)
+
+
 def require_writable_run(path, contract_path, value):
     path = Path(path).absolute()
     policies = read_policy(value)
@@ -131,6 +138,73 @@ def guarded_entries(directory, value):
 
 def guarded_names(directory, value):
     return [name for name, _ in guarded_entries(directory, value)]
+
+
+def slice_capture_paths(value, repo, patterns):
+    """Enumerate non-Git slice scope without opening excluded paths or following directories through symlinks."""
+    root = guarded_resolve(value["repo_paths"][repo], value)
+    tables = state.policy_tables(read_policy(value), pinned=True)
+    names = source_names(value, repo)
+    found = set()
+    visited = set()
+    for table in tables:
+        if not table.root.is_relative_to(root):
+            continue
+        for exclusion in table.read_excludes:
+            excluded = (table.root / exclusion).relative_to(root).as_posix()
+            parts = excluded.split("/")
+            ancestors = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+            for pattern in patterns:
+                prefix = "/".join(scope_prefix(pattern))
+                require(not any(in_scope(path, [pattern], names) for path in ancestors)
+                        and not (prefix and names.intersects(prefix, [excluded])),
+                        "Slice write scope intersects read_excludes")
+
+    def walk(directory):
+        if directory in visited:
+            return
+        visited.add(directory)
+        try:
+            state.check_path_exclusions(directory, tables)
+        except ValueError as error:
+            if str(error) == "Path intersects read_excludes":
+                return
+            raise
+        try:
+            with state.open_directory(directory) as descriptor:
+                with os.scandir(descriptor) as entries:
+                    children = sorted(entry.name for entry in entries)
+                for name in children:
+                    path = directory / name
+                    try:
+                        state.check_path_exclusions(path, tables)
+                    except ValueError as error:
+                        if str(error) == "Path intersects read_excludes":
+                            continue
+                        raise
+                    mode = os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_mode
+                    relative = path.relative_to(root).as_posix()
+                    if stat.S_ISDIR(mode):
+                        walk(path)
+                    elif in_scope(relative, patterns, names):
+                        found.add(relative)
+        except FileNotFoundError:
+            return
+
+    for pattern in patterns:
+        prefix = "/".join(scope_prefix(pattern))
+        candidate = root / prefix if prefix else root
+        if prefix and in_scope(prefix, [pattern], names):
+            try:
+                state.check_path_exclusions(candidate, tables)
+                mode = state.capture_lstat(candidate).st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                found.add(prefix)
+                continue
+        walk(candidate)
+    return sorted(found)
 
 
 def guarded_history(directory, value):
@@ -593,11 +667,20 @@ def reserve_predecessors(draft, new_path, successor_hash, policy_value, *, linea
             require(latest is not None and timestamp(end["at"]) <= timestamp(latest.get("at")),
                     "Predecessor work has not been recorded in lifecycle history")
             if start["phase"] in {"review-fix", "gate-fix"}:
+                legacy_run_scope = (start.get("repo") is None and len(old["repos"]) == 1
+                                    and start.get("repair_source") is None and end.get("repair_source") is None)
+                require(start.get("repo") == repo or legacy_run_scope,
+                        f"Predecessor repair phase {start['phase_id']} has invalid repo")
                 scope_directory = source.parent / repo
                 if phase_slice is not None:
                     scope_directory = scope_directory / "slices" / state.relative_path(phase_slice)
                 events = guarded_history(scope_directory, old)
                 actions = {"gate-fix"} if start["phase"] == "gate-fix" else {"review-fix", "plan-gap"}
+                for field in ("action", "previous_state_path", "previous_state_sha256", "round", "attempt", "capsule_path"):
+                    require(start.get(field) == end.get(field), "Predecessor repair phase boundary mismatch")
+                for field in ("tool_use_id", "request_id"):
+                    require(start.get(field) is None or end.get(field) is None or start[field] == end[field],
+                            f"Predecessor repair phase {start['phase_id']} has conflicting {field}")
                 matches = []
                 for index, (_, _, event) in enumerate(events):
                     if not index or event.get("status") != "edited-unverified" or event.get("action") not in actions:
@@ -608,6 +691,201 @@ def reserve_predecessors(draft, new_path, successor_hash, policy_value, *, linea
                     previous = events[index - 1][2]
                     if timestamp(previous.get("at")) <= timestamp(start.get("at")) <= timestamp(end.get("at")) <= timestamp(event.get("at")):
                         matches.append((index, event))
+                if not matches and end["status"] != "passed":
+                    require(not legacy_run_scope,
+                            f"Predecessor repair phase {start['phase_id']} lacks repo-bound source evidence")
+                    anchor = [(path, event) for _, path, event in events
+                              if start.get("previous_state_path") and
+                              guarded_resolve(path, old) == guarded_resolve(start["previous_state_path"], old)]
+                    require(len(anchor) == 1 and guarded_sha(anchor[0][0], old) == start.get("previous_state_sha256"),
+                            f"Predecessor repair phase {start['phase_id']} has invalid predecessor state")
+                    previous = anchor[0][1]
+                    author = (previous.get("author_agent_id") if phase_slice is not None else
+                              previous.get("current_author_agent_id") or previous.get("original_agent_id"))
+                    require(start.get("agent_id") == author and bool(author),
+                            f"Predecessor repair phase {start['phase_id']} has invalid author")
+                    if end.get("agent_id") is not None and end.get("agent_id") != author:
+                        capsule_path = run_local_evidence_path(start.get("capsule_path"), source.parent, old,
+                                                              "Partial repair capsule")
+                        capsule = guarded_load(capsule_path, old)
+                        bound(old, repo, capsule)
+                        capsule_manifest_path = run_local_evidence_path(capsule.get("manifest_path"), source.parent,
+                                                                       old, "Repair capsule manifest")
+                        capsule_manifest = manifest(old, repo, capsule_manifest_path)
+                        require(old.get("author_rotation") == "capsule" and capsule.get("written_by") == author
+                                and capsule.get("source_fingerprint") == previous.get("source_fingerprint")
+                                and capsule_manifest["fingerprint"] == capsule.get("source_fingerprint")
+                                and start.get("capsule_sha256") == guarded_sha(capsule_path, old)
+                                and end.get("capsule_sha256") == start.get("capsule_sha256")
+                                and start.get("capsule_manifest_sha256") == guarded_sha(capsule_manifest_path, old)
+                                and end.get("capsule_manifest_sha256") == start.get("capsule_manifest_sha256")
+                                and (phase_slice is None or capsule.get("slice_id") == phase_slice),
+                                f"Predecessor repair phase {start['phase_id']} has invalid author handoff")
+                    if start.get("capsule_path"):
+                        require(end.get("agent_id") is not None and end.get("agent_id") != author,
+                                f"Predecessor repair phase {start['phase_id']} has invalid fresh author")
+                    repair_author = end.get("agent_id") or author
+                    require(timestamp(previous["at"]) <= timestamp(start["at"]),
+                            f"Predecessor repair phase {start['phase_id']} has invalid predecessor timestamp")
+                    action = start.get("action")
+                    require(action in actions, f"Predecessor repair phase {start['phase_id']} has invalid action")
+                    if action == "gate-fix":
+                        require(start.get("attempt") == previous.get("gate_fix_count", 0) + 1,
+                                f"Predecessor repair phase {start['phase_id']} has invalid attempt")
+                    else:
+                        require(start.get("round") == previous.get("latest_review_round", 0),
+                                f"Predecessor repair phase {start['phase_id']} has invalid round")
+                    snapshots = [boundary.get("repair_source") for boundary in (start, end)]
+                    for boundary, snapshot in zip((start, end), snapshots):
+                        require(isinstance(snapshot, dict) and snapshot.get("contract_sha256") == contract_hash
+                                and isinstance(snapshot.get("manifest"), dict),
+                                f"Predecessor repair phase {start['phase_id']} lacks source evidence")
+                        capture = snapshot["manifest"]
+                        require(all(key in capture for key in ("repo_path", "head", "files", "fingerprint"))
+                                and capture["fingerprint"] == state.digest({key: capture[key] for key in
+                                                                           ("repo_path", "head", "files")})
+                                and capture["repo_path"] == str(guarded_resolve(old["repo_paths"][repo], old))
+                                and timestamp(boundary["at"]) <= timestamp(snapshot.get("observed_at"))
+                                <= timestamp(latest["at"]),
+                                f"Predecessor repair phase {start['phase_id']} has invalid source evidence")
+                    require(timestamp(snapshots[0]["observed_at"]) <= timestamp(end["at"])
+                            <= timestamp(snapshots[1]["observed_at"]),
+                            f"Predecessor repair phase {start['phase_id']} has invalid capture order")
+                    if phase_slice is not None and snapshots[0]["manifest"]["head"] is None:
+                        schedule, _ = checked_slice_schedule(old, repo, old["slice_schedules"][repo]["path"])
+                        item = next((entry for entry in schedule["slices"] if entry["id"] == phase_slice), None)
+                        require(item is not None and all(snapshot.get("scope_coverage") == item["write_scope"]
+                                                         for snapshot in snapshots),
+                                f"Predecessor repair phase {start['phase_id']} has incomplete source coverage")
+                    candidates = []
+                    for other in phases.values():
+                        if "phase-start" not in other or "phase-end" not in other or other is phase:
+                            continue
+                        other_start = other["phase-start"][1]
+                        if (other_start.get("repo") == repo and other_start.get("slice_id") == phase_slice
+                                and other_start.get("previous_state_path") == start.get("previous_state_path")
+                                and other_start.get("previous_state_sha256") == start.get("previous_state_sha256")
+                                and other_start.get("action") == action):
+                            candidates.append(other)
+                    before = [other for other in candidates
+                              if timestamp(other["phase-start"][1]["at"]) < timestamp(start["at"])]
+                    after = [other for other in candidates
+                             if timestamp(other["phase-start"][1]["at"]) > timestamp(start["at"])]
+                    names = repo_read_excludes(old, repo)
+                    if before:
+                        prior = max(before, key=lambda other: timestamp(other["phase-start"][1]["at"]))
+                        prior_end = prior["phase-end"][1]
+                        prior_capture = prior_end.get("repair_source", {}).get("manifest")
+                        require(timestamp(prior_end["at"]) <= timestamp(start["at"])
+                                and isinstance(prior_capture, dict)
+                                and state.same_source(prior_capture, snapshots[0]["manifest"], names),
+                                f"Predecessor repair phase {start['phase_id']} has a source evidence gap")
+                    else:
+                        require(state.same_source(event_manifest(old, repo, previous), snapshots[0]["manifest"], names),
+                                f"Predecessor repair phase {start['phase_id']} differs from predecessor source")
+                    require(after, f"Predecessor repair phase {start['phase_id']} has no recorded retry")
+                    following = min(after, key=lambda other: timestamp(other["phase-start"][1]["at"]))
+                    following_start = following["phase-start"][1]
+                    for other in phases.values():
+                        if other is phase or other is following or "phase-start" not in other or "phase-end" not in other:
+                            continue
+                        other_start, other_end = other["phase-start"][1], other["phase-end"][1]
+                        if other_start.get("phase") not in {"implement", "review-fix", "gate-fix"}:
+                            continue
+                        following_end = following["phase-end"][1]
+                        require(timestamp(other_end.get("repair_source", {}).get("observed_at", other_end["at"]))
+                                <= timestamp(start["at"])
+                                or timestamp(other_start["at"]) >= timestamp(
+                                    following_end.get("repair_source", {}).get("observed_at", following_end["at"])),
+                                f"Predecessor repair phase {start['phase_id']} overlaps another writer")
+                    following_capture = following_start.get("repair_source", {}).get("manifest")
+                    references = following_start.get("prior_repair_boundaries", {})
+                    require(timestamp(snapshots[1]["observed_at"]) <= timestamp(following_start["at"])
+                            and isinstance(following_capture, dict)
+                            and state.same_source(snapshots[1]["manifest"], following_capture, names)
+                            and isinstance(references, dict)
+                            and all(any(guarded_resolve(path, old) == guarded_resolve(boundary, old)
+                                            and digest == guarded_sha(boundary, old)
+                                            for path, digest in references.items())
+                                    for boundary in (start_path, phase["phase-end"][0])),
+                            f"Predecessor repair phase {start['phase_id']} has unaccounted partial changes or retry gap")
+                    if not state.same_source(snapshots[0]["manifest"], snapshots[1]["manifest"], names):
+                        recovery_path = run_local_evidence_path(following_start.get("repair_recovery_path"),
+                                                               source.parent, old, "Partial repair recovery")
+                        recovery = guarded_load(recovery_path, old)
+                        bound(old, repo, recovery)
+                        require(recovery.get("kind") == "ship-partial-repair-recovery-v1"
+                                and end.get("end_reason") in {"context", "api-error", "user-stop", "timeout", "unknown"}
+                                and recovery.get("slice_id") == phase_slice
+                                and recovery.get("action") == action
+                                and recovery.get("phase_id") == start["phase_id"]
+                                and recovery.get("start_sha256") == guarded_sha(start_path, old)
+                                and recovery.get("end_sha256") == guarded_sha(phase["phase-end"][0], old)
+                                and recovery.get("before_fingerprint") == snapshots[0]["manifest"]["fingerprint"]
+                                and recovery.get("partial_fingerprint") == snapshots[1]["manifest"]["fingerprint"]
+                                and recovery.get("author_agent_id") == repair_author
+                                and recovery.get("retry_phase_id") == following_start["phase_id"]
+                                and following_start.get("repair_recovery_sha256") == guarded_sha(recovery_path, old)
+                                and timestamp(end["at"]) <= timestamp(recovery.get("at")) <= timestamp(following_start["at"]),
+                                f"Predecessor repair phase {start['phase_id']} has invalid partial recovery evidence")
+                        changed = source_names(old, repo).changed(snapshots[0]["manifest"], snapshots[1]["manifest"])
+                        declared = recovery.get("changed_paths")
+                        require(isinstance(declared, list) and declared and
+                                source_names(old, repo).keys(declared) == changed,
+                                "Partial repair recovery paths do not match source changes")
+                        require(phase_slice is not None and action == "review-fix",
+                                "Partial repair recovery requires slice review-fix")
+                        schedule, _ = checked_slice_schedule(old, repo, old["slice_schedules"][repo]["path"])
+                        item = next((entry for entry in schedule["slices"] if entry["id"] == phase_slice), None)
+                        require(item is not None and all(in_scope(path, item["write_scope"], source_names(old, repo))
+                                                         for path in declared),
+                                "Partial repair recovery changed files outside slice scope")
+                        state.text(recovery.get("remaining_work"), "partial repair remaining work")
+                        finding_ids = recovery.get("finding_ids")
+                        require(phase_slice is not None and action == "review-fix" and isinstance(finding_ids, list)
+                                and finding_ids and len(set(finding_ids)) == len(finding_ids),
+                                "Partial repair recovery needs slice finding IDs")
+                        checkpoint_path = run_local_evidence_path(end.get("checkpoint_path"), source.parent, old,
+                                                                 "Partial repair checkpoint")
+                        checkpoint = guarded_load(checkpoint_path, old)
+                        bound(old, repo, checkpoint)
+                        require(guarded_resolve(checkpoint_path, old).is_relative_to(guarded_resolve(source.parent, old))
+                                and end.get("checkpoint_sha256") == guarded_sha(checkpoint_path, old)
+                                and checkpoint.get("kind") == "ship-partial-repair-checkpoint-v1"
+                                and checkpoint.get("slice_id") == phase_slice
+                                and checkpoint.get("phase_id") == start["phase_id"]
+                                and checkpoint.get("start_sha256") == guarded_sha(start_path, old)
+                                and checkpoint.get("author_agent_id") == repair_author
+                                and checkpoint.get("previous_state_sha256") == start.get("previous_state_sha256")
+                                and checkpoint.get("source_fingerprint") == snapshots[1]["manifest"]["fingerprint"]
+                                and checkpoint.get("status") == end["status"]
+                                and checkpoint.get("completed") == []
+                                and timestamp(start["at"]) <= timestamp(checkpoint.get("at")) <= timestamp(end["at"])
+                                and set(finding_ids) <= {entry.get("id") for entry in checkpoint.get("unfinished", [])
+                                                         if isinstance(entry.get("reason"), str) and entry["reason"].strip()},
+                                "Partial repair checkpoint does not establish unfinished findings")
+                        retry_ids = {other["phase-start"][1]["phase_id"] for other in after}
+                        recovered = [event for _, _, event in events
+                                     if event.get("status") == "edited-unverified"
+                                     and event.get("repair_phase_id") in retry_ids]
+                        require(len(recovered) == 1, "Partial repair retry lacks a charged lifecycle state")
+                        recorded = recovered[0]
+                        require(all(any(guarded_resolve(path, old) == guarded_resolve(artifact, old)
+                                        and digest == guarded_sha(artifact, old)
+                                        for path, digest in recorded.get("artifact_hashes", {}).items())
+                                    for artifact in (recovery_path, checkpoint_path)),
+                                "Partial repair recovery evidence is not sealed")
+                        result = guarded_load(absolute_file(recorded.get("applied_path"), old), old)
+                        applied = {entry.get("id") for entry in result.get("applied", [])
+                                   if entry.get("evidence_paths")}
+                        require(set(finding_ids) <= applied, "Partial repair findings lack confirmed recovery")
+                    sealed = any(all(any(guarded_resolve(path, old) == guarded_resolve(boundary, old)
+                                             and digest == guarded_sha(boundary, old)
+                                             for path, digest in event.get("artifact_hashes", {}).items())
+                                         for boundary in (start_path, phase["phase-end"][0]))
+                                 for _, _, event in events)
+                    require(sealed, f"Predecessor repair phase {start['phase_id']} boundaries are not sealed in history")
+                    continue
                 require(len(matches) == 1, "Predecessor repair phase is missing from lifecycle history")
                 index, event = matches[0]
                 key = (phase_slice, index)
@@ -622,6 +900,55 @@ def reserve_predecessors(draft, new_path, successor_hash, policy_value, *, linea
                             and start.get("previous_state_sha256") == guarded_sha(events[index - 1][1], old),
                             "Predecessor repair phase binding mismatch")
                 previous = events[index - 1][2]
+                expected_author = (previous.get("author_agent_id") if phase_slice is not None else
+                                   previous.get("current_author_agent_id") or previous.get("original_agent_id"))
+                if start.get("agent_id") is not None and expected_author is not None:
+                    require(start["agent_id"] == expected_author,
+                            f"Predecessor repair phase {start['phase_id']} has invalid author")
+                if start.get("agent_id") is not None and end.get("agent_id") is not None and not start.get("capsule_path"):
+                    require(start["agent_id"] == end["agent_id"],
+                            f"Predecessor repair phase {start['phase_id']} has conflicting authors")
+                end_source = end.get("repair_source")
+                if end_source is not None:
+                    capture = end_source.get("manifest") if isinstance(end_source, dict) else None
+                    start_source = start.get("repair_source")
+                    start_capture = start_source.get("manifest") if isinstance(start_source, dict) else None
+                    require(isinstance(capture, dict)
+                            and all(key in capture for key in ("repo_path", "head", "files", "fingerprint"))
+                            and capture["fingerprint"] == state.digest({key: capture[key] for key in
+                                                                       ("repo_path", "head", "files")})
+                            and isinstance(start_capture, dict)
+                            and all(key in start_capture for key in ("repo_path", "head", "files", "fingerprint"))
+                            and start_capture["fingerprint"] == state.digest({key: start_capture[key] for key in
+                                                                             ("repo_path", "head", "files")})
+                            and start_source.get("contract_sha256") == contract_hash
+                            and end_source.get("contract_sha256") == contract_hash
+                            and timestamp(start["at"]) <= timestamp(start_source.get("observed_at")) <= timestamp(end["at"])
+                            and timestamp(end["at"]) <= timestamp(end_source.get("observed_at")) <= timestamp(event["at"])
+                            and state.same_source(capture, event_manifest(old, repo, event), repo_read_excludes(old, repo)),
+                            f"Predecessor repair phase {start['phase_id']} result source does not match lifecycle")
+                    previous_phases = [other for other in phases.values()
+                                       if other is not phase and "phase-start" in other and "phase-end" in other
+                                       and other["phase-start"][1].get("repo") == repo
+                                       and other["phase-start"][1].get("slice_id") == phase_slice
+                                       and other["phase-start"][1].get("previous_state_path") == start.get("previous_state_path")
+                                       and other["phase-start"][1].get("action") == start.get("action")
+                                       and timestamp(other["phase-start"][1]["at"]) < timestamp(start["at"])]
+                    prior_source = event_manifest(old, repo, previous)
+                    if previous_phases:
+                        prior_phase = max(previous_phases, key=lambda item: timestamp(item["phase-start"][1]["at"]))
+                        prior_end = prior_phase["phase-end"][1]
+                        prior_source = prior_end.get("repair_source", {}).get("manifest")
+                        references = start.get("prior_repair_boundaries", {})
+                        require(isinstance(references, dict) and all(
+                            any(guarded_resolve(path, old) == guarded_resolve(boundary[0], old)
+                                and digest == guarded_sha(boundary[0], old) for path, digest in references.items())
+                            for boundary in (prior_phase["phase-start"], prior_phase["phase-end"]))
+                            and timestamp(prior_end["at"]) <= timestamp(start["at"]),
+                            f"Predecessor repair phase {start['phase_id']} lacks previous phase binding")
+                    require(isinstance(prior_source, dict)
+                            and state.same_source(prior_source, start_capture, repo_read_excludes(old, repo)),
+                            f"Predecessor repair phase {start['phase_id']} starts from unrecorded source")
                 counter = "gate_fix_count" if event["action"] == "gate-fix" else "review_fix_count"
                 require(event.get(counter, 0) == previous.get(counter, 0) + 1,
                         "Predecessor repair phase counter mismatch")
@@ -3252,7 +3579,13 @@ def repair_phase(contract_path, value, repo, request, events, expected_current_a
             <= datetime.now(timezone.utc), "Repair phase timestamp is stale, future or reversed")
     require(end.get("status") in {"passed", "failed", "blocked", "interrupted"},
             "Repair phase is not closed with an actual result status")
-    return [str(p) for p in paths] + [str(previous_path), str(original_path)]
+    prior_boundaries = start.get("prior_repair_boundaries", {})
+    require(isinstance(prior_boundaries, dict), "Invalid prior repair boundary bindings")
+    for path, expected_hash in prior_boundaries.items():
+        boundary = absolute_file(path, value)
+        require(boundary.parent == directory and guarded_sha(boundary, value) == expected_hash,
+                "Prior repair boundary changed")
+    return [str(p) for p in paths] + [str(previous_path), str(original_path), *prior_boundaries]
 
 
 def capsule_handoff(contract_path, value, repo, request, previous, events, current, fingerprint, slice_id=None):
@@ -4450,6 +4783,69 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
             require(before == "needs-fix" and previous.get("review_path"), "Slice review fix needs findings")
             require(data["review_fix_count"] < data.get("review_fix_limit", SLICE_REVIEW_FIX_BUDGET),
                     "Slice review-fix budget exhausted")
+            if request.get("repair_phase_id") is not None:
+                identifier = request["repair_phase_id"]
+                require(isinstance(identifier, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", identifier)
+                        and identifier not in {".", ".."}, "Invalid slice repair phase ID")
+                directory = Path(contract_path).parent / "telemetry"
+                paths = [directory / f"{identifier}-{suffix}.json" for suffix in ("start", "end")]
+                start, end = [state.load(absolute_file(path)) for path in paths]
+                expected = {"schema_version": VERSION, "run_id": value["run_id"], "workflow": value["workflow"],
+                            "repo": repo, "slice_id": slice_id, "phase_id": identifier, "phase": "review-fix",
+                            "action": action, "previous_state_path": str(events[-1][1]),
+                            "previous_state_sha256": sha(events[-1][1]), "round": previous["latest_review_round"]}
+                require(all(all(boundary.get(key) == val for key, val in expected.items())
+                            for boundary in (start, end)) and start.get("event") == "phase-start"
+                        and end.get("event") == "phase-end" and end.get("start_sha256") == sha(paths[0])
+                        and end.get("status") in {"passed", "failed", "blocked", "interrupted"}
+                        and timestamp(previous["at"]) <= timestamp(start["at"]) <= timestamp(end["at"])
+                        <= datetime.now(timezone.utc), "Slice repair phase binding mismatch")
+                require(start.get("agent_id") == previous["author_agent_id"]
+                        and end.get("agent_id") == (new_author or previous["author_agent_id"]),
+                        "Slice repair phase author mismatch")
+                require(not any(event.get("repair_phase_id") == identifier for _, _, event in events),
+                        "Slice repair phase already used")
+                prior_boundaries = start.get("prior_repair_boundaries", {})
+                require(isinstance(prior_boundaries, dict), "Invalid prior repair boundary bindings")
+                for path, expected_hash in prior_boundaries.items():
+                    boundary = absolute_file(path, value)
+                    require(boundary.parent == directory and guarded_sha(boundary, value) == expected_hash,
+                            "Prior repair boundary changed")
+                sealed += [str(path) for path in paths] + list(prior_boundaries)
+                if start.get("repair_recovery_path"):
+                    recovery_path = run_local_evidence_path(start["repair_recovery_path"], Path(contract_path).parent,
+                                                            value, "Partial repair recovery")
+                    require(guarded_sha(recovery_path, value) == start.get("repair_recovery_sha256"),
+                            "Partial repair recovery changed")
+                    sealed.append(str(recovery_path))
+                    recovery = guarded_load(recovery_path, value)
+                    partial_id = recovery.get("phase_id")
+                    require(isinstance(partial_id, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", partial_id)
+                            and partial_id not in {".", ".."}, "Invalid partial repair phase ID")
+                    partial_end = guarded_load(absolute_file(directory / f"{partial_id}-end.json", value), value)
+                    checkpoint = run_local_evidence_path(partial_end.get("checkpoint_path"), Path(contract_path).parent,
+                                                         value, "Partial repair checkpoint")
+                    require(guarded_sha(checkpoint, value) == partial_end.get("checkpoint_sha256"),
+                            "Partial repair checkpoint changed")
+                    sealed.append(str(checkpoint))
+                for path in prior_boundaries:
+                    prior = guarded_load(path, value)
+                    if prior.get("event") != "phase-start" or not prior.get("repair_recovery_path"):
+                        continue
+                    recovery_path = run_local_evidence_path(prior["repair_recovery_path"], Path(contract_path).parent,
+                                                            value, "Partial repair recovery")
+                    require(guarded_sha(recovery_path, value) == prior.get("repair_recovery_sha256"),
+                            "Prior partial repair recovery changed")
+                    recovery = guarded_load(recovery_path, value)
+                    partial_id = recovery.get("phase_id")
+                    require(isinstance(partial_id, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", partial_id)
+                            and partial_id not in {".", ".."}, "Invalid partial repair phase ID")
+                    partial_end = guarded_load(absolute_file(directory / f"{partial_id}-end.json", value), value)
+                    checkpoint = run_local_evidence_path(partial_end.get("checkpoint_path"), Path(contract_path).parent,
+                                                         value, "Partial repair checkpoint")
+                    require(guarded_sha(checkpoint, value) == partial_end.get("checkpoint_sha256"),
+                            "Prior partial repair checkpoint changed")
+                    sealed += [str(recovery_path), str(checkpoint)]
             data["review_fix_count"] += 1
             applied_path = request.get("applied_path")
             result = state.load(absolute_file(applied_path))
@@ -5767,6 +6163,7 @@ def phase_from_flags(contract_path, out, *, phase_id, phase, event, repo=None, s
 def phase_from_record(contract_path, record, out):
     value = contract(contract_path)
     require(isinstance(record, dict), "Telemetry request must be an object")
+    require("checkpoint_sha256" not in record, "Checkpoint hash is generated by phase")
     require_unreserved(value, contract_path, record.get("repo"))
     record.setdefault("run_id", value["run_id"])
     record.setdefault("workflow", value["workflow"])
@@ -5828,15 +6225,18 @@ def phase_from_record(contract_path, record, out):
         state.text(author, "current author")
         require(record.get("agent_id") == author, "Repair phase author mismatch")
         if value.get("author_rotation", "resume") == "capsule":
-            capsule_path = absolute_file(record.get("capsule_path"))
-            require(capsule_path.resolve().is_relative_to(Path(contract_path).parent.resolve()), "Capsule must be run-local")
-            capsule = state.load(capsule_path)
+            capsule_path = run_local_evidence_path(record.get("capsule_path"), Path(contract_path).parent, value,
+                                                   "Repair capsule")
+            capsule = guarded_load(capsule_path, value)
             bound(value, repo, capsule)
             require(capsule.get("written_by") == author
                     and capsule.get("source_fingerprint") == previous.get("source_fingerprint"),
                     "Repair phase capsule author/source mismatch")
-            manifest = state.checked_manifest(absolute_file(capsule.get("manifest_path")))
-            require(manifest["fingerprint"] == previous.get("source_fingerprint"), "Repair phase capsule manifest mismatch")
+            capsule_manifest_path = run_local_evidence_path(capsule.get("manifest_path"), Path(contract_path).parent,
+                                                           value, "Repair capsule manifest")
+            capsule_manifest = state.checked_manifest(capsule_manifest_path, loader=lambda path: guarded_load(path, value))
+            require(capsule_manifest["fingerprint"] == previous.get("source_fingerprint"),
+                    "Repair phase capsule manifest mismatch")
     if record["event"] == "phase-end":
         start_path = directory / (record["phase_id"] + "-start.json")
         start = state.load(absolute_file(start_path))
@@ -5861,7 +6261,69 @@ def phase_from_record(contract_path, record, out):
         checkpoint = record.get("checkpoint_path")
         require(checkpoint is None or (isinstance(checkpoint, str) and Path(checkpoint).is_absolute()),
                 "checkpoint_path must be absolute")
+        if checkpoint is not None and record["phase"] in {"review-fix", "gate-fix"}:
+            checkpoint_path = guarded_resolve(checkpoint, value)
+            run_root = guarded_resolve(Path(contract_path).parent, value)
+            if checkpoint_path.is_relative_to(run_root) and guarded_exists(checkpoint, value):
+                record["checkpoint_sha256"] = guarded_sha(absolute_file(checkpoint, value), value)
         record["start_sha256"] = sha(start_path)
+    if (record["phase"] in {"review-fix", "gate-fix"} and record.get("repo") in value["repos"]
+            and record.get("previous_state_path") and record.get("previous_state_sha256")):
+        previous_path = run_local_evidence_path(record["previous_state_path"], Path(contract_path).parent, value,
+                                                "Repair predecessor state")
+        require(guarded_sha(previous_path, value) == record["previous_state_sha256"],
+                "Repair phase source capture predecessor mismatch")
+        previous = guarded_load(previous_path, value)
+        bound(value, record["repo"], previous)
+        require(previous.get("slice_id") == slice_id, "Repair phase source capture slice mismatch")
+        scope = sorted(set(previous.get("scope", previous.get("touched", []))) |
+                       set(previous.get("source_scope", [])))
+        coverage = None
+        enumerated = None
+        if slice_id is not None:
+            declaration = value["slice_schedules"][record["repo"]]
+            schedule, _ = checked_slice_schedule(value, record["repo"], declaration["path"])
+            item = next(entry for entry in schedule["slices"] if entry["id"] == slice_id)
+            coverage = item["write_scope"]
+            if not guarded_exists(Path(value["repo_paths"][record["repo"]]) / ".git", value):
+                enumerated = slice_capture_paths(value, record["repo"], coverage)
+                scope = sorted(set(scope) | set(enumerated))
+            if record["event"] == "phase-end":
+                scope = sorted(set(scope) | set(start.get("repair_source", {}).get("manifest", {}).get("files", {})))
+        capture = state.capture(value["repo_paths"][record["repo"]], scope, previous.get("excludes", []),
+                                repo_read_excludes(value, record["repo"]), policies=read_policy(value))
+        if enumerated is not None:
+            require(slice_capture_paths(value, record["repo"], coverage) == enumerated,
+                    "Slice source scope changed during capture; stabilize and retry")
+        record["repair_source"] = {"observed_at": datetime.now(timezone.utc).isoformat(),
+                                   "contract_sha256": guarded_sha(contract_path, value), "manifest": capture}
+        if record.get("capsule_path"):
+            capsule_path = run_local_evidence_path(record["capsule_path"], Path(contract_path).parent, value,
+                                                   "Repair capsule")
+            record["capsule_sha256"] = guarded_sha(capsule_path, value)
+            capsule = guarded_load(capsule_path, value)
+            capsule_manifest_path = run_local_evidence_path(capsule.get("manifest_path"), Path(contract_path).parent,
+                                                           value, "Repair capsule manifest")
+            record["capsule_manifest_sha256"] = guarded_sha(capsule_manifest_path, value)
+        if coverage is not None:
+            record["repair_source"]["scope_coverage"] = coverage
+        if record["event"] == "phase-start":
+            if record.get("repair_recovery_path"):
+                recovery_path = run_local_evidence_path(record["repair_recovery_path"], Path(contract_path).parent,
+                                                        value, "Partial repair recovery")
+                record["repair_recovery_sha256"] = guarded_sha(recovery_path, value)
+            prior = {}
+            for name in guarded_names(directory, value):
+                if not name.endswith(("-start.json", "-end.json")):
+                    continue
+                path = directory / name
+                boundary = guarded_load(path, value)
+                if (boundary.get("phase") in {"review-fix", "gate-fix"}
+                        and boundary.get("repo") == record["repo"] and boundary.get("slice_id") == slice_id
+                        and boundary.get("previous_state_path") == str(previous_path)
+                        and boundary.get("previous_state_sha256") == record["previous_state_sha256"]):
+                    prior[str(path)] = guarded_sha(path, value)
+            record["prior_repair_boundaries"] = prior
     record["schema_version"] = VERSION
     state.write_once(out, record)
     return record

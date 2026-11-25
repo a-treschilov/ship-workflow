@@ -127,6 +127,9 @@ parent captures and historical audits. See the
 boundaries.
 Successor budget continuity records bind the latest predecessor state, the SHA-256 of its audited history and
 the explicit user decision. Historical schedule validation uses the already loaded predecessor contract.
+Repair telemetry can bind source observations at each boundary. Replacement audits use these observations,
+sealed retry records and, for partial slice repairs, the recorded unfinished-finding checkpoint and recovery
+evidence to reconcile actual repair work with lifecycle counters. Ambiguous histories remain blocked.
 Related-run discovery belongs to active contract validation. The repo gate-fix budget follows the historical links and counts each predecessor's local
 repair events once. The combined allowance is two attempts. A contract can assign a deliverable to slice
 pre-review or whole-repo pre-review. Whole-repo certification includes every deliverable. Small files use

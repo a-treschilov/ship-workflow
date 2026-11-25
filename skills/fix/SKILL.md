@@ -90,6 +90,8 @@ use `--round` for review-fix/plan-gap and `--attempt` for gate-fix. For slice ph
 boundaries. The start names the current author; the end
 names the observed fresh author. The --from-review author_handoff exception in the
 shared protocol remains an author handoff, not an invented resumed implementer.
+When a slice review-fix stops with partial changes, retain the actual unfinished-finding checkpoint and
+bind a partial repair recovery record to the retry as specified in protocol §6.
 
 Follow protocol transitions: implemented → independent pre-review → fresh review → original implementer
 fix → fresh review → independent final gates. Prepare helper review packets and pass baseline scope,

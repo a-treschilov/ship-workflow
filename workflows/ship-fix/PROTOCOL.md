@@ -195,8 +195,15 @@ exclusion. The policy argument must itself be complete, because contract content
 discover an exclusion that forbids reading the other contract.
 
 The helper reserves audited predecessor scopes with write-once `successor-reservation.json` records. It
-refuses an open work phase or a repair phase that is not accounted for by lifecycle history. Stop work on
+refuses an open work phase or a repair phase that is not accounted for by lifecycle history. A closed
+non-passed repair without a separate lifecycle event can be reconciled through its source captures and a
+subsequent recorded retry. The captures must connect the predecessor source, every retry boundary and the
+charged lifecycle state. Partial slice review-fix changes require the recovery record described in §6 and
+confirmed finding evidence in the charged state. Missing captures, gaps, unsealed boundaries and ambiguous repair
+accounting block replacement. A legacy phase without sufficient source evidence remains blocked. Stop work on
 predecessors before invoking it. The current helpers coordinate their state changes and honor reservations.
+An older repair pair with `repo: null` can be attributed to a single-repository run only when it uniquely
+matches a charged lifecycle state. Other run-scoped repair pairs lack a reliable repository binding.
 An older installed helper, host file write or external process that does not use this coordination can still
 write concurrently. Stop those processes before choosing a predecessor and preserve their recorded histories.
 
@@ -1037,6 +1044,37 @@ edits, but do not authorize a new source version: policy-enabled proof progressi
 implemented/edited-unverified source (initial submitted source before a from-review repair). Record the
 repair before re-entering review/gates/acceptance, even after terminal/block detours; restarting
 implementation cannot reset this anchor. Unchanged block/unblock remains supported.
+For repair boundaries carrying the predecessor state path and hash, `phase` captures the applicable source
+and binds its capture to the contract. Retry starts bind the preceding repair boundaries for that same state.
+An `edited-unverified` transition with `repair_phase_id` seals these boundaries. Slice review repairs can
+also supply `repair_phase_id` to bind the actual phase and seal preceding retry evidence. The observations
+cover the declared source scope and obey read exclusions. For a non-Git slice, the helper enumerates the
+approved write scope before and after capture. Reconciliation requires its first observed version to match
+the preceding lifecycle manifest, including every enumerated path. A pair deleted before any
+later immutable record binds it cannot be reconstructed from the remaining history.
+
+When an interrupted slice review-fix leaves partial edits and the same repair must resume, retain its actual
+run-local `ship-partial-repair-checkpoint-v1` result before closing the phase. The checkpoint contains
+`schema_version`, `kind`, `run_id`, `repo`, `slice_id`, `phase_id`, `author_agent_id`,
+`previous_state_sha256`, `start_sha256`, `at`, `source_fingerprint`, the observed `status`, an empty `completed`
+list, and `unfinished` entries containing
+finding `id` and `reason`. Supply its path as `checkpoint_path` on phase-end, which binds its SHA-256 when
+the run-local file exists. An unavailable or non-local checkpoint cannot support this recovery.
+An attempt that reports completed repairs needs its own lifecycle accounting.
+Write a unique run-local `ship-partial-repair-recovery-v1` JSON record before starting the retry. It contains `schema_version`,
+`kind`, `run_id`, `repo`, `slice_id`, `action: "review-fix"`, the interrupted `phase_id`, the two boundary
+hashes `start_sha256` and `end_sha256`, `before_fingerprint`, `partial_fingerprint`, `author_agent_id`,
+`retry_phase_id`, `at`, exact `changed_paths`, affected `finding_ids`, and a nonempty `remaining_work`.
+The interrupted end must record its actual non-success `end_reason`. Each recovery finding must appear as
+unfinished in the checkpoint. Supply the recovery record's absolute path as
+`repair_recovery_path` in the retry phase-start input JSON. The helper binds its hash. The slice
+`edited-unverified` request names the retry as `repair_phase_id` and seals the recovery record. Its normal
+`applied_path` must contain the affected findings with matching independent proof. The retry spends one
+slice repair pass and the usual fresh review remains required. Partial changes without this chain remain
+blocked. Repo-level partial repairs continue to require a recorded charged repair for each operation.
+For a capsule handoff, the checkpoint and recovery record identify the actual author recorded at phase-end.
+The capsule and its manifest must be run-local. Both phase boundaries bind them by file hash, and replacement checks their hashes,
+the author and source fingerprint.
 For the repo recovery transition after already accepted slice repairs, use the sealed slice evidence
 defined in "Recovering a repo review fix after slice acceptance".
 The guard does not mechanically prove host's continuation capability order.

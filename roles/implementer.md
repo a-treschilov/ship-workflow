@@ -65,6 +65,10 @@ helper, including in resumes. The script prints short results and exits 2 on ref
 4. Final report, short: `{status: done|blocked|interrupted, capsule, matrix|applied, runs, gaps}`. Claim only
    what the runs prove. Do not claim independent review or a whole-run success.
 
+When a slice review-fix stops with partial edits, provide the actual unfinished findings and source checkpoint
+described in protocol §6. Bind it to the observed repair phase and report its path so the orchestrator can
+record it on the phase end and, if appropriate, continue the same repair with its recovery record.
+
 ## Provider or quota errors
 
 If the provider returns a usage, quota or rate-limit error mid-task, stop before starting any new work. Make the
