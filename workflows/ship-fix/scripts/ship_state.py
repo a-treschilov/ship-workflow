@@ -70,7 +70,15 @@ def read_policy_input(contract):
             relative_path(excluded)
         if paths:
             policies.append((root, tuple(paths)))
-    return tuple(policies)
+    inherited = contract.get("inherited_read_policy")
+    if inherited is not None:
+        require(isinstance(inherited, dict) and set(inherited) == {"repo_paths", "read_excludes"},
+                "Invalid inherited read policy")
+        policies.extend(read_policy_input(inherited))
+    merged = {}
+    for root, paths in policies:
+        merged.setdefault(root, set()).update(paths)
+    return tuple(sorted((root, tuple(sorted(paths))) for root, paths in merged.items()))
 
 
 def publish_once(path, writer, *, pinned=False, temporary_path=None, sync=False, mode=0o666):
@@ -1617,6 +1625,13 @@ def main():
     sub.add_argument("--successor-draft", required=True)
     sub.add_argument("--reason", required=True)
     sub.add_argument("--read-policy", required=True)
+    sub.add_argument("--bootstrap-read-policy")
+    check_mode = sub.add_mutually_exclusive_group()
+    check_mode.add_argument("--check", action="store_true")
+    check_mode.add_argument("--expect-check-sha256")
+    sub.add_argument("--exclude-related-run", action="append", default=[])
+    sub.add_argument("--legacy-repair-recovery", action="append", default=[], metavar="ABS_PATH@SHA256")
+    sub.add_argument("--legacy-host-signers", metavar="ABS_PATH@SHA256")
     for name in ("capture", "delta"):
         sub = commands.add_parser(name)
         sub.add_argument("--repo", required=True)
@@ -1819,9 +1834,47 @@ def dispatch(args):
         module_spec = importlib.util.spec_from_file_location("ship_workflow", Path(__file__).with_name("ship_workflow.py"))
         workflow = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(workflow)
-        policies = read_policy_input(json.loads(args.read_policy))
-        print(json.dumps(workflow.replace_setup(args.contract, args.successor_draft, args.reason,
-                                                bootstrap_policy=policies)))
+        policy_bytes = args.read_policy.encode("utf-8")
+        policy_path = None
+        if Path(args.read_policy).is_absolute():
+            require(args.bootstrap_read_policy is not None,
+                    "A read-policy file requires an inline bootstrap read policy")
+            bootstrap = read_policy_input(json.loads(args.bootstrap_read_policy))
+            policy_path = Path(args.read_policy)
+            guarded = guard_excluded_paths(policy_path, bootstrap, pinned=bool(bootstrap))
+            if not bootstrap:
+                guarded = guarded.resolve()
+            policy_bytes = capture_bytes(guarded)
+        policy_sha256 = hashlib.sha256(policy_bytes).hexdigest()
+        policies = read_policy_input(json.loads(policy_bytes))
+        if policy_path is not None:
+            supplied = {(root, path) for root, paths in bootstrap for path in paths}
+            required = {(root, path) for root, paths in policies for path in paths}
+            require(required <= supplied, "Bootstrap read policy omits a file policy exclusion")
+            policies = bootstrap
+        else:
+            require(args.bootstrap_read_policy is None, "Inline read policy cannot use a separate bootstrap policy")
+        def pinned_reference(reference):
+            path, separator, digest = reference.rpartition("@")
+            require(separator and Path(path).is_absolute() and re.fullmatch(r"[0-9a-f]{64}", digest),
+                    "Legacy repair evidence and allowed signers need ABS_PATH@SHA256")
+            return {"path": path, "sha256": digest}
+
+        require(bool(args.legacy_repair_recovery) == bool(args.legacy_host_signers),
+                "Legacy repair recovery requires an independently provisioned --legacy-host-signers file")
+        legacy_recovery = [{**pinned_reference(reference),
+                            "allowed_signers": pinned_reference(args.legacy_host_signers)}
+                           for reference in args.legacy_repair_recovery]
+        require(len({reference["path"] for reference in legacy_recovery}) == len(legacy_recovery),
+                "Duplicate legacy repair recovery path")
+        result = workflow.replace_setup(args.contract, args.successor_draft, args.reason,
+                                        bootstrap_policy=policies, check=args.check,
+                                        expected_check=args.expect_check_sha256, policy_sha256=policy_sha256,
+                                        policy_path=policy_path, excluded_related_runs=args.exclude_related_run,
+                                        legacy_recovery=legacy_recovery)
+        print(json.dumps(result))
+        if result.get("status") == "blocked":
+            sys.exit(1)
         return
     if args.command in {"slice-transition", "slice-gate", "batch-start", "batch-barrier"}:
         import importlib.util

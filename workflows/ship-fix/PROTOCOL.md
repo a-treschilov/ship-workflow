@@ -179,6 +179,15 @@ When a frozen contract cannot represent the approved work, preserve the original
 
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py replace-setup --contract OLD_CONTRACT --successor-draft NEW_DRAFT --reason REASON --read-policy READ_POLICY_JSON`
 
+Add `--check` to inspect the replacement without publishing artifacts. A ready result contains `check_sha256`,
+which may be supplied to a later publication as `--expect-check-sha256`. The helper rechecks the inputs after
+acquiring its locks and refuses a different hash. `--read-policy` also accepts an absolute path to a JSON file
+when `--bootstrap-read-policy` supplies an inline JSON policy covering every exclusion in that file. The helper
+applies the inline bootstrap before opening the file.
+For a diagnostic check where access to a related run is prohibited, repeat `--exclude-related-run RUN_NAME`.
+Excluded runs are not inspected during related-run discovery and the result is blocked because that discovery
+is incomplete. Publication requires the complete related history.
+
 The helper publishes the original run's `setup-replacement.json` and the new `contract.json`. Validate the new
 contract with `validate-run` before continuing. A replacement is permitted only when the original run's complete
 available history shows setup activity and no lifecycle state, implementation, review, or budget consumption.
@@ -203,6 +212,11 @@ has exclusions.
 The helper applies this bootstrap policy before opening either contract and rejects any omitted contract
 exclusion. The policy argument must itself be complete, because contract contents cannot be read safely to
 discover an exclusion that forbids reading the other contract.
+The successor contract records the complete supplied policy in `inherited_read_policy`, using `repo_paths`
+and `read_excludes`. Later commands apply that frozen policy before reading predecessor histories. A manually
+prepared slice-only successor with multiple source slices must supply the same complete inherited policy.
+Callers must include every applicable exclusion in the bootstrap, because an exclusion present only in an
+unread predecessor cannot be discovered safely before opening that predecessor.
 
 The helper reserves audited predecessor scopes with write-once `successor-reservation.json` records. It
 refuses an open work phase or a repair phase that is not accounted for by lifecycle history. A closed
@@ -210,7 +224,8 @@ non-passed repair without a separate lifecycle event can be reconciled through i
 subsequent recorded retry. The captures must connect the predecessor source, every retry boundary and the
 charged lifecycle state. Partial slice review-fix changes require the recovery record described in §6 and
 confirmed finding evidence in the charged state. Missing captures, gaps, unsealed boundaries and ambiguous repair
-accounting block replacement. A legacy phase without sufficient source evidence remains blocked. Stop work on
+accounting block replacement. A legacy phase without sufficient source evidence remains blocked. For closed legacy
+repair phases missing both source captures, see the recovery evidence in §6. Stop work on
 predecessors before invoking it. The current helpers coordinate their state changes and honor reservations.
 An older repair pair with `repo: null` can be attributed to a single-repository run only when it uniquely
 matches a charged lifecycle state. Other run-scoped repair pairs lack a reliable repository binding.
@@ -261,6 +276,27 @@ record and matching successor scope even if repo lifecycle state has not started
 one slice in the replacement's approved schedule. If that mapping is ambiguous, resolve it before continuing.
 The history hash covers the contract, ordered slice states and prior slice history. Existing contracts without
 this optional hash continue to use their original validation rules.
+When a replacement carries changed slice history that began before any repo state, `original_review_base`
+binds the earliest audited slice `base_manifest` and a first-touch baseline inside that predecessor run.
+Every carried changed path must have exactly one owner in the new approved slice schedule and must be
+reaccepted before slice-gate. The helper compares the successor startup with the recorded slice versions,
+rejects unrecorded edits and reversions, and carries inherited read exclusions through earlier generations.
+When a successor must review a predecessor's existing changes, its contract may declare `original_review_base`
+with `repo`, `initial_manifest`, and `first_touch_baseline`. The repository continuity record must bind one
+predecessor's latest state and history hash. Contract validation verifies those paths against the predecessor's
+audited initial manifest and baseline. The review packet and repository review verify that the review scope contains every changed
+path in its recorded scope. The helper validates each such path's first-touch record against the original
+manifest. The successor's initialization capture continues to identify its current checkout.
+For that repository, generate a review packet before each repo review and include its `index.json` absolute
+path and SHA-256 as `packet_path` and `packet_sha256` in the review result. The helper verifies the packet's
+sealed source and delta against the current checkout and first-touch baseline before accepting the review.
+An unrecorded change after the predecessor's last implementation or repair blocks the carried review base.
+For changed predecessor scope-amendment paths outside the successor's slices, the approved schedule declares
+`carried_repo_scope` with `owner: "repo"`, exact `paths`, `source_amendment_path`, and
+`source_amendment_sha256`. The helper audits the predecessor history and approval, rejects unapproved paths,
+and requires every changed amendment path outside the slices to have a repo owner. The slice gate binds those
+paths to the predecessor versions and includes them in its touched union. Initialization requires scoped
+checkout versions to match the predecessor and refuses unowned predecessor changes in that scope.
 All commands below use actual absolute variables, not literal placeholders.
 
 For policy-enabled repo repairs, `phase-start` validates the current state path/hash, action, author and
@@ -1062,6 +1098,64 @@ cover the declared source scope and obey read exclusions. For a non-Git slice, t
 approved write scope before and after capture. Reconciliation requires its first observed version to match
 the preceding lifecycle manifest, including every enumerated path. A pair deleted before any
 later immutable record binds it cannot be reconstructed from the remaining history.
+
+#### Recovering missing legacy repair captures for a setup replacement
+
+Supply each recovery as `replace-setup --legacy-repair-recovery ABS_PATH@SHA256` with
+`--legacy-host-signers ABS_PATH@SHA256`, using the same references for `--check` and publication.
+Obtain the allowed-signers file from the independently trusted recorder configuration. Do not
+accept one supplied as part of the proposed recovery or give the repair author a recorder key.
+Do not put the references in the draft. Publication
+records the references in `legacy_repair_recovery` and seals the applicable recovery in the
+predecessor reservation. The helper never rewrites the original telemetry, states or host observations.
+
+A `ship-legacy-repair-recovery-v1` record names `schema_version: 2`, `run_id`, `repo`, optional
+`slice_id`, `contract_path` and `contract_sha256` of the predecessor, `anchor` and `latest_state`
+(each an absolute `path` and `sha256`), the repair `action`, the host's `repair_id`, and ordered
+`attempts`. Each attempt names `phase_id`, `start_sha256`, `end_sha256`, and `host_observation`
+with `path`, `sha256`, `signature_path`, and `signature_sha256`. Paths are absolute.
+A chain that changed source must also bind `accounted_state` by path and hash and include a
+`settlement_observation` reference with the same fields as a `host_observation`.
+
+The host observation must come from the original recorder. Its exact bytes must already be sealed
+in the selected predecessor lifecycle history, directly or through a lifecycle-sealed phase-end
+with `checkpoint_path` and `checkpoint_sha256`. The recorder signs the exact observation bytes with
+the OpenSSH signature namespace `ship-workflow-legacy-repair`. The observation's `recorder`
+identifies its principal in the independently supplied allowed-signers file. Verification uses
+`ssh-keygen -Y verify` only for this recovery option. Approval and history hashes by themselves
+do not authenticate an observation. Historical logs that record only a spawn, a tool call
+or a result summary cannot establish the versions seen before and after a repair.
+
+A sealed `ship-host-repair-observation-v1` JSON uses `schema_version: 2`, `run_id`, `repo`,
+optional `slice_id`, `phase_id`, `phase_status`, `start_sha256`, `previous_state_sha256`,
+and the `session_id`, `request_id` and `tool_use_id` correlations recorded on either boundary.
+It records the actual `dispatch_id`, its `repair_id`, `resumes_dispatch_id` (null on first dispatch),
+`actual_author`, full `before` and `after` source manifests and UTC `before_at` and `after_at`.
+The signed `complete_write_coverage: true` attests the full writer audit from `coverage_from`
+(the anchor time for the first attempt, the preceding phase-end for a retry) through
+`coverage_through` (the current phase-end). The recorder must cover both snapshots, time outside
+the snapshots, and gaps between dispatches. It cannot attest a window with omitted host activity.
+The `writes` array is the complete ordered sequence of observed writes, including temporary edits.
+Each write records relative `path`, time `at`, `author`, `dispatch_id`, and `before` and `after`
+file versions (null for absence, otherwise the manifest's file or symlink version).
+A change of author requires the original contract's capsule rotation policy and a signed
+`author_handoff` with `from_agent_id`, `to_agent_id`, `capsule_path`, `capsule_sha256`, and
+`manifest_sha256`. The capsule must be bound to the preceding actual author and the observed
+start source. A recorder's signature cannot authorize a handoff on its own.
+For a repository plan-gap repair, a scope amendment registered by the charged state can add exact paths.
+It must bind the same predecessor and have been approved before the first attempt.
+Record `outcome: "unfinished"` only when the recorder observed that the repair was still open for
+continuation. The final `"submitted"` observation must reach the source and actual author of the
+unique charged lifecycle event. That final phase also goes through ordinary lifecycle validation.
+The signed `ship-host-repair-settlement-v1` observation covers the quiet window from the final
+phase-end to the time of the charged state. It binds `schema_version: 2`, `recorder`, `run_id`, `repo`,
+optional `slice_id`, `repair_id`, the final `dispatch_id`, `phase_id` and `end_sha256`, and the charged
+`state_sha256` and `source_fingerprint`. Require the start and end of the window in `coverage_from`
+and `coverage_through`, `complete_write_coverage: true` and an empty `writes` array.
+An already completed independent repair needs its own charge. A closed launch the host did not start
+can be recorded separately with `outcome: "not-started"`, null `actual_author`, no writes and
+unchanged source. The verifier rejects overlapping work phases, unobserved intermediate changes,
+writes outside approved scope and chains with native source observations.
 
 When an interrupted slice review-fix leaves partial edits and the same repair must resume, retain its actual
 run-local `ship-partial-repair-checkpoint-v1` result before closing the phase. The checkpoint contains

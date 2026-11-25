@@ -11,6 +11,7 @@ on the source repository.
 ## Before you install
 
 - Python 3.11 or newer on `PATH` as `python3`.
+- Legacy repair recovery also needs OpenSSH `ssh-keygen` with `-Y verify` support.
 - `git`, `bash`, and standard Unix tools (`cp`, `mv`, `find`).
 - An `.agents/` directory in the project root. Create it if needed:
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.7.0 - 2026-11-25
+
+### New Features
+
+- Inspect a setup replacement without publishing its artifacts and bind publication to the checked inputs.
+- Reconcile legacy repair phases during replacement when sealed host observations prove their source changes and lifecycle accounting.
+- Bind a successor's review packet and repository review to the audited predecessor first-touch base.
+- Carry approved predecessor documentation paths as repository-owned scope in a successor slice schedule.
+
 ### Bug Fixes
 
 - Check Codex session capabilities before run setup and support identified results from untargeted waits.

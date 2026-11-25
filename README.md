@@ -125,8 +125,11 @@ before preflight. An interrupted setup can remain open, and a failed setup does 
 When a frozen setup-only contract needs replacement, `replace-setup` preserves its artifacts and binds a new
 contract to it. The successor carries the audited budgets of all related lifecycle histories. See the
 [replacement procedure](workflows/ship-fix/PROTOCOL.md#replacing-a-setup-only-run).
+Use `replace-setup --check` to inspect a proposed replacement before publication.
 Closed unsuccessful repair attempts can be reconciled when their recorded source observations and subsequent
-repair evidence establish their effect and budget use.
+repair evidence establish their effect and budget use. For legacy phases without source captures, the
+[recovery procedure](workflows/ship-fix/PROTOCOL.md#recovering-missing-legacy-repair-captures-for-a-setup-replacement)
+requires signed host observations already sealed in predecessor history.
 
 ### Configure review criteria
 

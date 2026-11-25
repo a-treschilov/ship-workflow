@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,39 @@ state = workflow.state
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_replacement_freezes_bootstrap_read_policy(self):
+        group = self.root / "plans/.fix-runs"
+        old, new = group / "old", group / "new"
+        old.mkdir(parents=True)
+        (new / "inputs").mkdir(parents=True)
+        for run in (old, new):
+            (run / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": run.name,
+                                                       "workflow": "fix", "repos": ["api"]}))
+        prior = {**self.c, "run_id": "old", "budget_work_items": {"api": "work-1"}}
+        old_contract = old / "contract.json"
+        old_contract.write_text(json.dumps(prior))
+        state.validate_run(str(old_contract), "first", workflow)
+        draft = new / "inputs/replacement-contract.json"
+        draft.write_text(json.dumps({**prior, "run_id": "new"}))
+        private = self.repo / "private"
+        private.mkdir()
+        (private / "secret.txt").write_text("fixture")
+        bootstrap = ((str(self.repo), ("private",)),)
+        checked = workflow.replace_setup(str(old_contract), str(draft), "Correct scope", bootstrap_policy=bootstrap,
+                                         check=True)
+        self.assertEqual("ready", checked["status"])
+        with self.assertRaisesRegex(ValueError, "checked inputs changed"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct scope", bootstrap_policy=(),
+                                   expected_check=checked["check_sha256"])
+        workflow.replace_setup(str(old_contract), str(draft), "Correct scope", bootstrap_policy=bootstrap,
+                               expected_check=checked["check_sha256"])
+        published = new / "contract.json"
+        self.assertEqual(bootstrap, state.contract_read_policy(str(published)))
+        value = workflow.contract(str(published))
+        self.assertEqual(bootstrap, workflow.read_policy(value))
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            workflow.guarded_load(private / "secret.txt", value)
+
     def test_replace_setup_preserves_files_and_binds_successor(self):
         plans = self.root / "plans"
         old_run = plans / ".fix-runs" / "old"
@@ -55,6 +89,142 @@ class LifecycleTests(unittest.TestCase):
             workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope", bootstrap_policy=())
         self.assertFalse((old_run / "setup-replacement.json").exists())
         draft.write_text(json.dumps(new))
+        before_check = {p: p.read_bytes() for run in (old_run, new_run)
+                        for p in run.rglob("*") if p.is_file()}
+        checked = workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                         bootstrap_policy=(), check=True)
+        self.assertEqual("ready", checked["status"])
+        original_metadata = (old_run / "run.json").read_bytes()
+        validate_stores = workflow.validate_store_roots
+        def change_setup_during_check(value):
+            validate_stores(value)
+            (old_run / "run.json").write_bytes(original_metadata + b" ")
+        with patch.object(workflow, "validate_store_roots", side_effect=change_setup_during_check):
+            with self.assertRaisesRegex(ValueError, "Original setup changed during replacement check"):
+                workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                       bootstrap_policy=())
+        (old_run / "run.json").write_bytes(original_metadata)
+        original_draft = draft.read_bytes()
+        def change_draft_during_check(value):
+            validate_stores(value)
+            draft.write_bytes(original_draft + b" ")
+        with patch.object(workflow, "validate_store_roots", side_effect=change_draft_during_check):
+            with self.assertRaisesRegex(ValueError, "Successor setup changed during replacement check"):
+                workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                       bootstrap_policy=(), expected_check=checked["check_sha256"])
+        draft.write_bytes(original_draft)
+        self.assertFalse((old_run / "setup-replacement.json").exists())
+        self.assertEqual(before_check, {p: p.read_bytes() for run in (old_run, new_run)
+                                        for p in run.rglob("*") if p.is_file()})
+        policy = self.root / "read-policy.json"
+        policy.write_text("{}")
+        with self.assertRaisesRegex(ValueError, "read policy changed while acquiring locks"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                   bootstrap_policy=(), policy_path=policy, policy_sha256="0" * 64)
+        self.assertFalse((old_run / "setup-replacement.json").exists())
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "replace-setup", "--check",
+                                 "--contract", str(old_contract), "--successor-draft", str(draft),
+                                 "--reason", "Correct the approved scope", "--read-policy", str(policy),
+                                 "--bootstrap-read-policy", "{}"],
+                                capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("ready", json.loads(result.stdout)["status"])
+        old_work = old_run / "state-1.json"
+        new_work = new_run / "state-1.json"
+        old_work.write_text("{}")
+        new_work.write_text("{}")
+        draft.write_text(json.dumps({**new, "slice_schedules": []}))
+        blocked = workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                         bootstrap_policy=(), check=True)
+        self.assertEqual("blocked", blocked["status"])
+        self.assertTrue({"original_setup", "successor_setup", "slice_schedules"} <=
+                        {item.get("check") for item in blocked["blockers"]})
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "replace-setup", "--check",
+                                 "--contract", str(old_contract), "--successor-draft", str(draft),
+                                 "--reason", "Correct the approved scope", "--read-policy", "{}"],
+                                capture_output=True, text=True)
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertEqual({"original_setup", "successor_setup", "slice_schedules"},
+                         {item.get("check") for item in json.loads(result.stdout)["blockers"]})
+        old_work.unlink()
+        new_work.unlink()
+        draft.write_text(json.dumps(new))
+        private = self.repo / "private"
+        private.mkdir()
+        forbidden_policy = private / "policy.json"
+        forbidden_policy.write_text("not JSON")
+        bootstrap = json.dumps({"repo_paths": {"api": str(self.repo)}, "read_excludes": {"api": ["private"]}})
+        result = subprocess.run(["python3", "-I", "-B", str(SCRIPT), "replace-setup", "--check",
+                                 "--contract", str(old_contract), "--successor-draft", str(draft),
+                                 "--reason", "Correct the approved scope", "--read-policy", str(forbidden_policy),
+                                 "--bootstrap-read-policy", bootstrap], capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("read_excludes", result.stderr)
+        forbidden_policy.unlink()
+        private.rmdir()
+        draft.write_text(json.dumps({**new, "slice_schedules": []}))
+        with patch.object(workflow, "budget_continuity", side_effect=ValueError("broken predecessor history")):
+            diagnostic = workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                                bootstrap_policy=(), check=True)
+        self.assertEqual("blocked", diagnostic["status"])
+        self.assertTrue({"predecessor_discovery", "slice_schedules"} <=
+                        {item.get("check") for item in diagnostic["blockers"]})
+        draft.write_text(json.dumps(new))
+        excluded = plans / ".fix-runs" / "unreadable"
+        excluded.mkdir()
+        (excluded / "contract.json").write_text("{")
+        guarded_names = workflow.guarded_names
+        def refuse_excluded(directory, value, **kwargs):
+            self.assertNotEqual(excluded, Path(directory))
+            return guarded_names(directory, value, **kwargs)
+        with patch.object(workflow, "guarded_names", side_effect=refuse_excluded):
+            skipped = workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                             bootstrap_policy=(), check=True,
+                                             excluded_related_runs=["unreadable"])
+        self.assertEqual("blocked", skipped["status"])
+        self.assertTrue(any(item.get("check") == "related_runs" for item in skipped["blockers"]))
+        policy = ((str(plans / ".fix-runs"), ("unreadable",)),)
+        with self.assertRaisesRegex(ValueError, "read_excludes"):
+            state.guard_excluded_paths(excluded / "contract.json", policy, pinned=True)
+        draft.write_text(json.dumps({**new, "budget_continuity": [{"repo": "api",
+                         "source_contract_path": str(excluded / "contract.json") }]}))
+        with patch.object(workflow, "guarded_load", wraps=workflow.guarded_load) as loads:
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                       bootstrap_policy=(), check=True,
+                                       excluded_related_runs=["unreadable"])
+        self.assertNotIn(excluded / "contract.json", [Path(call.args[0]) for call in loads.call_args_list])
+        draft.write_text(json.dumps(new))
+        with self.assertRaisesRegex(ValueError, "requires check mode"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                   bootstrap_policy=(), excluded_related_runs=["unreadable"])
+        (excluded / "contract.json").unlink()
+        excluded.rmdir()
+        unrelated = plans / ".fix-runs" / "unrelated"
+        unrelated.mkdir()
+        unrelated_contract = unrelated / "contract.json"
+        unrelated_contract.write_text(json.dumps({**new, "run_id": "unrelated",
+                                                   "budget_work_items": {"api": "other"}}))
+        observed = workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                          bootstrap_policy=(), check=True)
+        self.assertEqual("ready", observed["status"])
+        unrelated_contract.write_text(unrelated_contract.read_text() + " ")
+        with self.assertRaisesRegex(ValueError, "checked inputs changed"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                   bootstrap_policy=(), expected_check=observed["check_sha256"])
+        unrelated_contract.unlink()
+        unrelated.rmdir()
+        with self.assertRaisesRegex(ValueError, "checked inputs changed"):
+            workflow.replace_setup(str(old_contract), str(draft), "A different reason", bootstrap_policy=(),
+                                   expected_check=checked["check_sha256"])
+        self.assertFalse((old_run / "setup-replacement.json").exists())
+        unexpected_contract = new_run / "contract.json"
+        unexpected_contract.write_text(json.dumps(new))
+        checked = workflow.replace_setup(str(old_contract), str(draft), "Correct the approved scope",
+                                         bootstrap_policy=(), check=True)
+        self.assertEqual("blocked", checked["status"])
+        self.assertTrue(any(item.get("check") == "publication" for item in checked["blockers"]))
+        unexpected_contract.unlink()
         publish = workflow.publish_once
         def interrupt_temporary(path, payload, value, **kwargs):
             if path == old_run / "setup-replacement.json":
@@ -307,9 +477,22 @@ class LifecycleTests(unittest.TestCase):
         self.c["budget_work_items"] = {"api": "work-1"}
         with self.assertRaisesRegex(ValueError, "open work phase"):
             workflow.reserve_predecessors(self.c, Path(self.contract), "a" * 64, self.c)
+        second_start = Path(source).parent / "telemetry/other-start.json"
+        workflow.phase_from_flags(source, str(second_start), phase_id="other", phase="review-fix",
+                                  event="phase-start", repo="api", at="2025-01-01T00:00:00Z")
+        malformed = Path(source).parent / "telemetry/bad-start.json"
+        malformed.write_text("{")
+        diagnostics = []
+        workflow.reserve_predecessors(self.c, Path(self.contract), "a" * 64, self.c,
+                                      diagnostics=diagnostics)
+        self.assertEqual({"repair", "other", "bad"}, {item["phase_id"] for item in diagnostics})
+        self.assertIn("start.repair_source", next(item for item in diagnostics
+                                                  if item["phase_id"] == "repair")["missing_bindings"])
+        malformed.unlink()
+        second_start.unlink()
         workflow.phase_from_flags(source, str(end), phase_id="repair", phase="review-fix", event="phase-end",
                                   repo="api", status="passed", at="2025-01-01T00:01:00Z")
-        with self.assertRaisesRegex(ValueError, "repair phase is missing"):
+        with self.assertRaisesRegex(ValueError, "repair phase repair is missing"):
             workflow.reserve_predecessors(self.c, Path(self.contract), "a" * 64, self.c)
         self.assertFalse((Path(source).parent / "api/successor-reservation.json").exists())
 
@@ -318,6 +501,246 @@ class LifecycleTests(unittest.TestCase):
 
     def test_replace_setup_refuses_second_unrecorded_successful_repair(self):
         self.replacement_after_gate_repairs(extra_success=True)
+
+    def test_replace_setup_recovers_legacy_repair_with_approved_observations(self):
+        self.legacy_replacement()
+
+    def test_replace_setup_refuses_reverted_write_outside_legacy_scope(self):
+        self.legacy_replacement(outside_scope=True)
+
+    def test_replace_setup_refuses_legacy_failed_launch_overlapping_work(self):
+        self.legacy_replacement(overlap=True)
+
+    def test_replace_setup_refuses_unapproved_legacy_author(self):
+        self.legacy_replacement(unauthorized=True)
+
+    def test_replace_setup_refuses_gaps_in_signed_legacy_observation(self):
+        self.legacy_replacement(coverage_gap=True)
+
+    def test_replace_setup_refuses_writer_after_legacy_submission(self):
+        self.legacy_replacement(settlement_writer=True)
+
+    def legacy_replacement(self, *, outside_scope=False, overlap=False, unauthorized=False, coverage_gap=False,
+                           settlement_writer=False):
+        if shutil.which("ssh-keygen") is None:
+            self.skipTest("legacy host provenance verification requires ssh-keygen")
+        key = self.root / "recorder-key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+        signers = self.root / "allowed-signers"
+        signers.write_text("host-recorder " + key.with_suffix(".pub").read_text())
+        group = self.root / "plans/.fix-runs"
+        self.new_budget_run("predecessor", run_group=group)
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.c["author_rotation"] = "capsule"
+        self.policy_reviewed()
+        predecessor = Path(self.contract)
+        previous_path, previous = workflow.history(self.run / "api")[-1][1:]
+        initial = state.load(previous["source_manifest"])
+        failure = self.evidence("gate.tests", status="failed")
+        missing_launch = ("launch", "failed", "not-started", None)
+        partial = ("partial", "failed", "unfinished", "actual-new-author")
+        continuation = ("resume", "blocked", "unfinished", "original-1")
+        final = ("submit", "passed", "submitted", "original-1")
+        (self.run / "telemetry").mkdir(exist_ok=True)
+        attempts = []
+        prior_boundaries = {}
+        last_end = previous["at"]
+        current_author = "original-1"
+        for identifier, status, outcome, author in (missing_launch, partial, continuation, final):
+            now = lambda: workflow.datetime.now(workflow.timezone.utc).isoformat()
+            start = self.run / "telemetry" / f"{identifier}-start.json"
+            end = self.run / "telemetry" / f"{identifier}-end.json"
+            common = {"schema_version": 2, "run_id": "predecessor", "workflow": "fix", "repo": "api",
+                      "phase_id": identifier, "phase": "gate-fix", "action": "gate-fix",
+                      "previous_state_path": str(previous_path), "previous_state_sha256": workflow.sha(previous_path),
+                      "attempt": 1, "agent_id": "original-1", "session_id": "host-session"}
+            start.write_text(json.dumps({**common, "event": "phase-start", "at": now(),
+                                         "prior_repair_boundaries": prior_boundaries.copy()}))
+            before_at = now()
+            before = state.capture(self.repo, previous["scope"], previous["excludes"])
+            handoff = {}
+            if author and author != current_author and not (unauthorized and identifier == "partial"):
+                handoff_manifest = self.save(f"observations/handoff-{identifier}.manifest.json", before)
+                capsule = self.save(f"observations/handoff-{identifier}.json", {
+                    "schema_version": 2, "run_id": "predecessor", "repo": "api", "written_by": current_author,
+                    "manifest_path": handoff_manifest, "source_fingerprint": before["fingerprint"]})
+                handoff = {"author_handoff": {"from_agent_id": current_author, "to_agent_id": author,
+                                              "capsule_path": capsule, "capsule_sha256": workflow.sha(capsule),
+                                              "manifest_sha256": workflow.sha(handoff_manifest)}}
+                current_author = author
+            writes = []
+            if identifier == "partial":
+                self.source.write_text("Gate repair made by the actual new author\n")
+                writes.append({"path": self.source.name, "before": before["files"][self.source.name],
+                               "after": state.file_state(self.source), "at": now(),
+                               "author": author, "dispatch_id": identifier})
+                if outside_scope:
+                    scratch = self.repo / "unowned.txt"
+                    scratch.write_text("temporary unowned change")
+                    state_written = state.file_state(scratch)
+                    scratch.unlink()
+                    writes.extend([{**writes[-1], "path": scratch.name, "at": now(),
+                                    "before": None, "after": state_written},
+                                   {**writes[-1], "path": scratch.name, "at": now(),
+                                    "before": state_written, "after": None}])
+            after = state.capture(self.repo, previous["scope"], previous["excludes"])
+            after_at = now()
+            end_at = now()
+            coverage_from = previous["at"] if identifier in ("launch", "partial") else last_end
+            if coverage_gap and identifier == "partial":
+                coverage_from = before_at
+            start_hash = workflow.sha(start)
+            journal = Path(self.save(f"observations/{identifier}.json", {
+                "kind": "ship-host-repair-observation-v1", "schema_version": 2, "run_id": "predecessor",
+                "repo": "api", "phase_id": identifier, "phase_status": status, "start_sha256": start_hash,
+                "recorder": "host-recorder",
+                "previous_state_sha256": workflow.sha(previous_path), "actual_author": author, "dispatch_id": identifier,
+                "session_id": "host-session", "repair_id": "failed-launch" if identifier == "launch" else "repair-1",
+                "resumes_dispatch_id": attempts[-1]["phase_id"] if len(attempts) > 1 else None,
+                "outcome": outcome, "before": before, "after": after, "writes": writes,
+                "before_at": before_at, "after_at": after_at, "complete_write_coverage": True,
+                "coverage_from": coverage_from, "coverage_through": end_at, **handoff}))
+            subprocess.run(["ssh-keygen", "-Y", "sign", "-f", str(key), "-n", "ship-workflow-legacy-repair",
+                            str(journal)], capture_output=True, check=True)
+            signature = journal.with_suffix(".json.sig")
+            end.write_text(json.dumps({**common, "event": "phase-end", "at": end_at, "status": status,
+                                       "end_reason": "api-error" if status == "failed" else "done",
+                                       "checkpoint_path": str(journal), "checkpoint_sha256": workflow.sha(journal),
+                                       "start_sha256": start_hash}))
+            attempts.append({"phase_id": identifier, "start_sha256": start_hash,
+                             "end_sha256": workflow.sha(end),
+                             "host_observation": {"path": str(journal), "sha256": workflow.sha(journal),
+                                                  "signature_path": str(signature),
+                                                  "signature_sha256": workflow.sha(signature)}})
+            prior_boundaries.update({str(start): start_hash, str(end): workflow.sha(end)})
+            last_end = end_at
+            if outcome == "not-started":
+                self.assertEqual(initial, before)
+                self.assertEqual(before, after)
+                if overlap:
+                    overlapping_start, overlapping_end = (self.run / "telemetry" / f"other-{part}.json"
+                                                           for part in ("start", "end"))
+                    work_identity = {"schema_version": 2, "run_id": "predecessor", "workflow": "fix",
+                                     "repo": "api", "phase": "implement", "phase_id": "other"}
+                    overlapping_start.write_text(json.dumps({**work_identity, "event": "phase-start",
+                                                             "at": before_at}))
+                    overlapping_end.write_text(json.dumps({**work_identity, "event": "phase-end", "at": after_at,
+                                                           "status": "failed",
+                                                           "start_sha256": workflow.sha(overlapping_start)}))
+            elif identifier == "resume":
+                self.assertEqual(before, after)
+        if settlement_writer:
+            common = {"schema_version": 2, "run_id": "predecessor", "workflow": "fix",
+                      "repo": "api", "phase": "implement", "phase_id": "late-writer"}
+            late_start = self.run / "telemetry/late-writer-start.json"
+            late_end = self.run / "telemetry/late-writer-end.json"
+            late_start.write_text(json.dumps({**common, "event": "phase-start", "at": now()}))
+            late_end.write_text(json.dumps({**common, "event": "phase-end", "at": now(),
+                                           "status": "failed", "start_sha256": workflow.sha(late_start)}))
+        self.move("edited-unverified", action="gate-fix", repair_phase_id="submit",
+                  gate_failure_path=failure)
+        accounted_path, accounted = workflow.history(self.run / "api")[-1][1:]
+        settlement = Path(self.save("observations/settlement.json", {
+            "kind": "ship-host-repair-settlement-v1", "schema_version": 2, "run_id": "predecessor",
+            "repo": "api", "repair_id": "repair-1", "dispatch_id": "submit", "phase_id": "submit",
+            "recorder": "host-recorder", "end_sha256": attempts[-1]["end_sha256"],
+            "state_sha256": workflow.sha(accounted_path), "source_fingerprint": accounted["source_fingerprint"],
+            "coverage_from": last_end, "coverage_through": accounted["at"], "complete_write_coverage": True,
+            "writes": []}))
+        subprocess.run(["ssh-keygen", "-Y", "sign", "-f", str(key), "-n", "ship-workflow-legacy-repair",
+                        str(settlement)], capture_output=True, check=True)
+        settlement_signature = settlement.with_suffix(".json.sig")
+        self.move("blocked", reason="Repair needs fresh verification")
+        latest_path = workflow.history(self.run / "api")[-1][1]
+
+        def reference(path):
+            return {"path": str(path), "sha256": workflow.sha(path)}
+
+        def approval(path):
+            return {**reference(path), "allowed_signers": reference(signers)}
+
+        common = {"kind": "ship-legacy-repair-recovery-v1", "schema_version": 2,
+                  "run_id": "predecessor", "repo": "api", "action": "gate-fix",
+                  "contract_path": str(predecessor), "contract_sha256": workflow.sha(predecessor),
+                  "latest_state": reference(latest_path), "anchor": reference(previous_path)}
+        self.new_budget_run("setup", predecessor=str(predecessor), run_group=group)
+        setup = self.contract
+        self.save("run.json", {"schema_version": 2, "run_id": "setup", "workflow": "fix", "repos": ["api"]})
+        state.validate_run(setup, "setup", workflow)
+        self.new_budget_run("successor", predecessor=str(predecessor), run_group=group)
+        self.save("run.json", {"schema_version": 2, "run_id": "successor", "workflow": "fix", "repos": ["api"]})
+        draft = self.save("inputs/replacement-contract.json", self.c)
+        Path(self.contract).unlink()
+        recovered = {**common, "repair_id": "repair-1", "accounted_state": reference(accounted_path),
+                     "attempts": attempts[1:], "settlement_observation": {
+                         **reference(settlement), "signature_path": str(settlement_signature),
+                         "signature_sha256": workflow.sha(settlement_signature)}}
+        no_launch = {**common, "repair_id": "failed-launch", "attempts": [attempts[0]]}
+        no_launch_path = Path(self.save("inputs/no-launch.json", no_launch))
+        recovery_path = Path(self.save("inputs/legacy-repair.json", recovered))
+        evidence = (approval(no_launch_path), approval(recovery_path))
+        reservation = predecessor.parent / "api/successor-reservation.json"
+
+        def check(approvals=evidence):
+            return workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=(), check=True,
+                                          legacy_recovery=approvals)
+
+        if outside_scope or overlap or unauthorized or coverage_gap or settlement_writer:
+            blocked = check()
+            self.assertEqual("blocked", blocked["status"])
+            expected = next(message for condition, message in (
+                (outside_scope, "observed write outside approved scope"),
+                (overlap, "overlaps legacy repair"),
+                (unauthorized, "lacks an authorized capsule handoff"),
+                (coverage_gap, "does not cover the entire repair phase"),
+                (settlement_writer, "late-writer overlaps legacy repair")) if condition)
+            self.assertTrue(any(expected in issue["message"] for issue in blocked["blockers"]), blocked)
+            self.assertFalse(reservation.exists())
+            return
+        blocked = check(())
+        self.assertEqual({"launch", "partial", "resume"},
+                         {issue["phase_id"] for issue in blocked["blockers"] if "phase_id" in issue})
+        fabricated = Path(self.save("inputs/fabricated.json", state.load(attempts[1]["host_observation"]["path"])))
+        fabricated_observation = {**attempts[1], "host_observation":
+                                  {**attempts[1]["host_observation"], **reference(fabricated)}}
+        wrong_signature = {**attempts[1], "host_observation": {
+            **attempts[1]["host_observation"],
+            **{field: attempts[-1]["host_observation"][field] for field in ("signature_path", "signature_sha256")}}}
+        for label, invalid in (
+            ("latest state", {**recovered, "latest_state": reference(previous_path)}),
+            ("end bytes", {**recovered, "attempts": [{**attempts[1], "end_sha256": "0" * 64}, *attempts[2:]]}),
+            ("invented observation", {**recovered, "attempts": [fabricated_observation, *attempts[2:]]}),
+            ("wrong host signature", {**recovered, "attempts": [wrong_signature, *attempts[2:]]}),
+            ("foreign observation", {**recovered, "attempts": [
+                {**attempts[1], "host_observation": attempts[2]["host_observation"]}, *attempts[2:]]}),
+            ("missing prior writes", {**recovered, "attempts": attempts[2:]}),
+            ("missing continuation", {**recovered, "attempts": [attempts[1], attempts[3]]}),
+            ("completed repair", {**recovered, "attempts": [attempts[3], *attempts[2:]]}),
+            ("no charged event", {**recovered, "accounted_state": None}),
+            ("no charged-state coverage", {**recovered, "settlement_observation": None}),
+        ):
+            recovery_path.write_text(json.dumps(invalid))
+            with self.subTest(case=label):
+                rejected = check((evidence[0], approval(recovery_path)))
+                self.assertEqual("blocked", rejected["status"])
+                self.assertIn("legacy_repair_recovery", {issue.get("check") for issue in rejected["blockers"]})
+                self.assertFalse(reservation.exists())
+        recovery_path.write_text(json.dumps(recovered) + "\n")
+        with self.assertRaisesRegex(ValueError, "evidence SHA-256 mismatch"):
+            workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=(), legacy_recovery=evidence)
+        evidence = (evidence[0], approval(recovery_path))
+        ready = check(evidence)
+        self.assertEqual("ready", ready["status"], ready)
+        self.assertEqual(1, ready["budgets"]["api"]["gate_fix_budget"]["historical_used_attempts"])
+        self.assertFalse(reservation.exists())
+        workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=(), legacy_recovery=evidence,
+                               expected_check=ready["check_sha256"])
+        self.assertEqual({entry["path"]: entry["sha256"] for entry in evidence},
+                         state.load(reservation)["legacy_repair_recovery"])
+        state.validate_run(self.contract, "successor", workflow)
+        recovery_path.write_text("{}")
+        with self.assertRaisesRegex(ValueError, "evidence SHA-256 mismatch"):
+            workflow.contract(self.contract)
 
     def replacement_after_gate_repairs(self, extra_success=False):
         group = self.root / "plans/.fix-runs"
@@ -360,10 +783,74 @@ class LifecycleTests(unittest.TestCase):
         draft = self.save("inputs/replacement-contract.json", self.c)
         Path(self.contract).unlink()
         if extra_success:
-            with self.assertRaisesRegex(ValueError, "repair phase is missing from lifecycle history"):
+            with self.assertRaisesRegex(ValueError, "repair phase extra-success is missing from lifecycle history"):
                 workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=())
             self.assertFalse((Path(predecessor).parent / "api/successor-reservation.json").exists())
             return
+        setup_work = Path(setup).parent / "state-99.json"
+        open_end = Path(predecessor).parent / "telemetry/gate-repair-1-end.json"
+        saved_end = open_end.read_bytes()
+        setup_work.write_text("{}")
+        open_end.unlink()
+        blocked = workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=(), check=True)
+        self.assertEqual("blocked", blocked["status"])
+        self.assertIn("original_setup", {item.get("check") for item in blocked["blockers"]})
+        self.assertIn("gate-repair-1", {item.get("phase_id") for item in blocked["blockers"]})
+        self.assertIn("publication and reservations", blocked["unverified"])
+        setup_work.unlink()
+        open_end.write_bytes(saved_end)
+        with patch.object(workflow, "validate_history", wraps=workflow.validate_history) as audits:
+            checked = workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=(), check=True)
+        predecessor_audits = [call for call in audits.call_args_list
+                              if Path(call.args[0]).resolve() == Path(predecessor).resolve()]
+        self.assertLessEqual(len(predecessor_audits), 2)
+        self.assertEqual("ready", checked["status"])
+        self.assertEqual(1, checked["budgets"]["api"]["gate_fix_budget"]["historical_used_attempts"])
+        sealed = next(Path(path) for path in previous["artifact_hashes"] if path.endswith(".log"))
+        original_sealed = sealed.read_bytes()
+        validate_stores = workflow.validate_store_roots
+        def mutate_seal_after_audit(value):
+            validate_stores(value)
+            sealed.write_bytes(original_sealed + b" changed")
+        with patch.object(workflow, "validate_store_roots", side_effect=mutate_seal_after_audit):
+            with self.assertRaisesRegex(ValueError, "Immutable artifact changed"):
+                workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=())
+        sealed.write_bytes(original_sealed)
+        reservation = Path(predecessor).parent / "api/successor-reservation.json"
+        captured = {}
+        publish = workflow.publish_once
+        def capture_reservation(path, payload, value, **kwargs):
+            if path.resolve() == reservation.resolve():
+                captured["payload"] = payload
+                raise OSError("stop before reservation")
+            publish(path, payload, value, **kwargs)
+        with patch.object(workflow, "publish_once", side_effect=capture_reservation):
+            with self.assertRaisesRegex(OSError, "stop before reservation"):
+                workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=(),
+                                       expected_check=checked["check_sha256"])
+        journal = Path(draft).parent / "setup-replacement-transaction.json"
+        journal.unlink()
+        reservation.write_bytes(captured["payload"])
+        with self.assertRaisesRegex(ValueError, "checked inputs changed"):
+            workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=(),
+                                   expected_check=checked["check_sha256"])
+        self.assertFalse(journal.exists())
+        reservation.unlink()
+        boundary = Path(predecessor).parent / "telemetry/gate-repair-1-end.json"
+        boundary_bytes = boundary.read_bytes()
+        read_bytes = workflow.guarded_bytes
+        changed = False
+        def change_boundary_after_read(path, value):
+            nonlocal changed
+            data = read_bytes(path, value)
+            if Path(path).resolve() == boundary.resolve() and not changed:
+                changed = True
+                boundary.write_bytes(data + b" ")
+            return data
+        with patch.object(workflow, "guarded_bytes", side_effect=change_boundary_after_read):
+            with self.assertRaisesRegex(ValueError, "telemetry changed while reading"):
+                workflow.replace_setup(setup, draft, "Continue fixture", bootstrap_policy=())
+        boundary.write_bytes(boundary_bytes)
         original = {path: path.read_bytes() for path in Path(predecessor).parent.rglob("*") if path.is_file()}
         start_path = Path(predecessor).parent / "telemetry/gate-repair-1-start.json"
         end_path = Path(predecessor).parent / "telemetry/gate-repair-1-end.json"
@@ -739,6 +1226,221 @@ class LifecycleTests(unittest.TestCase):
         after = workflow.audit_slice_history(source, "api", "s1")
         self.assertEqual(before["state_sha256"], after["state_sha256"])
         self.assertNotEqual(before["history_sha256"], after["history_sha256"])
+
+    def test_successor_review_base_binds_history_and_first_touch(self):
+        self.ready()
+        self.implement()
+        audit = workflow.validate_history(self.contract, "api")
+        latest = state.load(audit["state_path"])
+        value = copy.deepcopy(self.c)
+        value["budget_continuity"] = [{"repo": "api", "source_contract_path": self.contract,
+                                      "source_state_sha256": audit["state_sha256"],
+                                      "source_history_sha256": audit["history_sha256"]}]
+        value["original_review_base"] = {"repo": "api", "initial_manifest": latest["initial_manifest"],
+                                         "first_touch_baseline": str(self.base)}
+        seals = workflow.successor_review_base(value, "api", self.contract, ["source.txt"], str(self.base))
+        self.assertIn(audit["state_path"], seals)
+        with self.assertRaisesRegex(ValueError, "Review omits predecessor changes"):
+            workflow.successor_review_base(value, "api", self.contract, [], str(self.base))
+        value["original_review_base"]["initial_manifest"] = latest["source_manifest"]
+        with self.assertRaisesRegex(ValueError, "initial manifest differs"):
+            workflow.successor_review_base(value, "api", self.contract, ["source.txt"], str(self.base))
+        value["original_review_base"]["initial_manifest"] = latest["initial_manifest"]
+        (self.base / "source.txt").write_text("substituted")
+        with self.assertRaisesRegex(ValueError, "first-touch record differs"):
+            workflow.successor_review_base(value, "api", self.contract, ["source.txt"], str(self.base))
+
+    def test_successor_review_transition_uses_predecessor_base(self):
+        self.ready()
+        self.implement()
+        predecessor = self.contract
+        audit = workflow.validate_history(predecessor, "api")
+        latest = state.load(audit["state_path"])
+        old_baseline = self.base
+        self.new_budget_run("successor", predecessor=predecessor)
+        self.c["from_review"] = True
+        self.c["original_review_base"] = {"repo": "api", "initial_manifest": latest["initial_manifest"],
+                                         "first_touch_baseline": str(old_baseline)}
+        self.save("contract.json", self.c)
+        workflow.contract(self.contract)
+        self.c["original_review_base"]["initial_manifest"] = latest["source_manifest"]
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "initial manifest differs"):
+            workflow.contract(self.contract)
+        self.c["original_review_base"]["initial_manifest"] = latest["initial_manifest"]
+        self.save("contract.json", self.c)
+        self.base = old_baseline
+        self.ready()
+        matrix = self.save("successor-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "source.txt", "assertion": "expected output",
+            "status": "unverified", "reason": "independent assessment pending", "evidence_paths": []}]))
+        self.move("pre-review-passed", matrix_path=matrix, pre_review_evidence_paths=[self.evidence("early.tests")])
+        review_path = self.review()
+        with self.assertRaisesRegex(ValueError, "Successor review packet needs an absolute path"):
+            self.move("reviewed", review_path=review_path)
+        packet = self.run / "review-packet"
+        workflow.packet(self.contract, "api", self.scope, str(old_baseline), str(packet))
+        review = state.load(review_path)
+        review["packet_path"] = str(packet / "index.json")
+        review["packet_sha256"] = workflow.sha(review["packet_path"])
+        Path(review_path).write_text(json.dumps(review))
+        delta_path = packet / "delta.json"
+        saved_delta = delta_path.read_bytes()
+        delta_path.write_text(json.dumps({"repo_path": str(self.repo), "diff_base": "baseline", "changes": []}))
+        with self.assertRaisesRegex(ValueError, "Immutable artifact changed"):
+            self.move("reviewed", review_path=review_path)
+        delta_path.write_bytes(saved_delta)
+        index_path = packet / "index.json"
+        saved_index = index_path.read_bytes()
+        delta = state.load(delta_path)
+        delta["changes"] = []
+        delta_path.write_text(json.dumps(delta))
+        index = state.load(index_path)
+        index["artifact_hashes"][str(delta_path)] = workflow.sha(delta_path)
+        index_path.write_text(json.dumps(index))
+        review["packet_sha256"] = workflow.sha(index_path)
+        Path(review_path).write_text(json.dumps(review))
+        with self.assertRaisesRegex(ValueError, "packet delta differs"):
+            self.move("reviewed", review_path=review_path)
+        delta_path.write_bytes(saved_delta)
+        index_path.write_bytes(saved_index)
+        review["packet_sha256"] = workflow.sha(index_path)
+        Path(review_path).write_text(json.dumps(review))
+        reviewed = self.move("reviewed", review_path=review_path)
+        self.assertEqual(workflow.sha(predecessor), reviewed["artifact_hashes"][predecessor])
+        self.assertEqual(workflow.sha(audit["state_path"]), reviewed["artifact_hashes"][audit["state_path"]])
+        delta = state.load(packet / "delta.json")
+        self.assertEqual(["source.txt"], [entry["path"] for entry in delta["changes"]])
+        self.assertEqual(state.file_state(self.source), delta["changes"][0]["after"])
+
+    def test_successor_review_base_rejects_unrecorded_blocked_edit(self):
+        self.ready()
+        self.implement()
+        self.source.write_text("unrecorded edit\n")
+        self.move("blocked", reason="Interrupted before repair was recorded")
+        audit = workflow.validate_history(self.contract, "api")
+        latest = state.load(audit["state_path"])
+        value = copy.deepcopy(self.c)
+        value["budget_continuity"] = [{"repo": "api", "source_contract_path": self.contract,
+                                      "source_state_sha256": audit["state_sha256"],
+                                      "source_history_sha256": audit["history_sha256"]}]
+        value["original_review_base"] = {"repo": "api", "initial_manifest": latest["initial_manifest"],
+                                         "first_touch_baseline": str(self.base)}
+        with self.assertRaisesRegex(ValueError, "unrecorded changes after the last repair"):
+            workflow.successor_review_base(value, "api", self.contract, ["source.txt"], str(self.base))
+
+    def test_successor_review_base_rejects_unrecorded_reversion(self):
+        self.ready()
+        self.implement()
+        self.source.write_text("before\n")
+        self.move("blocked", reason="Source was reverted without recording a repair")
+        audit = workflow.validate_history(self.contract, "api")
+        latest = state.load(audit["state_path"])
+        value = copy.deepcopy(self.c)
+        value["budget_continuity"] = [{"repo": "api", "source_contract_path": self.contract,
+                                      "source_state_sha256": audit["state_sha256"],
+                                      "source_history_sha256": audit["history_sha256"]}]
+        value["original_review_base"] = {"repo": "api", "initial_manifest": latest["initial_manifest"],
+                                         "first_touch_baseline": str(self.base)}
+        with self.assertRaisesRegex(ValueError, "unrecorded changes after the last repair"):
+            workflow.successor_review_base(value, "api", self.contract, ["source.txt"], str(self.base))
+
+    def test_successor_implementation_keeps_old_base_after_new_edit(self):
+        self.ready()
+        self.implement()
+        predecessor = self.contract
+        latest = state.load(workflow.validate_history(predecessor, "api")["state_path"])
+        old_baseline = self.base
+        self.new_budget_run("successor", predecessor=predecessor)
+        self.c["original_review_base"] = {"repo": "api", "initial_manifest": latest["initial_manifest"],
+                                         "first_touch_baseline": str(old_baseline)}
+        self.save("contract.json", self.c)
+        self.base = old_baseline
+        self.ready()
+        self.source.write_text("edited again by successor\n")
+        matrix = self.save("successor-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "source.txt", "assertion": "expected output",
+            "status": "unverified", "reason": "independent assessment pending", "evidence_paths": []}]))
+        event = self.move("implemented", matrix_path=matrix)
+        self.assertEqual(str(old_baseline), event["baseline_dir"])
+        self.assertNotEqual(event["initial_manifest"], latest["initial_manifest"])
+
+    def test_successor_initialization_refuses_unattributed_edit_in_old_scope(self):
+        self.ready()
+        self.implement()
+        predecessor = self.contract
+        latest = state.load(workflow.validate_history(predecessor, "api")["state_path"])
+        old_baseline = self.base
+        self.source.write_text("someone else's work\n")
+        self.new_budget_run("successor", predecessor=predecessor)
+        self.c["original_review_base"] = {"repo": "api", "initial_manifest": latest["initial_manifest"],
+                                         "first_touch_baseline": str(old_baseline)}
+        self.save("contract.json", self.c)
+        self.base = old_baseline
+        with self.assertRaisesRegex(ValueError, "startup differs from predecessor on scoped paths"):
+            self.move("initialized")
+        self.assertFalse((self.run / "api/state-1.json").exists())
+
+    def test_slice_history_checks_repeated_seals_once_and_rechecks_freshness(self):
+        prior = self.root / "prior-slice"
+        directory = prior / "api/slices/s1"
+        directory.mkdir(parents=True)
+        source = prior / "contract.json"
+        source.write_text(json.dumps({"schema_version": 2, "workflow": "fix", "run_id": prior.name,
+                                      "repos": ["api"], "repo_paths": {"api": str(self.repo)}}))
+        proof = prior / "proof.txt"
+        proof.write_text("proof")
+        base = {"schema_version": 2, "run_id": prior.name, "repo": "api", "slice_id": "s1",
+                "review_fix_count": 0, "artifact_hashes": {str(source): workflow.sha(source),
+                                                            str(proof): workflow.sha(proof)}}
+        statuses = ["implemented", "pre-review-passed", "reviewed", "accepted"]
+        statuses += ["edited-unverified", "pre-review-passed", "reviewed", "accepted"] * 9
+        for index, status in enumerate(statuses, 1):
+            (directory / f"state-{index}.json").write_text(json.dumps({**base, "status": status}))
+        original_sha = workflow.guarded_sha
+        proof_reads = []
+        def count_sha(path, value):
+            if Path(path) == proof:
+                proof_reads.append(path)
+            return original_sha(path, value)
+        with patch.object(workflow, "guarded_sha", side_effect=count_sha):
+            workflow.audit_slice_history(source, "api", "s1")
+        self.assertEqual(2, len(proof_reads))
+        conflicting = directory / "state-2.json"
+        saved = conflicting.read_text()
+        event = json.loads(saved)
+        event["artifact_hashes"][str(proof)] = "0" * 64
+        conflicting.write_text(json.dumps(event))
+        with self.assertRaisesRegex(ValueError, "Conflicting immutable artifact seals"):
+            workflow.audit_slice_history(source, "api", "s1")
+        conflicting.write_text(saved)
+        proof_reads.clear()
+        def change_after_first_observation(path, value):
+            digest = count_sha(path, value)
+            if Path(path) == proof and len(proof_reads) == 1:
+                proof.write_text("changed")
+            return digest
+        with patch.object(workflow, "guarded_sha", side_effect=change_after_first_observation):
+            with self.assertRaisesRegex(ValueError, "Immutable artifact changed"):
+                workflow.audit_slice_history(source, "api", "s1")
+
+    def test_repo_history_rechecks_cached_seals_before_returning(self):
+        self.ready()
+        self.implement()
+        event = workflow.history(self.run / "api")[-1][2]
+        proof = next(Path(path) for path in event["artifact_hashes"] if path.endswith(".log"))
+        original = workflow.guarded_sha
+        observations = []
+        def change_after_first_read(path, value):
+            digest = original(path, value)
+            if Path(path) == proof:
+                observations.append(path)
+                if len(observations) == 1:
+                    proof.write_text("changed during audit")
+            return digest
+        with patch.object(workflow, "guarded_sha", side_effect=change_after_first_read):
+            with self.assertRaisesRegex(ValueError, "Immutable artifact changed"):
+                workflow.validate_history(self.contract, "api")
 
     def test_budget_continuity_preserves_human_decision_and_rejects_changed_source(self):
         prior = self.root / "prior-run"
@@ -3437,6 +4139,280 @@ class SliceLifecycleTests(unittest.TestCase):
     def test_replacement_carries_slice_started_before_repo_state(self):
         self.replacement_with_partial_slice_repairs()
 
+    def test_slice_only_replacement_reaches_completion_with_fresh_review(self):
+        self.replacement_with_partial_slice_repairs(finish_slice_only=True)
+
+    def test_slice_only_replacement_rejects_wip_between_generations(self):
+        self.replacement_with_partial_slice_repairs(intervening_wip=True)
+
+    def test_slice_only_review_base_rejects_unrecorded_blocked_edit(self):
+        self.assert_slice_only_blocked_source_is_rejected("foreign WIP\n")
+
+    def test_slice_only_review_base_rejects_unrecorded_reversion(self):
+        self.assert_slice_only_blocked_source_is_rejected("a0\n")
+
+    def test_slice_only_review_base_requires_historical_schedule_approval(self):
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.save("contract.json", self.c)
+        self.accept("a", "a.txt")
+        latest = workflow.history(self.run / "api/slices/a")[-1][1]
+        item = {"repo": "api", "slice_id": "a", "source_slice_id": "a", "source_contract_path": self.contract,
+                "source_state_sha256": workflow.sha(latest), "source_history_sha256": "history"}
+        audit = {"state_sha256": item["source_state_sha256"], "state_path": str(latest), "history_sha256": "history"}
+        successor = self.run.parent / "approval-successor"
+        successor.mkdir()
+        value = {**self.c, "run_id": successor.name, "budget_continuity": [item],
+                 "original_review_base": {"repo": "api", "initial_manifest": self.bases["a"],
+                                          "first_touch_baseline": str(self.base)}}
+        original = state.load(self.schedule)
+        for field, bad in (("approved_by", ""), ("approved_at", "invalid"), ("schema_version", 99)):
+            with self.subTest(field=field):
+                self.save("slices-approved.json", {**original, field: bad})
+                self.c["slice_schedules"]["api"]["sha256"] = workflow.sha(self.schedule)
+                self.save("contract.json", self.c)
+                with patch.object(workflow, "budget_continuity"), \
+                        patch.object(workflow, "audit_slice_history", return_value=audit):
+                    with self.assertRaises((ValueError, TypeError)):
+                        workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt"],
+                                                       str(self.base))
+
+    def assert_slice_only_blocked_source_is_rejected(self, content):
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.save("contract.json", self.c)
+        self.accept("a", "a.txt")
+        (self.repo / "a.txt").write_text(content)
+        self.move_slice("a", "blocked", ["a.txt"], reason="Source changed outside a recorded repair")
+        audit = workflow.audit_slice_history(self.contract, "api", "a", strict=True)
+        decision = self.save("slice-only-decision.json", {"decision": "continue"})
+        item = {"repo": "api", "slice_id": "a", "source_slice_id": "a", "work_item": "work-1",
+                "approved_by": "user", "user_authorization": "continue", "reason": "same work",
+                "approved_at": "2026-01-01T00:00:00Z", "used_passes": audit["review_fix_count"],
+                "effective_limit": audit["review_fix_limit"], "source_contract_path": self.contract,
+                "source_contract_sha256": workflow.sha(self.contract), "source_state_path": audit["state_path"],
+                "source_state_sha256": audit["state_sha256"], "source_history_sha256": audit["history_sha256"],
+                "decision_path": decision, "decision_sha256": workflow.sha(decision)}
+        successor = self.run.parent / "successor"
+        successor.mkdir()
+        value = {**self.c, "run_id": successor.name, "budget_continuity": [item],
+                 "original_review_base": {"repo": "api", "initial_manifest": self.bases["a"],
+                                          "first_touch_baseline": str(self.base)}}
+        with self.assertRaisesRegex(ValueError, "Slice-only predecessor has unrecorded changes: a"):
+            workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt"], str(self.base))
+
+    def test_slice_only_review_base_inherits_intermediate_read_excludes(self):
+        private = self.repo / "private"
+        private.mkdir()
+        forbidden = private / "contract.json"
+        forbidden.write_text("must not be read")
+        self.c["read_excludes"] = {"api": ["private"]}
+        self.c["budget_continuity"] = [{"repo": "api", "slice_id": "a", "source_slice_id": "a",
+                                        "source_contract_path": str(forbidden)}]
+        self.save("contract.json", self.c)
+        source_manifest = self.cap(["a.txt"], "slice-only-manifest.json")
+        state_dir = self.run / "api/slices/a"
+        state_dir.mkdir(parents=True)
+        event_path = state_dir / "state-1.json"
+        event_path.write_text(json.dumps({"status": "implemented", "at": datetime.now(timezone.utc).isoformat(),
+                                          "base_manifest": self.bases["a"], "source_manifest": source_manifest,
+                                          "source_fingerprint": state.load(source_manifest)["fingerprint"],
+                                          "schedule_sha256": self.c["slice_schedules"]["api"]["sha256"],
+                                          "artifact_hashes": workflow.seal_files([self.bases["a"], source_manifest]),
+                                          "touched": ["a.txt"]}))
+        successor = self.run.parent / "next"
+        successor.mkdir()
+        item = {"repo": "api", "slice_id": "a", "source_slice_id": "a", "source_contract_path": self.contract,
+                "source_state_sha256": workflow.sha(event_path), "source_history_sha256": "history"}
+        value = {**self.c, "run_id": successor.name, "budget_continuity": [item],
+                 "read_excludes": {}, "original_review_base": {"repo": "api", "initial_manifest": self.bases["a"],
+                                                               "first_touch_baseline": str(self.base)}}
+        audit = {"state_sha256": item["source_state_sha256"], "state_path": str(event_path),
+                 "history_sha256": "history"}
+        with patch.object(workflow, "budget_continuity"), patch.object(workflow, "audit_slice_history", return_value=audit), \
+                patch.object(workflow, "guarded_load", wraps=workflow.guarded_load) as loads:
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt"], str(self.base))
+        self.assertNotIn(forbidden, [Path(call.args[0]) for call in loads.call_args_list])
+
+    def test_slice_only_review_base_inherits_excludes_across_slice_branches(self):
+        private = self.repo / "private"
+        private.mkdir()
+        forbidden = private / "contract.json"
+        forbidden.write_text("must not be read")
+        self.c["read_excludes"] = {"api": ["private"]}
+        self.save("contract.json", self.c)
+        source_manifest = self.cap(["a.txt"], "branch-a-source.json")
+        directory = self.run / "api/slices/a"
+        directory.mkdir(parents=True)
+        event_path = directory / "state-1.json"
+        event_path.write_text(json.dumps({"status": "implemented", "at": datetime.now(timezone.utc).isoformat(),
+            "base_manifest": self.bases["a"], "source_manifest": source_manifest,
+            "source_fingerprint": state.load(source_manifest)["fingerprint"],
+            "schedule_sha256": self.c["slice_schedules"]["api"]["sha256"],
+            "artifact_hashes": workflow.seal_files([self.bases["a"], source_manifest]), "touched": ["a.txt"]}))
+        first = {"repo": "api", "slice_id": "a", "source_slice_id": "a", "source_contract_path": self.contract,
+                 "source_state_sha256": workflow.sha(event_path), "source_history_sha256": "history"}
+        second = {"repo": "api", "slice_id": "b", "source_slice_id": "b", "source_contract_path": str(forbidden)}
+        successor = self.run.parent / "branch-successor"
+        successor.mkdir()
+        value = {**self.c, "run_id": successor.name, "budget_continuity": [first, second], "read_excludes": {},
+                 "inherited_read_policy": {"repo_paths": {"api": str(self.repo)},
+                                           "read_excludes": {"api": ["private"]}},
+                 "original_review_base": {"repo": "api", "initial_manifest": self.bases["a"],
+                                          "first_touch_baseline": str(self.base)}}
+        audit = {"state_sha256": first["source_state_sha256"], "state_path": str(event_path),
+                 "history_sha256": "history"}
+        incomplete = copy.deepcopy(value)
+        incomplete["inherited_read_policy"] = {"repo_paths": {}, "read_excludes": {}}
+        with patch.object(workflow, "budget_continuity"), patch.object(workflow, "audit_slice_history", return_value=audit), \
+                patch.object(workflow, "guarded_load", wraps=workflow.guarded_load) as loads:
+            with self.assertRaisesRegex(ValueError, "Inherited read policy omits a predecessor exclusion"):
+                workflow.slice_only_review_base(incomplete, "api", successor / "contract.json", ["a.txt"],
+                                                str(self.base))
+        self.assertNotIn(forbidden, [Path(call.args[0]) for call in loads.call_args_list])
+        with patch.object(workflow, "budget_continuity"), patch.object(workflow, "audit_slice_history", return_value=audit), \
+                patch.object(workflow, "guarded_load", wraps=workflow.guarded_load) as loads:
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt"], str(self.base))
+        self.assertNotIn(forbidden, [Path(call.args[0]) for call in loads.call_args_list])
+        value["budget_continuity"] = [second, first]
+        with patch.object(workflow, "budget_continuity"), patch.object(workflow, "audit_slice_history", return_value=audit), \
+                patch.object(workflow, "guarded_load", wraps=workflow.guarded_load) as loads:
+            with self.assertRaisesRegex(ValueError, "read_excludes"):
+                workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt"], str(self.base))
+        self.assertNotIn(forbidden, [Path(call.args[0]) for call in loads.call_args_list])
+
+    def test_slice_only_review_base_rejects_different_first_touch_bases(self):
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.save("contract.json", self.c)
+        base_a = self.cap(["a.txt", "b.txt"], "earliest-a.json")
+        (self.repo / "a.txt").write_text("a already changed\n")
+        base_b = self.cap(["a.txt", "b.txt"], "later-b.json")
+        source_a = self.cap(["a.txt", "b.txt"], "slice-a-source.json")
+        (self.repo / "b.txt").write_text("b changed\n")
+        source_b = self.cap(["a.txt", "b.txt"], "slice-b-source.json")
+        items, audits = [], {}
+        for identifier, base, source, at in (("a", base_a, source_a, "2026-01-01T00:02:00+00:00"),
+                                              ("b", base_b, source_b, "2026-01-01T00:01:00+00:00")):
+            directory = self.run / "api/slices" / identifier
+            directory.mkdir(parents=True)
+            path = directory / "state-1.json"
+            path.write_text(json.dumps({"status": "implemented", "at": at, "base_manifest": base,
+                                        "source_manifest": source, "source_fingerprint": state.load(source)["fingerprint"],
+                                        "schedule_sha256": self.c["slice_schedules"]["api"]["sha256"],
+                                        "artifact_hashes": workflow.seal_files([base, source]),
+                                        "touched": [identifier + ".txt"]}))
+            item = {"repo": "api", "slice_id": identifier, "source_slice_id": identifier,
+                    "source_contract_path": self.contract, "source_state_sha256": workflow.sha(path),
+                    "source_history_sha256": "history-" + identifier}
+            items.append(item)
+            audits[identifier] = {"state_sha256": item["source_state_sha256"], "state_path": str(path),
+                                   "history_sha256": item["source_history_sha256"]}
+        successor = self.run.parent / "parallel-successor"
+        successor.mkdir()
+        value = {**self.c, "run_id": successor.name, "budget_continuity": items,
+                 "inherited_read_policy": {"repo_paths": {}, "read_excludes": {}},
+                 "original_review_base": {"repo": "api", "initial_manifest": base_b,
+                                          "first_touch_baseline": str(self.base)}}
+        def audit(_, __, identifier, **kwargs):
+            return audits[identifier]
+        with patch.object(workflow, "budget_continuity"), patch.object(workflow, "audit_slice_history", side_effect=audit):
+            with self.assertRaisesRegex(ValueError, "Slice-only bases disagree for path: a.txt"):
+                workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt", "b.txt"],
+                                                str(self.base))
+            event_path = self.run / "api/slices/a/state-1.json"
+            event = state.load(event_path)
+            event["artifact_hashes"].pop(source_a)
+            event_path.write_text(json.dumps(event))
+            items[0]["source_state_sha256"] = workflow.sha(event_path)
+            audits["a"]["state_sha256"] = items[0]["source_state_sha256"]
+            with self.assertRaisesRegex(ValueError, "source_manifest lacks a valid history seal"):
+                workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt", "b.txt"],
+                                                str(self.base))
+
+    def test_slice_only_review_base_rejects_intermediate_head_change(self):
+        parent = self.run.parent
+        paths, audits = {}, {}
+        previous = None
+        for index, (name, base_head, result_head) in enumerate((
+                ("one", "original", "temporary"), ("two", "temporary", "original"),
+                ("three", "original", "original")), 1):
+            root = parent / name
+            directory = root / "api/slices/a"
+            directory.mkdir(parents=True)
+            manifest_paths = []
+            for suffix, head in (("base", base_head), ("source", result_head)):
+                data = state.capture(self.repo, ["a.txt"])
+                data["head"] = head
+                data["fingerprint"] = state.digest({key: data[key] for key in ("repo_path", "head", "files")})
+                path = root / f"{suffix}.json"
+                path.write_text(json.dumps(data))
+                manifest_paths.append(path)
+            event_path = directory / "state-1.json"
+            schedule_path = root / "slices-approved.json"
+            schedule = state.load(self.schedule)
+            schedule["run_id"] = name
+            schedule_path.write_text(json.dumps(schedule))
+            event_path.write_text(json.dumps({"status": "implemented", "at": f"2026-01-01T00:0{index}:00+00:00",
+                                             "base_manifest": str(manifest_paths[0]),
+                                             "source_manifest": str(manifest_paths[1]),
+                                             "source_fingerprint": state.load(manifest_paths[1])["fingerprint"],
+                                             "schedule_sha256": workflow.sha(schedule_path),
+                                             "artifact_hashes": workflow.seal_files(manifest_paths),
+                                             "touched": ["a.txt"]}))
+            contract = root / "contract.json"
+            prior = [] if previous is None else [previous]
+            contract.write_text(json.dumps({"schema_version": 2, "run_id": name, "workflow": "fix", "repos": ["api"],
+                                            "repo_paths": {"api": str(self.repo)}, "budget_continuity": prior,
+                                            "slice_schedules": {"api": {"path": str(schedule_path),
+                                                                        "sha256": workflow.sha(schedule_path)}}}))
+            previous = {"repo": "api", "slice_id": "a", "source_slice_id": "a",
+                        "source_contract_path": str(contract), "source_state_sha256": workflow.sha(event_path),
+                        "source_history_sha256": "history-" + name}
+            audits[str(contract)] = {"state_sha256": previous["source_state_sha256"], "state_path": str(event_path),
+                                     "history_sha256": previous["source_history_sha256"]}
+            paths[name] = manifest_paths[0]
+        successor = parent / "next"
+        successor.mkdir()
+        value = {**self.c, "run_id": successor.name, "budget_continuity": [previous],
+                 "original_review_base": {"repo": "api", "initial_manifest": str(paths["one"]),
+                                          "first_touch_baseline": str(self.base)}}
+        def audit(path, _repo, _slice, **kwargs):
+            return audits[str(path)]
+        with patch.object(workflow, "budget_continuity"), patch.object(workflow, "audit_slice_history", side_effect=audit):
+            with self.assertRaisesRegex(ValueError, "HEAD changed during work"):
+                workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt"], str(self.base))
+
+    def test_slice_only_review_base_rejects_head_change_inside_history(self):
+        base = state.capture(self.repo, ["a.txt"])
+        base["head"] = "original"
+        base["fingerprint"] = state.digest({key: base[key] for key in ("repo_path", "head", "files")})
+        base_path = self.save("head-original.json", base)
+        changed = dict(base, head="temporary")
+        changed["fingerprint"] = state.digest({key: changed[key] for key in ("repo_path", "head", "files")})
+        changed_path = self.save("head-temporary.json", changed)
+        directory = self.run / "api/slices/a"
+        directory.mkdir(parents=True)
+        for index, (status, source) in enumerate((("implemented", base_path), ("pre-review-passed", changed_path),
+                                                   ("reviewed", base_path)), 1):
+            (directory / f"state-{index}.json").write_text(json.dumps({
+                "status": status, "at": f"2026-01-01T00:0{index}:00+00:00", "base_manifest": base_path,
+                "source_manifest": source, "source_fingerprint": state.load(source)["fingerprint"],
+                "schedule_sha256": self.c["slice_schedules"]["api"]["sha256"],
+                "artifact_hashes": workflow.seal_files([base_path, source]),
+                "touched": ["a.txt"]}))
+        latest = directory / "state-3.json"
+        item = {"repo": "api", "slice_id": "a", "source_slice_id": "a", "source_contract_path": self.contract,
+                "source_state_sha256": workflow.sha(latest), "source_history_sha256": "history"}
+        audit = {"state_sha256": item["source_state_sha256"], "state_path": str(latest), "history_sha256": "history"}
+        successor = self.run.parent / "head-successor"
+        successor.mkdir()
+        value = {**self.c, "run_id": successor.name, "budget_continuity": [item],
+                 "original_review_base": {"repo": "api", "initial_manifest": base_path,
+                                          "first_touch_baseline": str(self.base)}}
+        with patch.object(workflow, "budget_continuity"), patch.object(workflow, "audit_slice_history", return_value=audit):
+            with self.assertRaisesRegex(ValueError, "HEAD changed during work"):
+                workflow.slice_only_review_base(value, "api", successor / "contract.json", ["a.txt"], str(self.base))
+
     def test_replacement_refuses_uncaptured_glob_source(self):
         self.replacement_with_partial_slice_repairs(extra_unrecorded=True)
 
@@ -3450,7 +4426,8 @@ class SliceLifecycleTests(unittest.TestCase):
         self.replacement_with_partial_slice_repairs(partial_rotation=True)
 
     def replacement_with_partial_slice_repairs(self, extra_unrecorded=False, missing_evidence=False,
-                                              completed_repair=False, partial_rotation=False):
+                                              completed_repair=False, partial_rotation=False, intervening_wip=False,
+                                              finish_slice_only=False):
         schedule = state.load(self.schedule)
         schedule["slices"][0]["write_scope"] = ["a*"]
         self.save("slices-approved.json", schedule)
@@ -3459,6 +4436,11 @@ class SliceLifecycleTests(unittest.TestCase):
             self.c["author_rotation"] = "capsule"
         self.c["budget_work_items"] = {"api": "work-1"}
         self.save("contract.json", self.c)
+        if finish_slice_only:
+            for command in (["init", "-q"], ["add", "-A"],
+                            ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]):
+                subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
+            self.bases = {"a": self.cap(["a.txt"]), "b": self.cap(["b.txt"])}
         self.accept("a", "a.txt")
         touched = ["a.txt"]
         self.move_slice("a", "edited-unverified", touched, action="integration-fix", author_agent_id="author-a")
@@ -3484,10 +4466,11 @@ class SliceLifecycleTests(unittest.TestCase):
                 slice_id="a", written_by="author-a", source_fingerprint=previous["source_fingerprint"],
                 manifest_path=capsule_source))
             first_fields["capsule_path"] = capsule
-        with patch.object(workflow, "slice_capture_paths", side_effect=[["a.txt"], ["a.txt", "added.txt"]]):
-            with self.assertRaisesRegex(ValueError, "scope changed during capture"):
-                workflow.phase_from_flags(self.contract, str(self.run / f"telemetry/{first}-start.json"),
-                                          phase_id=first, event="phase-start", **first_fields)
+        if not finish_slice_only:
+            with patch.object(workflow, "slice_capture_paths", side_effect=[["a.txt"], ["a.txt", "added.txt"]]):
+                with self.assertRaisesRegex(ValueError, "scope changed during capture"):
+                    workflow.phase_from_flags(self.contract, str(self.run / f"telemetry/{first}-start.json"),
+                                              phase_id=first, event="phase-start", **first_fields)
         self.assertFalse((self.run / f"telemetry/{first}-start.json").exists())
         workflow.phase_from_flags(self.contract, str(self.run / f"telemetry/{first}-start.json"),
                                   phase_id=first, event="phase-start", **first_fields)
@@ -3583,9 +4566,13 @@ class SliceLifecycleTests(unittest.TestCase):
                 "decision_sha256": workflow.sha(decision)}
         new = {**old, "run_id": "successor", "budget_continuity": [item],
                "successor_scopes": [{"repo": "api", "slice_id": "a", "work_item": "work-1"}],
+               "original_review_base": {"repo": "api", "initial_manifest": self.bases["a"],
+                                        "first_touch_baseline": str(self.base)},
                "slice_schedules": {"api": {"path": str(schedule_path), "sha256": workflow.sha(schedule_path)}}}
         draft = successor / "inputs/replacement-contract.json"
-        draft.write_text(json.dumps({**new, "budget_continuity": [], "successor_scopes": []}))
+        missing_history = {**new, "budget_continuity": [], "successor_scopes": []}
+        missing_history.pop("original_review_base")
+        draft.write_text(json.dumps(missing_history))
         with self.assertRaisesRegex(ValueError, "missing from budget continuity"):
             workflow.replace_setup(str(old_contract), str(draft), "Correct the scope", bootstrap_policy=())
         self.assertFalse((setup / "setup-replacement.json").exists())
@@ -3640,6 +4627,27 @@ class SliceLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid author handoff"):
                 workflow.replace_setup(str(old_contract), str(draft), "Correct the scope", bootstrap_policy=())
             manifest_path.write_bytes(manifest_bytes)
+        without_base = dict(new)
+        without_base.pop("original_review_base")
+        draft.write_text(json.dumps(without_base))
+        with self.assertRaisesRegex(ValueError, "Slice-only predecessor .* requiring original_review_base"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the scope", bootstrap_policy=())
+        self.assertFalse((Path(actual).parent / "api/successor-reservation.json").exists())
+        altered = copy.deepcopy(new)
+        altered["original_review_base"]["initial_manifest"] = state.load(audited["state_path"])["source_manifest"]
+        draft.write_text(json.dumps(altered))
+        with self.assertRaisesRegex(ValueError, "earliest slice base"):
+            workflow.replace_setup(str(old_contract), str(draft), "Correct the scope", bootstrap_policy=())
+        draft.write_text(json.dumps(new))
+        with self.assertRaisesRegex(ValueError, "Review omits predecessor changes"):
+            workflow.slice_only_review_base(new, "api", successor / "contract.json", [], str(self.base))
+        actual_source = (self.repo / "a.txt").read_text()
+        (self.repo / "a.txt").write_text("unattributed WIP\n")
+        wip_start = state.capture(self.repo, ["a.txt"])
+        (self.repo / "a.txt").write_text(actual_source)
+        with self.assertRaisesRegex(ValueError, "Successor startup differs from slice history"):
+            workflow.slice_only_review_base(new, "api", successor / "contract.json", ["a.txt"], str(self.base),
+                                            startup=wip_start)
         workflow.replace_setup(str(old_contract), str(draft), "Correct the scope", bootstrap_policy=())
         value = workflow.contract(successor / "contract.json")
         self.assertEqual(item, workflow.budget_continuity(value, "api", successor / "contract.json", "a"))
@@ -3647,10 +4655,29 @@ class SliceLifecycleTests(unittest.TestCase):
         self.contract = str(successor / "contract.json")
         self.c = state.load(self.contract)
         self.schedule = str(schedule_path)
+        if finish_slice_only:
+            state.validate_run(self.contract, "slice-only-successor", workflow)
+            self.complete_slice_only_successor(new["original_review_base"]["first_touch_baseline"])
+            return
         self.base = successor / "api/baselines"
+        if intervening_wip:
+            (self.repo / "a.txt").write_text("unattributed change between generations\n")
         state.baseline(self.repo, self.base, "a.txt")
+        source_before_wip = (self.repo / "a.txt").read_text()
+        (self.repo / "a.txt").write_text("unattributed WIP between runs\n")
+        self.bases = {"a": self.cap(["a.txt"], "wip-base.json")}
+        (self.repo / "a.txt").write_text("a1\n")
+        with self.assertRaisesRegex(ValueError, "Successor startup differs from slice history"):
+            self.move_slice("a", "implemented", ["a.txt"], author_agent_id="author-a",
+                            matrix_path=self.slice_matrix("a"))
+        (self.repo / "a.txt").write_text(source_before_wip)
         self.bases = {"a": self.cap(["a.txt"], "next-base.json")}
-        self.accept("a", "a.txt")
+        if intervening_wip:
+            # Reproduce a predecessor written by a helper that did not check handoff provenance.
+            with patch.object(workflow, "slice_only_review_base", return_value=([], {"a.txt": "a"}, {"a.txt"})):
+                self.accept("a", "a.txt")
+        else:
+            self.accept("a", "a.txt")
         next_audit = workflow.audit_slice_history(self.contract, "api", "a", strict=True)
         next_run = group / "next"
         next_run.mkdir()
@@ -3667,6 +4694,10 @@ class SliceLifecycleTests(unittest.TestCase):
                          "slice_schedules": {"api": {"path": str(next_schedule_path), "sha256": workflow.sha(next_schedule_path)}}}
         next_path = next_run / "contract.json"
         next_path.write_text(json.dumps(next_contract))
+        if intervening_wip:
+            with self.assertRaisesRegex(ValueError, "Slice-only predecessor source differs at handoff"):
+                workflow.contract(next_path)
+            return
         workflow.contract(next_path)
         reservation = Path(actual).parent / "api/successor-reservation.json"
         reservation.unlink()
@@ -3674,6 +4705,57 @@ class SliceLifecycleTests(unittest.TestCase):
             workflow.audit_slice_history(self.contract, "api", "a", strict=True)
         with self.assertRaisesRegex(ValueError, "reservation is missing"):
             workflow.contract(next_path)
+
+    def complete_slice_only_successor(self, baseline):
+        self.base = Path(baseline)
+        self.repo_scope = self.save("slice-only-repo-scope.json", ["a.txt", "b.txt"])
+        (self.repo / "unrelated-wip.txt").write_text("untouched WIP\n")
+        self.initial_repo = self.cap(["a.txt", "b.txt"], "slice-only-start.json")
+        self.bases = {"a": self.cap(["a.txt"]), "b": self.cap(["b.txt"])}
+        def repo_move(status, **fields):
+            events = workflow.history(self.run / "api")
+            self.counter += 1
+            request = self.save(f"slice-only-request-{self.counter}.json", {
+                "status": status, "source_manifest": self.cap(state.scope_paths(self.repo_scope)),
+                "scope_path": self.repo_scope, "baseline_dir": str(self.base), **fields})
+            return workflow.transition(self.contract, "api", request,
+                                       str(self.run / "api" / f"state-{len(events) + 1}.json"))
+        repo_move("initialized")
+        preflight = self.save("slice-only-preflight.json", self.artifact(status="passed", evidence_paths=[
+            self.evidence("env.runtime", "static", source=self.initial_repo)]))
+        repo_move("ready", preflight_path=preflight)
+        self.accept("a", "a.txt")
+        self.bases["b"] = self.cap(["b.txt"])
+        self.accept("b", "b.txt")
+        gate = self.run / "slice-only-gate.json"
+        workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo,
+                            self.cap(state.scope_paths(self.repo_scope)), str(gate))
+        matrix = self.save("slice-only-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "both slices", "assertion": "pending",
+            "status": "unverified", "reason": "independent acceptance pending", "evidence_paths": []}]))
+        repo_move("implemented", matrix_path=matrix, slice_gate_path=str(gate),
+                  slice_authors={"a": "author-a", "b": "author-b"})
+        repo_move("pre-review-passed", matrix_path=matrix, pre_review_evidence_paths=[
+            self.evidence("early.tests", source=self.cap(state.scope_paths(self.repo_scope)))])
+        packet = self.run / "slice-only-review-packet"
+        workflow.packet(self.contract, "api", self.repo_scope, str(self.base), str(packet))
+        review_path = self.slice_review("a", state.scope_paths(self.repo_scope), 1)
+        review = state.load(review_path)
+        review["packet_path"] = str(packet / "index.json")
+        review["packet_sha256"] = workflow.sha(review["packet_path"])
+        Path(review_path).write_text(json.dumps(review))
+        repo_move("reviewed", review_path=review_path)
+        repo_move("gates-passed", gate_evidence_paths=[
+            self.evidence("gate.tests", source=self.cap(state.scope_paths(self.repo_scope)))])
+        assessment = self.save("slice-only-assessment.json", self.artifact(
+            producer="orchestrator", requirements_match=True, criteria=[{
+                "criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                "reason": "fixture checked", "evidence_paths": [
+                    self.evidence("fix.ac-1", source=self.cap(state.scope_paths(self.repo_scope)))]}]))
+        repo_move("verified", assessment_path=assessment)
+        workflow.complete(self.contract, str(self.run / "completion.json"))
+        self.assertEqual("completed", state.load(self.run / "completion.json")["status"])
+        self.assertEqual("untouched WIP\n", (self.repo / "unrelated-wip.txt").read_text())
 
     def reviewed_artifact(self, path, manifest_path):
         record = state.load(path)
@@ -4032,6 +5114,52 @@ class SliceLifecycleTests(unittest.TestCase):
         a_path = workflow.history(self.run / "api/slices/a")[-1][1]
         self.assertEqual(workflow.sha(a_path), accepted["predecessor_states"]["a"]["sha256"])
         self.assertEqual(old_b[2]["base_manifest"], accepted["base_manifest"])
+
+    def test_integration_phase_is_bound_to_one_uncharged_slice_event(self):
+        self.c["budget_work_items"] = {"api": "work-1"}
+        self.save("contract.json", self.c)
+        self.integration_fixture()
+        checkpoint = self.save("alignment/integration-a.json", self.integration_request("a"))
+        previous_path, previous = workflow.history(self.run / "api/slices/a")[-1][1:]
+        binding = {"phase_id": "integration-a", "phase": "review-fix", "repo": "api", "slice_id": "a",
+                   "action": "integration-fix", "agent_id": previous["author_agent_id"], "round": 1,
+                   "previous_state_path": str(previous_path), "previous_state_sha256": workflow.sha(previous_path),
+                   "checkpoint_path": checkpoint}
+        start_path = self.run / "telemetry/integration-a-start.json"
+        end_path = self.run / "telemetry/integration-a-end.json"
+        workflow.phase_from_record(self.contract, {**binding, "event": "phase-start",
+                                   "at": datetime.now(timezone.utc).isoformat()}, str(start_path))
+        (self.repo / "a.txt").write_text("a2\n")
+        workflow.phase_from_record(self.contract, {**binding, "event": "phase-end", "status": "passed",
+                                   "at": datetime.now(timezone.utc).isoformat()}, str(end_path))
+        event = self.move_slice("a", "edited-unverified", ["a.txt"], action="integration-fix",
+                                integration_path=checkpoint, repair_phase_id="integration-a")
+        self.assertEqual(previous["review_fix_count"], event["review_fix_count"])
+        source = self.contract
+        decision = self.save("continuity-decision.json", {"decision": "continue"})
+        items = []
+        for identifier in ("a", "b"):
+            audited = workflow.audit_slice_history(source, "api", identifier, strict=True)
+            items.append({"repo": "api", "slice_id": identifier, "source_slice_id": identifier,
+                          "work_item": "work-1", "approved_by": "user", "user_authorization": "continue",
+                          "reason": "same work", "approved_at": "2026-01-01T00:00:00Z",
+                          "used_passes": audited["review_fix_count"], "effective_limit": audited["review_fix_limit"],
+                          "source_contract_path": source, "source_contract_sha256": workflow.sha(source),
+                          "source_state_path": audited["state_path"], "source_state_sha256": audited["state_sha256"],
+                          "source_history_sha256": audited["history_sha256"], "decision_path": decision,
+                          "decision_sha256": workflow.sha(decision)})
+        successor = self.run.parent / "integration-successor"
+        successor.mkdir()
+        draft = {**self.c, "run_id": successor.name, "budget_continuity": items,
+                 "original_review_base": {"repo": "api", "initial_manifest": self.bases["a"],
+                                          "first_touch_baseline": str(self.base)}}
+        reservation = workflow.reserve_predecessors(draft, successor / "contract.json", "a" * 64, draft)
+        self.assertEqual(1, len(reservation))
+        bad = state.load(end_path)
+        bad["checkpoint_path"] = str(self.run / "wrong-checkpoint.json")
+        end_path.write_text(json.dumps(bad))
+        with self.assertRaisesRegex(ValueError, "integration checkpoint binding"):
+            workflow.reserve_predecessors(draft, successor / "contract.json", "a" * 64, draft)
 
     def test_alignment_rejects_foreign_bindings_scope_drift_and_reuse(self):
         self.integration_fixture()
@@ -4848,6 +5976,241 @@ class SliceLifecycleTests(unittest.TestCase):
         self.save("contract.json", self.c)
         self.save("run.json", {"schema_version": 2, "workflow": "fix", "run_id": self.run.name, "repos": ["api"]})
         return predecessor
+
+    def test_cached_predecessor_audit_rechecks_amendment_baseline(self):
+        before = self.amended_predecessor(gate_fix=True)
+        old_baseline = self.base
+        predecessor = self.new_amendment_successor(before)
+        lineage = workflow.GateFixLineage(workflow.contract(self.contract), "api")
+        lineage.audit(Path(predecessor), set())
+        saved = (old_baseline / "doc.txt").read_bytes()
+        (old_baseline / "doc.txt").write_text("tampered baseline")
+        with self.assertRaisesRegex(ValueError, "matching first-touch baseline"):
+            workflow.check_gate_sources_current(lineage.cache)
+        (old_baseline / "doc.txt").write_bytes(saved)
+        workflow.check_gate_sources_current(lineage.cache)
+
+    def test_successor_schedule_carries_approved_repo_scope(self):
+        before = self.amended_predecessor(gate_fix=True)
+        predecessor_files = {path: path.read_bytes() for path in self.run.rglob("*") if path.is_file()}
+        predecessor_state = state.load(before["state_path"])
+        old_baseline = self.base
+        amendment = predecessor_state["scope_amendment_path"]
+        events = workflow.history(self.run / "api")
+        charged = next(event for _, _, event in events if event.get("action") == "plan-gap")
+        approval = state.load(amendment)
+        checked_inputs = {}
+        paths, approved_at = workflow.legacy_amended_scope(
+            Path(self.contract), workflow.contract(self.contract), "api", events,
+            Path(approval["previous_state_path"]).resolve(), charged, checked_inputs)
+        self.assertEqual(["doc.txt"], paths)
+        self.assertEqual(workflow.timestamp(approval["approved_at"]), approved_at)
+        self.assertEqual(workflow.sha(amendment), checked_inputs[amendment])
+        with self.assertRaisesRegex(ValueError, "different predecessor state"):
+            workflow.legacy_amended_scope(Path(self.contract), workflow.contract(self.contract), "api", events,
+                                          events[-1][1].resolve(), charged, {})
+        self.new_amendment_successor(before)
+        self.c["original_review_base"] = {"repo": "api", "initial_manifest": predecessor_state["initial_manifest"],
+                                         "first_touch_baseline": str(old_baseline)}
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "Historical approved paths lack a successor owner: doc.txt"):
+            workflow.slice_schedule(self.contract, "api", self.schedule)
+        schedule = state.load(self.schedule)
+        schedule["carried_repo_scope"] = {"owner": "repo", "paths": ["doc.txt"],
+                                           "source_amendment_path": amendment,
+                                           "source_amendment_sha256": workflow.sha(amendment)}
+        self.save("slices-approved.json", schedule)
+        self.c["slice_schedules"]["api"]["sha256"] = workflow.sha(self.schedule)
+        self.save("contract.json", self.c)
+        workflow.slice_schedule(self.contract, "api", self.schedule)
+        without_base = workflow.contract(self.contract)
+        without_base.pop("original_review_base")
+        without_base["_pending_replacement"] = True
+        with self.assertRaisesRegex(ValueError, "requires original_review_base"):
+            workflow.checked_slice_schedule(without_base, "api", self.schedule)
+        without_base["original_review_base"] = {"repo": "another-repo"}
+        with self.assertRaisesRegex(ValueError, "requires original_review_base"):
+            workflow.checked_slice_schedule(without_base, "api", self.schedule)
+        without_base["budget_continuity"][0]["recovery_sources"] = [{
+            "contract_path": self.c["budget_continuity"][0]["source_contract_path"]}]
+        with self.assertRaisesRegex(ValueError, "multiple predecessor histories"):
+            workflow.checked_slice_schedule(without_base, "api", self.schedule)
+        schedule["carried_repo_scope"]["paths"] = ["source.txt"]
+        self.save("slices-approved.json", schedule)
+        self.c["slice_schedules"]["api"]["sha256"] = workflow.sha(self.schedule)
+        self.save("contract.json", self.c)
+        with self.assertRaisesRegex(ValueError, "without predecessor approval"):
+            workflow.slice_schedule(self.contract, "api", self.schedule)
+        schedule["carried_repo_scope"]["paths"] = ["doc.txt"]
+        self.save("slices-approved.json", schedule)
+        self.c["slice_schedules"]["api"]["sha256"] = workflow.sha(self.schedule)
+        store_root = self.root.resolve() / "carried-store"
+        LifecycleTests.declare_store(self, store_root)
+        deliverable_file = store_root / "summary.txt"
+        deliverable_file.write_text("verified output\n")
+        self.c["deliverables"] = {"api": [{"id": "summary", "path": str(deliverable_file), "store": "data",
+                                             "criterion_ids": ["fix.ac-1"], "required_at": {"scope": "repo"}}]}
+        self.save("contract.json", self.c)
+        predecessor = self.c["budget_continuity"][0]["source_contract_path"]
+        slice_audit = workflow.audit_slice_history(predecessor, "api", "a", strict=True)
+        self.c["budget_continuity"][1]["source_history_sha256"] = slice_audit["history_sha256"]
+        slice_b = workflow.audit_slice_history(predecessor, "api", "b", strict=True)
+        self.c["budget_continuity"].append({**self.c["budget_continuity"][1], "slice_id": "b",
+                                            "source_slice_id": "b", "used_passes": slice_b["review_fix_count"],
+                                            "source_state_path": slice_b["state_path"],
+                                            "source_state_sha256": slice_b["state_sha256"],
+                                            "source_history_sha256": slice_b["history_sha256"]})
+        self.c["successor_scopes"].append({"repo": "api", "slice_id": "b", "work_item": "work-1"})
+        setup = self.run.parent / "setup-to-replace"
+        setup.mkdir()
+        (setup / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": setup.name,
+                                                     "workflow": "fix", "repos": ["api"]}))
+        setup_contract = setup / "contract.json"
+        old = {**self.c, "run_id": setup.name}
+        old.pop("slice_schedules")
+        old.pop("original_review_base")
+        setup_contract.write_text(json.dumps(old))
+        try:
+            state.validate_run(str(setup_contract), "first", workflow)
+        except (ValueError, OSError):
+            pass
+        Path(self.contract).unlink()
+        draft = self.save("inputs/replacement-contract.json", self.c)
+        workflow.replace_setup(str(setup_contract), draft, "Carry the approved scope", bootstrap_policy=())
+        self.c = state.load(self.contract)
+        state.validate_run(self.contract, "successor", workflow)
+        self.base = old_baseline
+        self.repo_scope = self.save("carried-repo-scope.json", ["a.txt", "b.txt", "doc.txt"])
+        (self.repo / "unrelated-wip.txt").write_text("untouched WIP\n")
+        self.initial_repo = self.cap(state.scope_paths(self.repo_scope), "carried-start.json")
+        self.bases = {"a": self.cap(["a.txt"]), "b": self.cap(["b.txt"])}
+        request = self.save("carried-initialize.json", {"status": "initialized", "source_manifest": self.initial_repo,
+                            "scope_path": self.repo_scope, "baseline_dir": str(self.base)})
+        workflow.transition(self.contract, "api", request, str(self.run / "api/state-1.json"))
+        expanded_scope = self.save("wip-scope.json", ["a.txt", "b.txt", "doc.txt", "unrelated-wip.txt"])
+        request = self.save("wip-ready.json", {"status": "ready", "source_manifest": self.initial_repo,
+                            "scope_path": expanded_scope, "baseline_dir": str(self.base)})
+        with self.assertRaisesRegex(ValueError, "startup differs from predecessor on scoped paths"):
+            workflow.transition(self.contract, "api", request, str(self.run / "api/state-2.json"))
+        preflight = self.save("carried-preflight.json", self.artifact(status="passed", evidence_paths=[
+            self.evidence("env.runtime", "static", source=self.initial_repo)]))
+        request = self.save("carried-ready.json", {"status": "ready", "source_manifest": self.initial_repo,
+                            "scope_path": self.repo_scope, "baseline_dir": str(self.base),
+                            "preflight_path": preflight})
+        workflow.transition(self.contract, "api", request, str(self.run / "api/state-2.json"))
+        self.accept("a", "a.txt")
+        self.bases["b"] = self.cap(["b.txt"])
+        self.accept("b", "b.txt")
+        final = self.cap(state.scope_paths(self.repo_scope))
+        gate = self.run / "carried-gate.json"
+        workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo, final, str(gate))
+        self.assertEqual(["doc.txt"], state.load(gate)["carried_repo_paths"])
+        self.assertIn("doc.txt", state.load(gate)["touched_union"])
+        self.assertEqual("untouched WIP\n", (self.repo / "unrelated-wip.txt").read_text())
+        (self.repo / "unrelated-wip.txt").write_text("changed WIP\n")
+        with self.assertRaisesRegex(ValueError, "not owned by any accepted slice"):
+            workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo,
+                                self.cap(state.scope_paths(self.repo_scope)), str(self.run / "wip-gate.json"))
+        (self.repo / "unrelated-wip.txt").write_text("untouched WIP\n")
+        (self.repo / "a.txt").write_text("edited after acceptance\n")
+        with self.assertRaisesRegex(ValueError, "Slice a is stale"):
+            workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo,
+                                self.cap(state.scope_paths(self.repo_scope)), str(self.run / "stale-gate.json"))
+        (self.repo / "a.txt").write_text("a1\n")
+        starting = {}
+        for identifier in ("a", "b"):
+            event = workflow.history(self.run / "api/slices" / identifier)[-1]
+            starting[identifier] = {"state_path": str(event[1]), "state_sha256": workflow.sha(event[1]),
+                                    "author_agent_id": event[2]["author_agent_id"]}
+        start = self.cap(state.scope_paths(self.repo_scope))
+        authorization = self.save("carried-alignment-authorization.json", self.artifact(
+            user_authorization="Approve repair and dependent recheck", approved_at=datetime.now(timezone.utc).isoformat(),
+            contract_sha256=workflow.sha(self.contract), schedule_sha256=workflow.sha(self.schedule),
+            starting_slices=starting, start_manifest_path=start, start_manifest_sha256=workflow.sha(start),
+            partial_slices={}, edit_paths={"a": ["a.txt"]}, recertify_slices=["b"]))
+        def checkpoint(identifier, sibling, mode):
+            event = workflow.history(self.run / "api/slices" / identifier)[-1]
+            other = workflow.history(self.run / "api/slices" / sibling)[-1]
+            snapshot = self.cap(state.scope_paths(self.repo_scope))
+            return self.save(f"carried-checkpoint-{identifier}.json", self.artifact(
+                slice_id=identifier, mode=mode, user_authorization="Approve alignment checkpoint",
+                author_agent_id=event[2]["author_agent_id"], previous_state_path=str(event[1]),
+                previous_state_sha256=workflow.sha(event[1]), contract_sha256=workflow.sha(self.contract),
+                schedule_sha256=workflow.sha(self.schedule), authorization_path=authorization,
+                authorization_sha256=workflow.sha(authorization), start_manifest=snapshot,
+                start_manifest_sha256=workflow.sha(snapshot), at=datetime.now(timezone.utc).isoformat(),
+                slice_states={sibling: {"path": str(other[1]), "sha256": workflow.sha(other[1])}},
+                partial_slices={}))
+        checkpoint_a = checkpoint("a", "b", "repair")
+        (self.repo / "a.txt").write_text("a2 after acceptance\n")
+        self.move_slice("a", "edited-unverified", ["a.txt"], action="integration-fix", integration_path=checkpoint_a)
+        self.move_slice("a", "pre-review-passed", ["a.txt"], pre_review_evidence_paths=[
+            self.evidence("early.tests", source=self.cap(["a.txt"]))])
+        self.move_slice("a", "reviewed", ["a.txt"], review_path=self.slice_review("a", ["a.txt"], 2))
+        self.move_slice("a", "accepted", ["a.txt"])
+        with self.assertRaisesRegex(ValueError, "predecessor a was re-accepted"):
+            workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo,
+                                self.cap(state.scope_paths(self.repo_scope)), str(self.run / "dependent-stale-gate.json"))
+        checkpoint_b = checkpoint("b", "a", "dependency-recheck")
+        self.move_slice("b", "pre-review-passed", ["b.txt"], action="dependency-recheck",
+                        integration_path=checkpoint_b,
+                        pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(["b.txt"]))])
+        self.move_slice("b", "reviewed", ["b.txt"], review_path=self.slice_review("b", ["b.txt"], 2))
+        self.move_slice("b", "accepted", ["b.txt"])
+        gate = self.run / "carried-fresh-gate.json"
+        workflow.slice_gate(self.contract, "api", self.schedule, self.initial_repo,
+                            self.cap(state.scope_paths(self.repo_scope)), str(gate))
+        matrix = self.save("carried-matrix.json", self.artifact(criteria=[{
+            "criterion_id": "fix.ac-1", "implementation": "both slices", "assertion": "pending",
+            "status": "unverified", "reason": "independent acceptance pending", "evidence_paths": []}]))
+        def repo_move(status, **fields):
+            events = workflow.history(self.run / "api")
+            self.counter += 1
+            request_path = self.save(f"carried-request-{self.counter}.json", {
+                "status": status, "source_manifest": self.cap(state.scope_paths(self.repo_scope)),
+                "scope_path": self.repo_scope, "baseline_dir": str(self.base), **fields})
+            return workflow.transition(self.contract, "api", request_path,
+                                       str(self.run / "api" / f"state-{len(events) + 1}.json"))
+        repo_move("implemented", matrix_path=matrix, slice_gate_path=str(gate),
+                  slice_authors={"a": "author-a", "b": "author-b"}, original_agent_id="original-1")
+        delivery = workflow.snapshot_deliverables(self.contract, "api", str(self.run / "carried-delivery"))
+        proof = self.reviewed_artifact(self.evidence("early.tests", source=self.cap(state.scope_paths(self.repo_scope))),
+                                       delivery)
+        repo_move("pre-review-passed", matrix_path=matrix, deliverable_manifest_path=delivery,
+                  pre_review_evidence_paths=[proof])
+        packet = self.run / "carried-review-packet"
+        workflow.packet(self.contract, "api", self.repo_scope, str(self.base), str(packet))
+        review_path = self.slice_review("a", state.scope_paths(self.repo_scope), 1)
+        review = state.load(review_path)
+        review["packet_path"] = str(packet / "index.json")
+        review["packet_sha256"] = workflow.sha(review["packet_path"])
+        Path(review_path).write_text(json.dumps(review))
+        repo_move("reviewed", review_path=self.reviewed_artifact(review_path, delivery))
+        repo_move("gates-passed", gate_evidence_paths=[
+            self.reviewed_artifact(self.evidence("gate.tests", source=self.cap(state.scope_paths(self.repo_scope))),
+                                   delivery)])
+        acceptance_proof = self.reviewed_artifact(
+            self.evidence("fix.ac-1", source=self.cap(state.scope_paths(self.repo_scope))), delivery)
+        assessment = self.save("carried-assessment.json", self.artifact(
+            producer="orchestrator", requirements_match=True, criteria=[{
+                "criterion_id": "fix.ac-1", "implementation": "met", "verification": "verified",
+                "reason": "fixture scenario checked", "evidence_paths": [acceptance_proof]}]))
+        repo_move("verified", assessment_path=self.reviewed_artifact(assessment, delivery))
+        completion = self.run / "completion.json"
+        workflow.complete(self.contract, str(completion))
+        certificate = state.load(completion)
+        self.assertEqual("completed", certificate["status"])
+        self.assertEqual(before["review_fix_count"],
+                         certificate["repos"]["api"]["review_budget"]["historical_used_passes"])
+        self.assertEqual(before["gate_fix_budget"]["current_used_attempts"],
+                         certificate["repos"]["api"]["gate_fix_budget"]["historical_used_attempts"])
+        self.assertEqual(workflow.sha(deliverable_file),
+                         certificate["repos"]["api"]["deliverables"][0]["version"]["sha256"])
+        self.assertEqual(predecessor_files, {path: path.read_bytes() for path in predecessor_files})
+        self.assertEqual("untouched WIP\n", (self.repo / "unrelated-wip.txt").read_text())
+        deliverable_file.write_text("modified after completion\n")
+        with self.assertRaisesRegex(ValueError, "differs|changed|stale"):
+            workflow.complete(self.contract, str(completion))
 
     def test_successor_audits_predecessor_with_scope_amendment(self):
         before = self.amended_predecessor(gate_fix=True)

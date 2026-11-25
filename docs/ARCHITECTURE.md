@@ -104,6 +104,10 @@ records a run-wide setup phase around contract and slice-schedule validation, in
 assert that preflight or any project check passed. `validate-contract` remains read-only for historical runs.
 Setup-only runs can be closed with a sealed replacement binding. The successor retains the original setup
 artifacts and independently accounts for all lifecycle predecessor budgets. The closure does not certify work.
+The read-only replacement check audits the proposed successor without publishing it. A successful check returns
+a hash that publication can verify after locking. Replacement freezes the supplied bootstrap read policy in
+the successor, and predecessor-based review binds the original first-touch base to the current review packet.
+Legacy recovery declarations are bound to predecessor history and independently signed host observations.
 `validate-run` writes a per-attempt contract seal alongside its setup events. Historical runs without that
 seal bind the contract when they are replaced. External work helpers record an activity marker before they
 execute so that a concurrent replacement cannot overlook their work.
