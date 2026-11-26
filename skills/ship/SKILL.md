@@ -3,6 +3,9 @@ name: ship
 description: Drive an approved plan through preflight, implementation, independent review, gates and version-bound acceptance, leaving verified uncommitted diffs.
 ---
 
+For each target repository, select the review rubric and freeze its stable IDs in the contract as described in
+PROTOCOL.md. Resolve the selected rubric again for every reviewer and pass its contents in the handoff.
+
 Read `.agents/workflows/ship-fix/HOST-ADAPTERS.md` to map workflow operations to this host's shell, agent-dispatch, continuation, and user-input capabilities. Stop and report unsupported capabilities instead of silently skipping workflow phases.
 
 

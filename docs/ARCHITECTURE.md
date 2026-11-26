@@ -9,6 +9,7 @@ The package repository is not a project and does not keep run state.
 ```text
 workflows/ship-fix/
   PROTOCOL.md          canonical lifecycle, schemas, budgets and telemetry rules
+  DEFAULT-REVIEW.md    fallback review criteria with stable pass IDs
   HOST-ADAPTERS.md     mapping from workflow operations to host capabilities
   scripts/             lifecycle validators, artifact helpers and run-check executor
   hooks/               trusted-command adapters

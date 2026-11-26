@@ -1,5 +1,25 @@
 # ship-workflow
 
+## Quick start
+
+Install Python 3.11+, Git and Bash, then clone this package and install its current committed snapshot into your Git project:
+
+```bash
+git clone https://github.com/a-treschilov/ship-workflow.git ~/ship-workflow
+cd /path/to/project
+mkdir -p .agents
+SHIP_SRC="$HOME/ship-workflow" "$HOME/ship-workflow/install/install.sh" \
+  "$(git -C "$HOME/ship-workflow" rev-parse --verify HEAD)" --host both
+```
+
+Open the project in Claude Code or Codex with custom agent roles enabled. Give the agent a concrete task, for example:
+
+```text
+/fix Make count_lines.py print 0 for an empty file. Preserve the result for nonempty files and add a regression test.
+```
+
+After completion, inspect `git status` and `git diff`, then run `./ship-view` from the project root to see the run and its completion certificate. The workflow checks host capabilities, prepares a contract, independently reviews changes and runs the required checks.
+
 Related ship and fix runs preserve review-fix budgets through stable work-item identifiers and explicit,
 audited continuity. The protocol describes recovery when independent run histories omitted that continuity.
 
@@ -55,27 +75,7 @@ The result is a reviewed, verified, uncommitted working tree for a human to insp
 The installer copies a snapshot of this repository into the target project. It does not add this repository as
 a submodule, workspace, or runtime dependency.
 
-Clone once:
-
-```bash
-git clone https://github.com/<owner>/ship-workflow.git ~/ship-workflow
-```
-
-Install a tag into a project:
-
-```bash
-cd /path/to/project
-mkdir -p .agents
-SHIP_REMOTE=https://github.com/<owner>/ship-workflow.git \
-  ~/ship-workflow/install/install.sh v1.1.0 --host both
-```
-
-The remote form fetches the requested ref into a temporary directory. To install from a local checkout:
-
-```bash
-cd /path/to/project
-SHIP_SRC=~/ship-workflow ~/ship-workflow/install/install.sh v1.1.0 --host both
-```
+The quick start installs the exact commit checked out in the clone. To install a release, check out its tag in the clone first and run the same commands. The installed version record identifies the resolved commit.
 
 `SHIP_SRC` takes precedence over `SHIP_REMOTE`. Local installs copy the committed bytes at the requested ref,
 regardless of the current checkout. For development, pass `--dev` with the checked-out ref to include worktree
@@ -87,7 +87,7 @@ The OCX assignments come from the template's `ocx_models` profile. Existing mode
 Each install writes `.agents/.ship-version`:
 
 ```json
-{"schema_version":1,"ref":"v1.1.0","commit":"<resolved commit>","installed_at":"<UTC>"}
+{"schema_version":1,"ref":"<commit SHA>","commit":"<resolved commit>","installed_at":"<UTC>"}
 ```
 
 An existing installation without `.ship-version` is backed up to `.agents/.ship-backup/<timestamp>/` before
@@ -133,24 +133,7 @@ requires signed host observations already sealed in predecessor history.
 
 ### Configure review criteria
 
-Each target repository owns its review rubric at `.agents/skills/review/SKILL.md`. The installer does not
-create this file. Create or edit it in each repository to describe the checks your project needs. The reviewer
-reads the rubric and applicable repository and module instructions in every review round. The workflow protocol
-defines the review scope, baseline and result format.
-
-For example, add a `simplification` section that explains when the check applies and what problems to look for,
-such as unnecessarily nested conditions or duplicated behavior. Give each rubric topic a stable ID. Before a
-new `/ship` or `/fix` run, ask the orchestrator to include the checks in the contract. It reads the rubric and
-records the complete set of IDs in `required_passes` for each repository. An excerpt might look like this:
-
-```json
-"required_passes": {"app": ["logic", "security", "simplification"]}
-```
-
-Keep all existing rubric IDs when adding a new one. Inspect the run's `contract.json` to see the selected IDs.
-Each review records an `inspected` result or a justified `not-applicable` result for every ID under
-`coverage.mandatory_passes`. Run contracts and review records are immutable; rubric changes apply when a new
-contract is prepared.
+Each target repository can provide `.agents/skills/review/SKILL.md`. When present, its criteria take priority. Otherwise the installed workflow provides the `logic`, `security` and `coverage` passes. Give each project rubric topic a stable ID. The orchestrator records all selected IDs in `required_passes` when preparing the contract, and each review records coverage for every pass. Project rubrics are preserved on installation and upgrade. See the [protocol](workflows/ship-fix/PROTOCOL.md) for selection and review rules.
 
 Rubrics can include Boy Scout suggestions for nearby code. The approved scope and protocol govern the review;
 unrelated pre-existing improvements do not expand the writable scope. See the
@@ -207,7 +190,7 @@ through to the host's normal permission prompt.
 
 ```bash
 # install or upgrade to another pinned tag
-make -C ~/ship-workflow install REF=v1.2.0 PROJECT=/path/to/project
+make -C ~/ship-workflow install REF=vX.Y.Z PROJECT=/path/to/project
 
 # regenerate native agent files after a role or model edit
 make -C ~/ship-workflow sync PROJECT=/path/to/project

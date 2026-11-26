@@ -38,6 +38,48 @@ class InstallerTests(unittest.TestCase):
             text=True,
         )
 
+    def test_first_review_rubric_and_project_override(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        result = self.install()
+        self.assertEqual(0, result.returncode, result.stderr)
+        launcher = self.project / "ship-view"
+        self.assertTrue(os.access(launcher, os.X_OK))
+        helper = self.project / ".agents/workflows/ship-fix/scripts/ship_state.py"
+        def rubric(repo):
+            result = subprocess.run(["python3", "-I", "-B", str(helper), "review-rubric", "--repo-path", str(repo)],
+                                    cwd=self.project, capture_output=True, text=True, check=True)
+            return json.loads(result.stdout)
+        default = rubric(self.project)
+        self.assertEqual("default", default["source"])
+        self.assertEqual(["logic", "security", "coverage"], default["ids"])
+        target = Path(self.temp.name) / "separate repo"
+        project_rubric = target / ".agents/skills/review/SKILL.md"
+        project_rubric.parent.mkdir(parents=True)
+        project_rubric.write_text("# Project review\n\n## custom\nCheck the project invariant.\n")
+        before = project_rubric.read_bytes()
+        selected = rubric(target)
+        self.assertEqual("project", selected["source"])
+        self.assertEqual(before.decode(), selected["content"])
+        own_rubric = self.project / ".agents/skills/review/SKILL.md"
+        own_rubric.parent.mkdir(parents=True)
+        own_rubric.write_bytes(before)
+        self.assertEqual(0, self.install().returncode)
+        self.assertEqual(before, own_rubric.read_bytes())
+        self.assertEqual("project", rubric(self.project)["source"])
+
+    def test_unreadable_project_rubric_does_not_fall_back(self):
+        self.assertEqual(0, self.install().returncode)
+        rubric = self.project / ".agents/skills/review/SKILL.md"
+        rubric.parent.mkdir(parents=True)
+        rubric.symlink_to("missing-user-rubric")
+        helper = self.project / ".agents/workflows/ship-fix/scripts/ship_state.py"
+        result = subprocess.run(["python3", "-I", "-B", str(helper), "review-rubric",
+                                 "--repo-path", str(self.project)], cwd=self.project,
+                                capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Blocked:", result.stderr)
+        self.assertTrue(rubric.is_symlink())
+
     def test_view_launcher_install_upgrade_and_uninstall(self):
         result = self.install()
         self.assertEqual(0, result.returncode, result.stderr)

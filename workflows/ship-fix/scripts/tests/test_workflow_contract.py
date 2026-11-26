@@ -148,7 +148,7 @@ class InstructionContractTests(unittest.TestCase):
 
     def test_role_separation_and_scope_precedence(self):
         reviewer = self.agents["reviewer"]
-        self.assertIn("not its standalone HEAD-diff", reviewer)
+        self.assertIn("review-rubric --contract CONTRACT_PATH --repo REPO", reviewer)
         self.assertIn("Hash equality is not impact analysis", reviewer)
         self.assertIn("Unrelated pre-existing Boy Scout", reviewer)
         self.assertIn("producer reviewer", reviewer)

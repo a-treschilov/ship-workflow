@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- Provide default review criteria for first runs while preserving project rubrics.
+- Keep quick-start installation pinned to the checked-out snapshot that supplies the documented launcher.
+
 ## v1.7.0 - 2026-11-25
 
 ### New Features

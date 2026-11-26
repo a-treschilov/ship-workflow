@@ -1610,6 +1610,11 @@ def evidence(value, final, read_excludes=(), *, historical=False, guard=Path, lo
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    sub = commands.add_parser("review-rubric")
+    source = sub.add_mutually_exclusive_group(required=True)
+    source.add_argument("--repo-path")
+    source.add_argument("--contract")
+    sub.add_argument("--repo")
     sub = commands.add_parser("init-run")
     sub.add_argument("--run-dir", required=True)
     sub.add_argument("--workflow", choices=("ship", "fix"), required=True)
@@ -1819,6 +1824,45 @@ def main():
 
 
 def dispatch(args):
+    if args.command == "review-rubric":
+        if args.contract:
+            import importlib.util
+            module_spec = importlib.util.spec_from_file_location("ship_workflow", Path(__file__).with_name("ship_workflow.py"))
+            workflow = importlib.util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(workflow)
+            contract = workflow.contract(args.contract)
+            require(args.repo in contract["repos"], "Unknown rubric repo")
+            repo = Path(contract["repo_paths"][args.repo])
+            policies = contract_read_policy(args.contract)
+        else:
+            require(not args.repo, "--repo requires --contract")
+            repo = Path(args.repo_path)
+            require(repo.is_absolute() and repo.is_dir(), "--repo-path must be an absolute directory")
+            policies = ()
+        project = repo / ".agents/skills/review/SKILL.md"
+        project = guard_excluded_paths(project, policies, pinned=bool(policies))
+        if policies:
+            exists = guarded_exists(project, policies)
+        else:
+            try:
+                os.lstat(project)
+                exists = True
+            except FileNotFoundError:
+                exists = False
+        if exists:
+            selected, source = project, "project"
+        else:
+            selected, source = Path(__file__).resolve().parent.parent / "DEFAULT-REVIEW.md", "default"
+        selected = guard_excluded_paths(selected, policies, pinned=bool(policies))
+        if not policies:
+            selected = selected.resolve(strict=True)
+        with capture_open(selected) as handle:
+            content = handle.read().decode("utf-8")
+        ids = re.findall(r"^## ([a-z][a-z0-9-]*)$", content, re.M) if source == "default" else None
+        if source == "default":
+            require(ids and len(ids) == len(set(ids)), "Invalid default rubric IDs")
+        print(json.dumps({"source": source, "path": str(selected.absolute()), "content": content, "ids": ids}))
+        return
     if args.command == "init-run":
         print(json.dumps(init_run(args.run_dir, args.workflow, args.repo, args.description, args.plan_path, args.session_id)))
         return

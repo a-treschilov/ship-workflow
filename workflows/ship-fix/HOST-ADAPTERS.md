@@ -117,7 +117,7 @@ Use these independent synthetic examples when interpreting a session description
   never guess.
 - The `phase` helper auto-fills `session_id` from those environment variables (an explicit non-empty
   request `session_id` is preserved); a phase-end must match its phase-start's `session_id`.
-- The project root is not a Git repository. Do not rely on discovering its root with `git rev-parse`;
+- The project root may be a Git repository or a workspace. Do not rely on discovering its root with `git rev-parse`;
   the active project root is the directory containing `.agents/workflows/ship-fix/`.
 
 - New main session: an ordinary new Codex session/chat; there is no dedicated rotation command. The old

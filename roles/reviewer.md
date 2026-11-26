@@ -1,9 +1,6 @@
 You have not seen the author's implementation narrative. Fresh context excludes author bias, not the
-requirements. Read absolute PROTOCOL_PATH and CONTRACT_PATH. Protocol controls source scope, history,
-version binding and output; `REPO_PATH/.agents/skills/review/SKILL.md` supplies the target repository's
-substantive review criteria, not its standalone HEAD-diff collection or output format. Read it fully along
-with repo/module conventions afresh every round; do not use a skill's standalone collection format to
-override the workflow contract.
+requirements. Read absolute PROTOCOL_PATH and CONTRACT_PATH. Protocol controls source scope, history, version binding and output. Read the selected review rubric
+returned by `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-rubric --contract CONTRACT_PATH --repo REPO` fully every round, together with applicable repo and module instructions. Apply every ID frozen in the contract.
 
 Inputs: REPO/REPO_PATH, RUN_DIR, PROTOCOL_PATH/HELPER_PATH, CONTRACT_PATH, PLAN_EXCERPT (ship) or BUG_BRIEF
 (fix), SCOPE_FILES, BASELINE_DIR or verified REVIEW_BASE, SOURCE_MANIFEST, packet/scoped delta paths,

@@ -23,26 +23,19 @@ on the source repository.
 The installer refuses to run in a directory without `.agents`. That keeps a mistyped `cd` from writing a
 workflow tree into an unrelated directory.
 
-## Install a tag
+## Install a pinned snapshot
 
-Use the remote form when you want the installed bytes to come from a specific tag:
-
-```bash
-git clone https://github.com/<owner>/ship-workflow.git ~/ship-workflow
-cd /path/to/project
-SHIP_REMOTE=https://github.com/<owner>/ship-workflow.git \
-  ~/ship-workflow/install/install.sh v1.1.0 --host both
-```
-
-The installer fetches `SHIP_REMOTE` at `<ref>` into a temporary directory and copies that snapshot. A private
-remote uses the same environment variable with an SSH or HTTPS URL your `git` already authenticates.
-
-Use the local form when you have a checkout containing the tag:
+Clone the package, then install the exact committed snapshot in your project:
 
 ```bash
+git clone https://github.com/a-treschilov/ship-workflow.git ~/ship-workflow
 cd /path/to/project
-SHIP_SRC=~/ship-workflow ~/ship-workflow/install/install.sh v1.1.0 --host both
+mkdir -p .agents
+SHIP_SRC="$HOME/ship-workflow" "$HOME/ship-workflow/install/install.sh" \
+  "$(git -C "$HOME/ship-workflow" rev-parse --verify HEAD)" --host both
 ```
+
+To select a release, check out its tag in the clone before running the installation commands. The version record stores the commit. For remote installation, set `SHIP_REMOTE` and pass the desired tag to the installer.
 
 `SHIP_SRC` takes precedence over `SHIP_REMOTE`. An unresolved ref is an error. A local install copies committed
 bytes at that ref even if another revision is checked out. Pass `--dev` with the currently checked-out ref to
@@ -64,7 +57,7 @@ The installer creates `.agents/.ship-version`:
 ```json
 {
   "schema_version": 1,
-  "ref": "v1.1.0",
+  "ref": "<commit SHA>",
   "commit": "<resolved commit or unknown>",
   "host": "both",
   "installed_at": "<UTC timestamp>"
@@ -84,6 +77,8 @@ Shared files are replaced on every install:
 .agents/platforms/claude/roles.json
 .agents/platforms/codex/roles.json
 ```
+
+A target repository can provide `.agents/skills/review/SKILL.md`. Its criteria take priority over the installed default rubric, and the installer preserves it. The default rubric is available under `.agents/workflows/ship-fix/DEFAULT-REVIEW.md`.
 
 The model configuration is created only when absent. Host settings are merged with the required workflow
 hooks and permissions; unrelated settings and worktree hooks are retained:
@@ -162,7 +157,7 @@ machine-specific paths into the shared package.
 ## Upgrade
 
 ```bash
-make -C ~/ship-workflow install REF=v1.2.0 HOST=both PROJECT=/path/to/project
+make -C ~/ship-workflow install REF=vX.Y.Z HOST=both PROJECT=/path/to/project
 ```
 
 The Make target invokes the same installer, so the tag verification and backup rules still apply. The shared
