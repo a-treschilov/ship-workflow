@@ -27,7 +27,7 @@ the script streams them and emits compact metrics. Do not rewrite history to imp
 ## v2 runs
 
 Contract and append-only telemetry identify exact run, repo, phase, agent instance and start/end boundaries.
-Phases include setup validation, resumed review-fix/gate-fix, gates and checkpoint waits. Setup success only
+Phases include slicer proposals, setup validation, resumed review-fix/gate-fix, gates and checkpoint waits. Setup success only
 validates run metadata and contract; it does not prove preflight or project checks passed. Script joins actual agent transcripts
 by agent_id/tool_use_id, deduplicates request/message chunks/replays and reads usage per phase, not cumulative
 agent totals. Actual model is per phase/instance; mixed phases expose a models list. Missing metrics are

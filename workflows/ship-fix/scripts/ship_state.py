@@ -25,11 +25,19 @@ import unicodedata
 DEFAULT_EXCLUDES = (".claude/review-findings.json", ".claude/review-applied.json")
 MISSING = {"kind": "missing"}
 SEVERITIES = {"Critical", "Warning", "Suggestion"}
+END_REASONS = {"done", "context", "api-error", "user-stop", "timeout", "unknown"}
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def timestamp(value):
+    text(value, "timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(parsed.tzinfo is not None, "Timestamp needs timezone")
+    return parsed
 
 
 def load(path):
@@ -137,11 +145,22 @@ def init_run(run_dir, workflow, repos, description, plan_path, session_id):
 
 def validate_run(contract_path, attempt_id, workflow):
     contract_file = Path(contract_path).absolute()
+    require(contract_file.name != workflow.slicer.DRAFT, "Slicer draft is not a lifecycle contract")
     policies = contract_read_policy(contract_file)
     resolved_contract = guard_excluded_paths(contract_file, policies, pinned=bool(policies))
     if not policies:
         resolved_contract = resolved_contract.resolve()
     root = resolved_contract.parent
+    draft_path = root / workflow.slicer.DRAFT
+    draft_active = False
+    if guarded_exists(draft_path, policies):
+        try:
+            draft_active = json.loads(capture_bytes(guard_excluded_paths(draft_path, policies, pinned=True))).get("slicer_draft") is True
+        except (ValueError, AttributeError):
+            pass
+    if draft_active:
+        require(contract_file == resolved_contract == root / "contract.json"
+                and guarded_exists(contract_file, policies), "Seal the slicer contract before setup validation")
     guard = lambda path: guard_excluded_paths(path.absolute(), policies, pinned=bool(policies))
     require(not guarded_exists(root / "setup-replacement.json", policies), "This setup run has been replaced")
     relative_path(attempt_id)
@@ -1625,6 +1644,23 @@ def main():
     sub = commands.add_parser("validate-run")
     sub.add_argument("--contract", required=True)
     sub.add_argument("--attempt-id", required=True)
+    for name in ("slicer-proposal", "seal-slicer-contract"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--run-dir", required=True)
+        sub.add_argument("--read-policy", required=True)
+        if name == "slicer-proposal":
+            sub.add_argument("--repo", required=True)
+            sub.add_argument("--attempt-id", required=True)
+            sub.add_argument("--event", choices=("start", "end"), required=True)
+            sub.add_argument("--session-id", default=os.environ.get("CODEX_SESSION_ID")
+                             or os.environ.get("CODEX_THREAD_ID") or "")
+            sub.add_argument("--status", choices=("passed", "failed", "blocked", "interrupted"))
+            sub.add_argument("--end-reason", choices=sorted(END_REASONS))
+            sub.add_argument("--agent-id")
+            sub.add_argument("--tool-use-id")
+            sub.add_argument("--result")
+        else:
+            sub.add_argument("--decisions", required=True)
     sub = commands.add_parser("replace-setup")
     sub.add_argument("--contract", required=True)
     sub.add_argument("--successor-draft", required=True)
@@ -1870,12 +1906,14 @@ def dispatch(args):
     if args.command == "init-run":
         print(json.dumps(init_run(args.run_dir, args.workflow, args.repo, args.description, args.plan_path, args.session_id)))
         return
-    if args.command == "validate-run":
+    if args.command in {"validate-run", "slicer-proposal", "seal-slicer-contract"}:
         import importlib.util
         module_spec = importlib.util.spec_from_file_location("ship_workflow", Path(__file__).with_name("ship_workflow.py"))
         workflow = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(workflow)
-        print(json.dumps(validate_run(args.contract, args.attempt_id, workflow)))
+        result = (validate_run(args.contract, args.attempt_id, workflow) if args.command == "validate-run"
+                  else workflow.slicer.execute(workflow, args))
+        print(json.dumps(result))
         return
     if args.command == "replace-setup":
         import importlib.util

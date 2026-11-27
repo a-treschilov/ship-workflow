@@ -289,7 +289,9 @@ def analyze(run_dir, telemetry):
                                    'timing': 'unverified', 'release_statements': lines,
                                    'limitation': 'Содержимое handoff — утверждения документа; время создания и исполнение последующих этапов не установлены.'})
 
-    incomplete = [p.get('phase_id') for p in telemetry.get('phases', []) if p.get('phase') in {'implement', 'review', 'review-fix', 'gate-fix', 'checker'} and not p.get('correlation_complete')]
+    incomplete = [p.get('phase_id') for p in telemetry.get('phases', []) if p.get('phase') in
+                  {'implement', 'review', 'review-fix', 'gate-fix', 'checker', 'slicer'}
+                  and not p.get('correlation_complete')]
     if incomplete:
         result['observations'].append({'category': 'telemetry', 'claim': 'Не удалось однозначно связать фазы с транскриптами: ' + ', '.join(str(x) for x in incomplete),
             'evidence_paths': [], 'evidence_level': 'telemetry-diagnostic',

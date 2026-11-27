@@ -19,6 +19,14 @@ spec.loader.exec_module(telemetry)
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_slicer_dispatch_accounts_for_agent_usage(self):
+        self.phase("slicer-proposal-one", "slicer", "2026-10-12T00:00:00Z", "2026-10-12T00:01:00Z")
+        self.write_messages([self.message("proposal", "2026-10-12T00:00:30Z")])
+        result = self.analyze()
+        self.assertTrue(result["accounting_complete"])
+        self.assertEqual(result["usage"]["input_tokens"], 10)
+        self.assertEqual(result["timing"]["agent_service_seconds"], 60)
+
     def test_setup_phase_is_reported_without_inventing_agent_usage(self):
         self.phase('setup-one', 'setup', '2026-10-12T00:00:00Z', '2026-10-12T00:00:01Z', repo=None)
         result = telemetry.analyze(self.run, self.project)

@@ -59,9 +59,9 @@ class InstructionContractTests(unittest.TestCase):
             self.assertNotIn(str(ROOT.parent), command)
             self.assertIn("independent review", command)
             self.assertIn("preflight", command)
-        for agent in self.agents.values():
+        for name, agent in self.agents.items():
             self.assertIn("PROTOCOL_PATH", agent)
-            self.assertIn("CONTRACT_PATH", agent)
+            self.assertIn("CONTRACT_DRAFT_PATH" if name == "slicer" else "CONTRACT_PATH", agent)
         for path in ("PROTOCOL.md", "scripts/ship_state.py", "scripts/ship_workflow.py"):
             self.assertTrue((SHARED / path).is_file())
 
@@ -119,7 +119,8 @@ class InstructionContractTests(unittest.TestCase):
         result = subprocess.run(["python3", "-I", "-B", str(SHARED / "scripts/ship_state.py"), "--help"],
                                 capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stderr)
-        for command in ("validate-contract", "validate-history", "review-budget", "review-fix-next", "transition", "record-evidence", "packet", "phase", "complete"):
+        for command in ("validate-contract", "validate-history", "review-budget", "review-fix-next", "transition",
+                        "record-evidence", "packet", "phase", "complete", "slicer-proposal", "seal-slicer-contract"):
             self.assertIn(command, result.stdout)
             self.assertIn(command, self.protocol)
 

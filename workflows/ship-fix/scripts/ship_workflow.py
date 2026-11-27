@@ -22,11 +22,15 @@ _spec.loader.exec_module(state)
 _spec = importlib.util.spec_from_file_location("workflow_store", Path(__file__).with_name("ship_store.py"))
 store = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(store)
+_spec = importlib.util.spec_from_file_location("workflow_slicer", Path(__file__).with_name("ship_slicer.py"))
+slicer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(slicer)
 
 VERSION = 2
 GATE_FIX_LIMIT = 2
 # Why a phase ended; unknown is a legitimate answer and must never be inferred from duration.
-END_REASONS = {"done", "context", "api-error", "user-stop", "timeout", "unknown"}
+END_REASONS = state.END_REASONS
+timestamp = state.timestamp
 UNSPECIFIED_DELIVERY = object()
 TERMINAL = {"blocked", "capped", "handoff", "preflight-blocked"}
 EDITS = {"implement", "review-fix", "gate-fix", "plan-gap"}
@@ -496,6 +500,7 @@ def mark_work_started(contract_path, repo=None):
         stack.callback(fcntl.flock, fd, fcntl.LOCK_UN)
         value = guarded_load(contract_path, initial)
         require(value == initial, "Contract changed while acquiring the run lock")
+        require_slicer_work(contract_path, value)
         closure = state.guard_excluded_paths(root / "setup-replacement.json", read_policy(value),
                                              pinned=bool(read_policy(value)))
         require(not guarded_exists(closure, value), "This setup run has been replaced")
@@ -518,6 +523,7 @@ def prepare_run_artifact(contract_path, repo=None):
         fcntl.flock(fd, fcntl.LOCK_EX)
         current = guarded_load(contract_path, value)
         require(current == value, "Contract changed while acquiring the run lock")
+        require_slicer_work(contract_path, value)
         require(not guarded_exists(root / "setup-replacement.json", value), "This setup run has been replaced")
         require_unreserved(value, contract_path, repo)
         yield
@@ -534,6 +540,14 @@ def require_unreserved(value, contract_path, repo=None):
         path = state.guard_excluded_paths(root / name / "successor-reservation.json",
                                           read_policy(value), pinned=bool(read_policy(value)))
         require(not guarded_exists(path, value), "Predecessor has been reserved for a successor")
+
+
+def require_slicer_work(contract_path, value):
+    path = Path(contract_path)
+    policies = read_policy(value)
+    if value.get("workflow") == "ship" and "slicer_draft" not in value:
+        slicer.validate_binding(state, path, value, policies)
+    slicer.require_setup(state, path, value, policies)
 
 
 def legacy_repair_evidence(value, references, checked_inputs=None, *, verify_observations=False):
@@ -1062,6 +1076,8 @@ def reserve_predecessors(draft, new_path, successor_hash, policy_value, *, linea
         scopes = group["scopes"]
         inherited = (*read_policy(policy_value), *group["policies"])
         old = with_read_policy(guarded_load(source, {"_read_policy": inherited}), inherited)
+        if old.get("workflow") == "ship":
+            slicer.validate_binding(state, source, old, read_policy(old), historical=True)
         if direct_only:
             require(guarded_sha(source, old) == contract_hash, "Predecessor contract seal mismatch")
             for scope in scopes:
@@ -1100,6 +1116,10 @@ def reserve_predecessors(draft, new_path, successor_hash, policy_value, *, linea
             require(event.get("schema_version") == VERSION and event.get("run_id") == old.get("run_id")
                     and event.get("workflow") == old.get("workflow") and event.get("repo") in {None, *old["repos"]},
                     "Predecessor telemetry identity mismatch")
+            if event.get("phase") == "slicer":
+                require(name.startswith(slicer.PREFIX) and event.get("phase_id") in old.get("slicer_telemetry", {}),
+                        "Unbound predecessor slicer telemetry")
+                return
             require(event.get("phase") in {"setup", "preflight", "implement", "pre-review", "review", "review-fix",
                                            "gate-fix", "checker", "gates", "checkpoint-wait"},
                     "Unknown predecessor telemetry phase")
@@ -2119,13 +2139,6 @@ def scope_amendment(contract_path, value, repo, path, events, initial):
     return additions, [str(path), str(anchor_path), str(before_path), anchor["slice_gate_path"]]
 
 
-def timestamp(value):
-    state.text(value, "timestamp")
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    require(parsed.tzinfo is not None, "Timestamp needs timezone")
-    return parsed
-
-
 def requirement_amendment(value, contract_path, path, previous_path):
     """Validate one explicit, run-local user amendment against its pre-cutover state."""
     root = Path(contract_path).parent.resolve()
@@ -2215,10 +2228,12 @@ def continuity_declarations(value, *, historical=False):
 
 
 def contract(path, *, draft=None, pending_replacement=None, inherited_policy=(), excluded_related_runs=(),
-             related_inputs=None, lineage_cache=None):
+             related_inputs=None, lineage_cache=None, slicer_draft=False):
     path = absolute_file(path) if draft is None else Path(path).absolute()
     value = state.load(path) if draft is None else copy.deepcopy(draft)
     require(isinstance(value, dict), "Contract must be an object")
+    require("slicer_draft" not in value or (slicer_draft and draft is not None and value["slicer_draft"] is True),
+            "Slicer draft is not a lifecycle contract")
     require(not {"_amendment", "_contract_path", "_read_policy", "_setup_replacements", "_pending_replacement"} & value.keys(),
             "Contract cannot define internal state")
     if inherited_policy:
@@ -2379,13 +2394,14 @@ def contract(path, *, draft=None, pending_replacement=None, inherited_policy=(),
         for item in passes:
             state.text(item, "rubric pass")
     if value["workflow"] == "ship":
-        snapshot = absolute_file(value.get("approved_snapshot"), value)
-        require(snapshot.resolve().is_relative_to(path.parent.resolve()), "Approved snapshot must be frozen inside run directory")
-        require(sha(snapshot) == value.get("plan_sha256"),
-                "Approved snapshot hash mismatch")
-        require(sha(absolute_file(value.get("plan_path"), value)) == value["plan_sha256"],
-                "Approved plan changed before completion")
+        if not slicer_draft and not slicer.validate_binding(state, path, value, read_policy(value)):
+            snapshot = absolute_file(value.get("approved_snapshot"), value)
+            require(snapshot.resolve().is_relative_to(path.parent.resolve()), "Approved snapshot must be frozen inside run directory")
+            require(guarded_sha(snapshot, value) == value.get("plan_sha256"), "Approved snapshot hash mismatch")
+            require(guarded_sha(absolute_file(value.get("plan_path"), value), value) == value["plan_sha256"],
+                    "Approved plan changed before completion")
     else:
+        require(not {"slicer_proposals", "slicer_telemetry"} & value.keys(), "Slicer requires a ship contract")
         brief = value.get("acceptance", {})
         for field in ("original_scenario", "expected_behavior", "non_goals"):
             state.text(brief.get(field), field)
@@ -2432,7 +2448,8 @@ def contract(path, *, draft=None, pending_replacement=None, inherited_policy=(),
         value["_pending_replacement"] = True
     for repo in repos:
         entries = value.get("deliverables", {}).get(repo, [])
-        if any(delivery_scope(entry) and delivery_scope(entry)["scope"] == "slice" for entry in entries):
+        if not slicer_draft and any(delivery_scope(entry) and delivery_scope(entry)["scope"] == "slice"
+                                    for entry in entries):
             declaration = value.get("slice_schedules", {}).get(repo)
             require(isinstance(declaration, dict), "Slice deliverable needs an approved slice schedule")
             checked_slice_schedule(value, repo, declaration.get("path"), lineage_cache=lineage_cache)
@@ -3586,6 +3603,9 @@ def audit_slice_history(contract_path, repo, slice_id, *, inherited_policy=(), v
     require(old.get("schema_version") == VERSION and old.get("workflow") in {"ship", "fix"}
             and source.parent.name == old.get("run_id") and repo in old.get("repos", []),
             "Invalid historical slice contract")
+    require("slicer_draft" not in old, "Slicer draft is not a lifecycle contract")
+    if old["workflow"] == "ship":
+        slicer.validate_binding(state, source, old, read_policy(old), historical=True)
     if old.get("setup_replacement") is not None:
         replacement_chain(old, source)
         pending = reserve_predecessors(old, source, guarded_sha(source, old), old)
@@ -4752,6 +4772,7 @@ def accept_review_findings(contract_path, value, repo, events, request, final, s
 
 def transition(contract_path, repo, request_path, out):
     value = contract(contract_path)
+    slicer.require_setup(state, Path(contract_path), value, read_policy(value))
     require_unreserved(value, contract_path, repo)
     require(repo in value["repos"], "Unknown transition repo")
     check_related_budgets(value, repo, contract_path)
@@ -5579,9 +5600,10 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     final review/fix budget over the whole repo diff.
     """
     value = contract(contract_path)
+    slicer.require_setup(state, Path(contract_path), value, read_policy(value))
     require_unreserved(value, contract_path, repo)
-    plan = slice_schedule(contract_path, repo, schedule_path)
-    items = {i["id"]: i for i in state.load(absolute_file(schedule_path))["slices"]}
+    schedule, plan = checked_slice_schedule(value, repo, schedule_path)
+    items = {i["id"]: i for i in schedule["slices"]}
     require(slice_id in items, "Unknown slice")
     continuity = budget_continuity(value, repo, contract_path, slice_id)
     item = items[slice_id]
@@ -6124,9 +6146,9 @@ def slice_gate(contract_path, repo, schedule_path, initial_path, source_path, ou
 def prepare_slice_gate(contract_path, repo, schedule_path, initial_path, source_path, amendment_path=None):
     """Certify that every slice is accepted, current and not stale before the repo-level lifecycle starts."""
     value = contract(contract_path)
+    slicer.require_setup(state, Path(contract_path), value, read_policy(value))
     require_unreserved(value, contract_path, repo)
-    plan = slice_schedule(contract_path, repo, schedule_path)
-    schedule = state.load(absolute_file(schedule_path))
+    schedule, plan = checked_slice_schedule(value, repo, schedule_path)
     initial = manifest(value, repo, initial_path)
     names = source_names(value, repo)
     root = Path(contract_path).parent / repo / "slices"
@@ -6454,9 +6476,9 @@ def batches(contract_path, repo):
 def batch_start(contract_path, repo, schedule_path, members, base_path, baseline_dir, scope, out):
     """Open one shared-checkout write window for a computed group; the orchestrator alone calls this."""
     value = contract(contract_path)
+    slicer.require_setup(state, Path(contract_path), value, read_policy(value))
     require_unreserved(value, contract_path, repo)
-    plan = slice_schedule(contract_path, repo, schedule_path)
-    schedule = state.load(absolute_file(schedule_path))
+    schedule, plan = checked_slice_schedule(value, repo, schedule_path)
     require(sorted(members) == sorted(next((g for g in plan["groups"] if set(members) <= set(g)), [])),
             "Members must be exactly one computed schedule group")
     by_id = {i["id"]: i for i in schedule["slices"]}
@@ -6488,7 +6510,7 @@ def batch_barrier(contract_path, repo, schedule_path, start_path, manifest_path,
     """Close a write window: all writers stopped, every change attributed to exactly one member, nothing else moved."""
     value = contract(contract_path)
     require_unreserved(value, contract_path, repo)
-    plan = slice_schedule(contract_path, repo, schedule_path)
+    _, plan = checked_slice_schedule(value, repo, schedule_path)
     start = state.load(absolute_file(start_path))
     bound(value, repo, start)
     check_seals(start["artifact_hashes"])
@@ -6700,7 +6722,9 @@ def checked_slice_schedule(value, repo, schedule_path, *, lineage_cache=None):
     """Validate the sealed schedule in the caller's contract and read policy."""
     require(repo in value["repos"], "Unknown slice repo")
     path = absolute_file(schedule_path, value)
-    schedule = state.load(path)
+    content = guarded_bytes(path, value)
+    schedule_hash = hashlib.sha256(content).hexdigest()
+    schedule = json.loads(content)
     require(isinstance(schedule, dict) and schedule.get("schema_version") == VERSION
             and schedule.get("run_id") == value["run_id"] and schedule.get("repo") == repo,
             "Slice schedule is not bound to this run/repo")
@@ -6708,7 +6732,7 @@ def checked_slice_schedule(value, repo, schedule_path, *, lineage_cache=None):
     require(schedule.get("approved") is True, "Slice schedule is not explicitly approved")
     timestamp(schedule.get("approved_at"))
     declared = value.get("slice_schedules", {}).get(repo)
-    require(isinstance(declared, dict) and declared.get("path") == str(path) and declared.get("sha256") == sha(path),
+    require(isinstance(declared, dict) and declared.get("path") == str(path) and declared.get("sha256") == schedule_hash,
             "Approved slice schedule must be declared in the contract with its hash")
     concurrency = schedule.get("max_parallel", 1)
     require(type(concurrency) is int and 1 <= concurrency <= 3, "max_parallel must be an integer from 1 to 3")
@@ -6810,7 +6834,7 @@ def checked_slice_schedule(value, repo, schedule_path, *, lineage_cache=None):
                     batch.append(candidate)
                     pending.remove(candidate)
             groups.append(batch)
-    return schedule, {"groups": groups, "cross_slice_criteria": sorted(cross), "schedule_sha256": sha(path)}
+    return schedule, {"groups": groups, "cross_slice_criteria": sorted(cross), "schedule_sha256": schedule_hash}
 
 
 def gate_budget_certificate(contract_path, value, repo, events, *, lineage_cache=None):
@@ -6877,6 +6901,9 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
         inherited_policy = (*inherited_policy, (value["repo_paths"][repo], read_excludes))
     value = with_read_policy(value, inherited_policy)
     guard_path(contract_file, value)
+    require("slicer_draft" not in value, "Slicer draft is not a lifecycle contract")
+    if value["workflow"] == "ship":
+        slicer.validate_binding(state, contract_file, value, read_policy(value), historical=True)
     if value.get("setup_replacement") is not None:
         replacement_chain(value, contract_file)
         pending = reserve_predecessors(value, contract_file, guarded_sha(contract_file, value), value,
@@ -7739,6 +7766,7 @@ def phase_from_flags(contract_path, out, *, phase_id, phase, event, repo=None, s
 
 def phase_from_record(contract_path, record, out):
     value = contract(contract_path)
+    slicer.require_setup(state, Path(contract_path), value, read_policy(value))
     require(isinstance(record, dict), "Telemetry request must be an object")
     require("checkpoint_sha256" not in record, "Checkpoint hash is generated by phase")
     require_unreserved(value, contract_path, record.get("repo"))
@@ -7752,6 +7780,7 @@ def phase_from_record(contract_path, record, out):
     identifier = record.get("phase_id")
     require(isinstance(identifier, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", identifier)
             and identifier not in {".", ".."}, "Invalid phase ID")
+    require(not identifier.startswith(slicer.PREFIX), "Reserved slicer phase ID")
     require(record.get("repo") in value["repos"] or record.get("repo") is None, "Unknown phase repo")
     timestamp(record.get("at"))
     explicit_session = record.get("session_id")
@@ -7769,10 +7798,9 @@ def phase_from_record(contract_path, record, out):
     if slice_id is not None:
         state.relative_path(slice_id)
         require(record.get("repo") in value.get("slice_schedules", {}), "Slice telemetry requires a scheduled repo")
-        schedule = value["slice_schedules"][record["repo"]]
-        slice_schedule(contract_path, record["repo"], schedule.get("path"))
-        require(any(item.get("id") == slice_id for item in state.load(schedule["path"])["slices"]),
-                "Unknown telemetry slice")
+        declaration = value["slice_schedules"][record["repo"]]
+        schedule, _ = checked_slice_schedule(value, record["repo"], declaration.get("path"))
+        require(any(item.get("id") == slice_id for item in schedule["slices"]), "Unknown telemetry slice")
     repair = (value.get("telemetry_policy", {}).get("repair_phase_required", False)
               and record["phase"] in {"review-fix", "gate-fix"} and not value.get("from_review")
               and slice_id is None)

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- Record slicer proposals before sealing the contract and bind the approved schedule to their telemetry and inputs.
+
 ## v1.8.0 - 2026-11-27
 
 ### New Features

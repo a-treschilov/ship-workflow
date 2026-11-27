@@ -139,7 +139,7 @@ def compact(report):
     for phase in telemetry.get("phases", []):
         usage = phase.get("usage") or {}
         label = " / ".join(str(x) for x in (phase.get("phase"), phase.get("repo"), phase.get("round")) if x is not None)
-        applicable = phase.get("phase") in {"implement", "review-fix", "gate-fix", "review", "checker"}
+        applicable = phase.get("phase") in {"implement", "review-fix", "gate-fix", "review", "checker", "slicer"}
         metric = lambda key: number(usage.get(key)) if applicable else "н/п"
         values = [label, phase.get("status"), (", ".join(phase.get("models") or []) or "неизвестно") if applicable else "—",
                   (phase.get("usage_source") or "неизвестно") if applicable else "не LLM-фаза", metric("input_tokens"),

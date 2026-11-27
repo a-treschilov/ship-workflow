@@ -105,6 +105,9 @@ A run lives in a unique directory under `plans/.ship-runs/` or `plans/.fix-runs/
 For new runs, `init-run` exclusively creates the directory and atomically publishes valid metadata. `validate-run`
 records a run-wide setup phase around contract and slice-schedule validation, including failures; it does not
 assert that preflight or any project check passed. `validate-contract` remains read-only for historical runs.
+For large ship plans, slicer proposal boundaries bind the draft, plan snapshot and run metadata before the
+human-approved schedule and proposal evidence are sealed into the final contract. Runs with slicer telemetry
+cannot participate as either side of setup-only replacement.
 Setup-only runs can be closed with a sealed replacement binding. The successor retains the original setup
 artifacts and independently accounts for all lifecycle predecessor budgets. The closure does not certify work.
 The read-only replacement check audits the proposed successor without publishing it. A successful check returns

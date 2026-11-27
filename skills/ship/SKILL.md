@@ -60,15 +60,14 @@ never reset its budget or treat a new directory as a fresh result.
 Also search `plans/.fix-runs/` and inspect legacy descriptions for related work. Assign each repo a stable
 `budget_work_items` identifier in the contract, reuse it for related ship/fix runs, and resolve ambiguous legacy
 matches with the user. Follow the protocol for multi-history recovery before dispatch or completion.
-Create exclusive RUN_DIR and valid run.json with the protocol's `init-run` helper, then write the immutable approved-plan snapshot,
-per-repo excerpts and v2 contract.json per protocol. Excerpts include selected repo work plus cross-cutting
+Create exclusive RUN_DIR and valid run.json with the protocol's `init-run` helper, then prepare the immutable approved-plan snapshot,
+per-repo excerpts and complete v2 contract fields per protocol. Excerpts include selected repo work plus cross-cutting
 constraints/verification; referenced cross-repo sections are accessible in the snapshot. Store actual
 session ID or empty string. repo_paths refer to existing assigned sibling repos; no new worktrees.
 New contracts include `telemetry_policy: {"repair_phase_required": true, "end_reason_required": true, "run_local_seals": true}` explicitly, and `"author_rotation": "capsule"` (omit only with `--no-rotation`, which writes `"resume"`).
 Declare empirical checks as `argv` lists where practical, and run each new pre-review/preflight command once
 before implementation. On any non-passed phase-end record `end_reason` (use `unknown` when not established).
-Validate each new run with the protocol's `validate-run` helper so setup success or failure is recorded before preflight. If a frozen setup-only contract cannot express the approved plan, follow the protocol's `replace-setup`
-procedure and carry every actual predecessor's budget and history into the new contract. No approved requirement edits during execution. Approved plans tag repo
+Approved plans tag repo
 ownership via subsection headings under `## Changes` / `## Implementation` (e.g. `### 1. Backend
 (\`server/\`) — …`); grep heading lines for a repo name (backtick-quoted directory or plain prose) to build
 each repo's `PLAN_EXCERPT` = cross-cutting sections (Context, Architecture, Verification,
@@ -76,10 +75,18 @@ Rollback/Out-of-scope, locked contracts) + only that repo's subsections. If a he
 unambiguously name exactly one repo, include it in every relevant repo's excerpt rather than guessing it
 out.
 If a repo's scope is too large for one bounded dispatch (many subsystems, shared files, a long plan excerpt, or
-earlier runs of the same stage were interrupted), spawn `slicer` (read-only; give REPO, REPO_PATH,
-PLAN_PATH, CONTRACT_PATH, PROTOCOL_PATH, RUN_DIR) before edits, show its table and get an explicit human
-decision with host's user-input capability. Only an approved schedule is used (protocol "Slice schedule"); never
-slice without that approval. Then drive each slice (dependency order; a computed multi-member group runs as one parallel batch per protocol "Parallel batches", otherwise one at a time) through `slice-transition` — implement, pre-review, fresh slice review, fixes by that slice's author, accepted — then run `slice-gate`, and only then the normal repo lifecycle over the whole diff with a fresh final review (protocol "Slice lifecycle and final integration review"). Use a fresh `implementer` per slice,
+earlier runs of the same stage were interrupted), follow the protocol's “Slice schedule” procedure before
+writing `contract.json` or editing source. Save the complete `slicer-draft.json`. Around each fresh read-only
+`slicer` dispatch use `slicer-proposal` with the actual host IDs and result. Pass REPO, REPO_PATH, PLAN_PATH
+(the approved snapshot), CONTRACT_DRAFT_PATH, PROTOCOL_PATH, RUN_DIR and the exact read exclusions.
+Show the recorded proposal and get an explicit human decision through the host's user-input capability.
+Resolve changes and obtain approval on the exact final schedule. Publish once with `seal-slicer-contract`,
+covering every dispatched repo. For ordinary runs without a slicer dispatch, write the v2 contract directly.
+Validate each published contract with `validate-run` before preflight. Follow `replace-setup` only where the
+protocol permits it, carrying every actual predecessor's budget and history. No approved requirement edits
+during execution.
+
+Drive each approved slice (dependency order; a computed multi-member group runs as one parallel batch per protocol "Parallel batches", otherwise one at a time) through `slice-transition` — implement, pre-review, fresh slice review, fixes by that slice's author, accepted — then run `slice-gate`, and only then the normal repo lifecycle over the whole diff with a fresh final review (protocol "Slice lifecycle and final integration review"). Use a fresh `implementer` per slice,
 passing the slice's write_scope, interfaces and predecessors' checkpoints, not the whole excerpt history.
 At a slice review cap, use `review-budget --slice SLICE`, present every finding and offer the same three decisions
 as for repo review. Record acceptance through `slice-transition` as described in the protocol.
@@ -110,7 +117,7 @@ every spawn/resume prompt. Require its completion matrix. Record its instance ID
 Each repair receives all open findings, effective amendments, the latest matrix and selected deliverable snapshot manifest. For repo review-fix, use review-fix-next below to select the author. For other repairs follow protocol "Author rotation". Before every spawn or resume run `ship_artifacts.py init-task` as its own helper call. After the author returns, seal its capsule with `ship_artifacts.py --task TASK_PATH capsule DRAFT.json --agent-id ACTUAL_ID`. Repeat the helper-call invariant in every message.
 
 Dispatch implementer, reviewer and checker through the host adapter's agent capability with explicit absolute inputs and task context; record the returned agent ID and correlation metadata. Every spawn runs with fresh context using the confirmed host mechanism; all required context is passed as files and paths, not chat history. Host-specific agent configuration selects the model. Do not request worktree isolation: the project root is not necessarily a Git repository, and author continuation requires agents to share the original source. On dispatch failure, stop and report the exact error; never substitute a model or launch a nested agent runner.
-Wrap every spawn/resume/gate/checkpoint wait with protocol phase telemetry. Write each boundary with the helper's flag form, for example `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py phase --contract CONTRACT --repo REPO --phase-id ID --phase review --event phase-start --out RUN_DIR/telemetry/ID-start.json` and the matching `--event phase-end --status passed|failed|blocked|interrupted --end-reason ...`; omit `--at` (the helper uses now) and `--session-id` (it reads `CODEX_SESSION_ID`/`CODEX_THREAD_ID`). Do not build phase JSON with `apply_patch` and do not call a clock tool for `at`. Wait for the actual phase result using the host adapter's supported wait form and longest supported timeout; do not poll in short loops. Record actual agent/correlation
+Wrap every post-setup spawn/resume/gate/checkpoint wait with protocol phase telemetry. Write each boundary with the helper's flag form, for example `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py phase --contract CONTRACT --repo REPO --phase-id ID --phase review --event phase-start --out RUN_DIR/telemetry/ID-start.json` and the matching `--event phase-end --status passed|failed|blocked|interrupted --end-reason ...`; omit `--at` (the helper uses now) and `--session-id` (it reads `CODEX_SESSION_ID`/`CODEX_THREAD_ID`). Do not build phase JSON with `apply_patch` and do not call a clock tool for `at`. Wait for the actual phase result using the host adapter's supported wait form and longest supported timeout; do not poll in short loops. Record actual agent/correlation
 IDs on phase-end; unknown IDs stay unknown. Record actual original_agent_id on implemented.
 For every newly dispatched repair use a new unique phase_id: phase-start before the host's continuation capability (or before the fresh spawn) to the current author →
 wait for the specific actual result (delivery acknowledgement is not completion) → phase-end with actual

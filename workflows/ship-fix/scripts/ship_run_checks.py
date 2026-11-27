@@ -313,4 +313,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise SystemExit(f"Blocked: {error}") from error

@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-AGENT_PHASES = {"implement", "review-fix", "gate-fix", "review", "checker"}
+AGENT_PHASES = {"implement", "review-fix", "gate-fix", "review", "checker", "slicer"}
 
 
 def read(path):

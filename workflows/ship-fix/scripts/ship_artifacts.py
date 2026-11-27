@@ -597,6 +597,7 @@ def init_task(args):
     guarded = state.guard_excluded_paths(Path(args.contract).absolute(), policies, pinned=bool(policies))
     contract_path = str(guarded if policies else guarded.resolve())
     contract = workflow.contract(contract_path)
+    workflow.slicer.require_setup(state, Path(contract_path), contract, workflow.read_policy(contract))
     require(args.repo in contract["repos"], f"Unknown repo: {args.repo}")
     workflow.require_unreserved(contract, contract_path, args.repo)
     for path in (args.touched, args.baseline, args.evidence_dir, args.out):
@@ -610,9 +611,14 @@ def init_task(args):
     require(bool(args.findings) == bool(args.round_dir), "--findings and --round-dir go together")
     if args.slice:
         require(args.schedule, "--slice needs --schedule")
-        plan = state.load(Path(args.schedule).resolve())
-        item = next((entry for entry in plan["slices"] if entry["id"] == args.slice), None)
-        require(item, f"Unknown slice: {args.slice}")
+        if "slicer_proposals" in contract:
+            declared = contract["slice_schedules"].get(args.repo)
+            require(declared and declared["path"] == args.schedule, "--schedule needs the exact approved schedule")
+            item = workflow.selected_slice(contract, args.repo, args.slice, args.schedule)
+        else:
+            plan = state.load(Path(args.schedule).resolve())
+            item = next((entry for entry in plan["slices"] if entry["id"] == args.slice), None)
+            require(item, f"Unknown slice: {args.slice}")
         write_scope = item["write_scope"]
     else:
         # Repo-level writes are bounded by the scope file and touched list, not by a pattern here.

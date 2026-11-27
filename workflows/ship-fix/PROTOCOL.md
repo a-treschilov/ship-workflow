@@ -616,12 +616,48 @@ not invent an applied result. Counters/rounds stay monotonic.
 
 ### Slice schedule (optional, large repo scope)
 
-For a repo scope too large for one bounded implementer dispatch, `slicer` (read-only) proposes slices and
-a human approves them before any source edit. The orchestrator saves the proposal, shows the table (id,
-depends_on, parallel, write_scope, criteria, interfaces, unknowns), asks via host's user-input capability
-(approve / change / do not slice), and on approval writes immutable `RUN_DIR/slices-approved.json`:
-`{schema_version, run_id, repo, approved: true, approved_by, approved_at, max_parallel (1-3, default 1), slices,
-cross_slice_criteria}` and declares `slice_schedules: {repo: {path, sha256}}` in contract.json. Validate with
+For a repo scope too large for one bounded implementer dispatch, prepare slicing in an initialized ship run
+before publishing `contract.json` or editing source.
+
+1. Save the complete v2 contract fields to `RUN_DIR/slicer-draft.json`, with `slicer_draft: true` and without
+   `slice_schedules`, `slicer_proposals` or `slicer_telemetry`. `plan_path` is the original path from `run.json`, and
+   `approved_snapshot` is a separate, byte-identical run-local file with the same `plan_sha256`. Freeze the draft
+   and inputs before the first dispatch. A slicer draft is refused by ordinary contract helpers. Every command
+   below takes inline `--read-policy` JSON for the complete declared and inherited read exclusions, in the
+   same `repo_paths`/`read_excludes` form as the draft (use `'{}'` when there are none).
+2. Record the start using `ship_state.py slicer-proposal --run-dir RUN_DIR --read-policy READ_POLICY_JSON
+   --repo REPO --attempt-id ID --event start`. Start checks the draft fields used for slicing and seals the byte
+   hashes of `run.json`, the draft, and approved plan. Dispatch a fresh read-only `slicer` only after this call
+   succeeds. Pass the exact snapshot and draft paths, repo identity, run and protocol paths, and read exclusions.
+3. Save the returned proposal JSON to a run-local input file. Record the end with the same run, repo, attempt
+   and session using `--event end --status passed --agent-id AGENT_ID --result RESULT_PATH` and, when available,
+   `--tool-use-id TOOL_ID`. The helper writes exclusive start/end events under `RUN_DIR/telemetry/` with phase
+   ID `slicer-proposal-ID`. The end binds the start SHA-256 and embeds the returned JSON. For a failed, blocked or
+   interrupted dispatch use the observed status and `--end-reason` with known IDs. If the end helper fails,
+   correct the input and retry the same end before dispatching again. Leave existing boundaries intact. A new
+   dispatch uses a fresh attempt ID and the same frozen inputs. Missing or changed inputs and incomplete pairs
+   block sealing. If exact inputs cannot be restored, preserve the run and prepare a fresh one.
+4. Show the recorded result and table (id, depends_on, parallel, write_scope, criteria, interfaces, unknowns).
+   Use the host's user-input capability to obtain an explicit decision to approve the exact schedule or proceed
+   unsliced. If the user requests changes, show the revised schedule and obtain fresh approval before sealing.
+   Write the approved schedule to an immutable run-local path, unique per repo, with
+   `{schema_version, run_id, repo, approved: true, approved_by, approved_at, max_parallel (1-3, default 1), slices,
+   cross_slice_criteria}`. Prepare a run-local decision JSON object keyed by dispatched repo. Each value contains
+   `decision` (`sliced` or `unsliced`), `phase_id` (`slicer-proposal-ID`), `end_sha256` (exact end file hash),
+   `approved_by: "user"`, `approved_at` (timezone-qualified), and `user_authorization` (the user's actual decision,
+   quote or attributable reference). A `sliced` decision also includes `schedule: {path, sha256}` of the exact
+   approved schedule, whose approval fields must match. For `unsliced`, omit `schedule`.
+5. Publish with `ship_state.py seal-slicer-contract --run-dir RUN_DIR --read-policy READ_POLICY_JSON
+   --decisions DECISIONS_PATH`. The helper validates the completed pairs, selected passed proposal per
+   dispatched repo, exact draft/plan/metadata hashes, decisions and approved schedules before exclusive
+   publication. It embeds the decisions as `slicer_proposals`, all attempt end hashes as `slicer_telemetry`,
+   and the schedule paths and hashes as `slice_schedules`. All other contract fields come from the draft. Run `validate-run` on the published
+   contract before preflight. Work helpers require a passed setup pair and a seal for the published contract.
+   Proposal telemetry records a read-only agent dispatch. The existing non-setup telemetry rule excludes
+   runs with these boundaries as either predecessors or destinations in `replace-setup`. Older schedules
+   and contracts without slicer proposal artifacts retain their original validation rules.
+
+Validate and print execution groups with
 `python3 -I -B HELPER_PATH validate-slices --contract ... --repo ... --file slices-approved.json`; it prints
 the execution `groups` computed from depends_on (never from the proposal). Rules enforced there: every mandatory
 criterion has a contribution; criteria with several contributing slices are listed in `cross_slice_criteria`
@@ -1072,7 +1108,7 @@ fresh review and gates after every repair, with budgets unchanged.
 
 ## 6. Telemetry and historical compatibility
 
-Before/after each phase use `phase --contract ... --file INPUT --out RUN_DIR/telemetry/PHASE_ID-start.json`
+Before/after each phase after setup use `phase --contract ... --file INPUT --out RUN_DIR/telemetry/PHASE_ID-start.json`
 (or -end.json). Input: run_id, workflow, repo (null for run-wide checker), phase_id, phase, event
 phase-start/phase-end, at UTC. End adds status passed/failed/blocked/interrupted and, when known,
 `end_reason` (done|context|api-error|user-stop|timeout|unknown) and an absolute `checkpoint_path` of the last
@@ -1087,8 +1123,9 @@ RUN_DIR and the assigned repos (stage-05's certificate sealed the live `stage-05
 invalidated it). Contracts with `telemetry_policy.end_reason_required: true` (optional boolean) require end_reason on every
 non-passed phase end. Include actual agent_id,
 tool_use_id/message IDs, session_id, round/attempt when available; never guess. Start may precede knowing
-agent_id; put it on end. Start hash binds end. Phases: setup, preflight, implement, pre-review, review, review-fix,
-gate-fix, checker, gates, checkpoint-wait. The `setup` phase is written only by `validate-run` and does not
+agent_id; put it on end. Start hash binds end. Phases: slicer, setup, preflight, implement, pre-review, review, review-fix,
+gate-fix, checker, gates, checkpoint-wait. The `slicer` phase is written only by `slicer-proposal` before
+contract publication. The `setup` phase is written only by `validate-run` and does not
 prove preflight or any check passed. Capture phases for resumed agents too, not just fresh spawns. Tool-level wait calls (waiting for an agent result, status checks) are not phases and emit no phase-start/phase-end events; only the workflow stages listed above emit phase events.
 
 ### Resumed repairs: record the actual envelope
