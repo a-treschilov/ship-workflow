@@ -4,6 +4,7 @@
 
 ### Bug Fixes
 
+- Report every required check in both runner entry points and distinguish selected-check batch results from phase status.
 - Record slicer proposals before sealing the contract and bind the approved schedule to their telemetry and inputs.
 
 ## v1.8.0 - 2026-11-27

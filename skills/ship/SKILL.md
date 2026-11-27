@@ -140,7 +140,8 @@ Run independent pre-review checks before the first expensive review. Run all fin
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_run_checks.py gates --contract CONTRACT --repo REPO --scope SCOPE --out-dir DIR --phase-id ID`
 call; it writes phase telemetry and prints results per check. For unsupported checks follow the reported
 independent execution or inspection action and record evidence. An `--ids` subset has its own exit status and
-does not pass the complete gates phase. Prepare helper packet or revision scoped diff/untracked files.
+does not pass the complete gates phase. Batch output labels selected-check results and reports each phase status.
+The `checks --group required_gates` form also reports every required ID. Prepare helper packet or revision scoped diff/untracked files.
 Fresh reviewer gets scope, baselines/base, contract/excerpt, manifests/deltas
 and all prior findings/applied files. Validate stable review and transition needs-fix/reviewed. Use review-fix-next for repo review fixes; read its immutable results before transition. Every edit requires pre-review,
 fresh review and final gates again; counters never reset. Review Suggestions and perform final review.

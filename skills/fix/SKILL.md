@@ -151,6 +151,8 @@ pre-review/fresh review/final gates, including previously green affected checks.
 remain unverified. All final independent gates are executed by orchestrator, not claimed from agent checks.
 For unsupported gates follow the runner's independent execution or inspection action and record evidence.
 An `--ids` subset has its own exit status and does not pass the complete gates phase.
+Batch output labels selected-check results and reports each phase status. The `checks --group required_gates`
+form also reports every required ID.
 Multi-repo checkpoint requires human Proceed/Stop/Redo after a clean report; blockers never offer Proceed.
 Single-repo skips pause, not validation. Keep scope confined to original brief and necessary regression fixes.
 

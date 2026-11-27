@@ -374,8 +374,39 @@ class CheckTests(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stderr)
         for repo in ("api", "web"):
-            self.assertIn(f"gates {repo}: passed; phase blocked", result.stdout)
+            self.assertIn(f"gates {repo}: selected checks passed; phase blocked", result.stdout)
             self.assertEqual("blocked", state.load(self.run_dir / f"telemetry/{repo}-gates-1-end.json")["status"])
+        self.assertIn("selected checks passed in 2/2 repos", result.stdout)
+
+    def test_required_checks_cli_accounts_for_all_ids(self):
+        legacy = {"id": "gate.legacy", "kind": "empirical", "command": "false", "verification": "exit zero"}
+        static = {"id": "gate.static", "kind": "static", "verification": "inspect"}
+        cases = [
+            ("command", [legacy], [], 1, ["gate.legacy: unsupported"]),
+            ("mixed", [self.entry("gate.one"), legacy], [], 1, ["gate.one: passed", "gate.legacy: unsupported"]),
+            ("full", [self.entry("gate.one"), self.entry("gate.two")], [], 0, ["gate.one: passed", "gate.two: passed"]),
+            ("subset", [self.entry("gate.one"), self.entry("gate.two")], ["--ids", "gate.one"], 0,
+             ["gate.one: passed", "gate.two: not-selected"]),
+            ("static", [static], [], 1, ["gate.static: unsupported", "inspection independently"]),
+            ("stop", [self.entry("gate.fail", "raise SystemExit(23)"), self.entry("gate.later")],
+             ["--stop-on-fail"], 1, ["gate.fail: failed", "gate.later: not-run"]),
+        ]
+        for name, entries, extra, code, expected in cases:
+            with self.subTest(name=name):
+                self.contract["required_gates"]["api"] = entries
+                self.persist()
+                out = self.run_dir / ("checks-" + name)
+                result = subprocess.run([sys.executable, "-I", "-B", str(RUNNER_SCRIPT), "checks",
+                    "--contract", str(self.path), "--repo", "api", "--scope", self.scope,
+                    "--out-dir", str(out), "--group", "required_gates", *extra], capture_output=True, text=True)
+                self.assertEqual(code, result.returncode, result.stderr)
+                for text in expected:
+                    self.assertIn(text, result.stdout)
+                if name in {"command", "mixed"}:
+                    self.assertIn("record evidence with record-evidence", result.stdout)
+                    self.assertFalse((out / "gate.legacy-record.json").exists())
+                if name == "mixed":
+                    self.assertTrue((out / "gate.one-record.json").exists())
 
     def write_scope_files(self, directory):
         directory.mkdir(exist_ok=True)

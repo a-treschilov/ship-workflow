@@ -79,7 +79,8 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
     policies = workflow.read_policy(contract)
     workflow.state.guard_excluded_paths(Path(out_dir).absolute(), policies)
     source_scope = workflow.scope_input(Path(scope).absolute(), contract)
-    checks = [c for c in contract[group][repo] if "argv" in c and (not wanted or c["id"] in wanted)]
+    checks = [c for c in contract[group][repo] if "argv" in c
+              and (c["id"] in wanted or (not wanted and progress is None))]
     if wanted and {c["id"] for c in checks} != wanted:
         raise SystemExit("Unknown or non-argv check id requested")
     out_dir = workflow.guarded_resolve(Path(out_dir).absolute(), contract)
@@ -147,7 +148,8 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
                    "--repo", repo, "--file", str(inp), "--out", str(out_dir / f"{cid}-record.json")])
         note = (rec.stdout + rec.stderr).strip().splitlines()[-1:] or [""]
         results[cid] = (done.returncode, note[0])
-        print(f"{cid}: exit={done.returncode} {note[0]}", flush=True)
+        if progress is None:
+            print(f"{cid}: exit={done.returncode} {note[0]}", flush=True)
         if rec.returncode != 0:
             raise SystemExit(f"{cid}: record-evidence refused: {note[0]}")
         if progress is not None:
@@ -158,13 +160,7 @@ def run_group(contract_path, contract, repo, scope, out_dir, group, wanted, stop
     return results
 
 
-def gates(contract_path, repo, scope, out_dir, phase_id, ids="", stop_on_fail=False,
-          session_id=None, at=None):
-    contract = json.loads(Path(contract_path).read_text())
-    if repo not in contract["repo_paths"]:
-        raise SystemExit("Unknown repo")
-    workflow = workflow_module()
-    wanted = {i for i in ids.split(",") if i}
+def required_results(contract, repo, wanted):
     checks = contract["required_gates"][repo]
     available = {check["id"] for check in checks}
     if not wanted <= available:
@@ -183,6 +179,28 @@ def gates(contract_path, repo, scope, out_dir, phase_id, ids="", stop_on_fail=Fa
                           "Perform the declared inspection independently and record evidence with record-evidence")
                 entry.update(status="unsupported", action=action)
         gate_results[cid] = entry
+    return selected, gate_results
+
+
+def report_required(gate_results, stop_on_fail):
+    if stop_on_fail and any(result["status"] == "failed" for result in gate_results.values()):
+        for result in gate_results.values():
+            if result["status"] == "not-run":
+                result["reason"] = "stopped after a failed check"
+    for cid, result in gate_results.items():
+        print(f"{cid}: {result['status']} exit={result['exit_code']} "
+              f"{result.get('action', result.get('reason', ''))}".rstrip(), flush=True)
+
+
+def gates(contract_path, repo, scope, out_dir, phase_id, ids="", stop_on_fail=False,
+          session_id=None, at=None):
+    contract = json.loads(Path(contract_path).read_text())
+    if repo not in contract["repo_paths"]:
+        raise SystemExit("Unknown repo")
+    workflow = workflow_module()
+    wanted = {i for i in ids.split(",") if i}
+    checks = contract["required_gates"][repo]
+    selected, gate_results = required_results(contract, repo, wanted)
     workflow.mark_work_started(contract_path, repo)
     run_dir = Path(contract_path).resolve().parent
     start_path = run_dir / "telemetry" / f"{phase_id}-start.json"
@@ -194,20 +212,12 @@ def gates(contract_path, repo, scope, out_dir, phase_id, ids="", stop_on_fail=Fa
         results = run_group(contract_path, contract, repo, scope, out_dir, "required_gates", runnable, stop_on_fail,
                             progress=gate_results) if runnable else {}
     except (Exception, SystemExit):
-        for cid, result in gate_results.items():
-            print(f"{cid}: {result['status']} exit={result['exit_code']} "
-                  f"{result.get('action', result.get('reason', ''))}".rstrip(), flush=True)
+        report_required(gate_results, stop_on_fail)
         workflow.phase_from_flags(contract_path, str(end_path), phase_id=phase_id, phase="gates",
                                   event="phase-end", repo=repo, status="blocked",
                                   end_reason="unknown", session_id=session_id, gate_results=gate_results)
         raise
-    if stop_on_fail and any(result["status"] == "failed" for result in gate_results.values()):
-        for result in gate_results.values():
-            if result["status"] == "not-run":
-                result["reason"] = "stopped after a failed check"
-    for cid, result in gate_results.items():
-        if result["status"] in {"unsupported", "not-selected", "not-run"}:
-            print(f"{cid}: {result['status']} {result.get('action', result.get('reason', ''))}".rstrip(), flush=True)
+    report_required(gate_results, stop_on_fail)
     selected_passed = all(gate_results[cid]["status"] == "passed" for cid in selected)
     statuses = {entry["status"] for entry in gate_results.values()}
     phase_status = "failed" if "failed" in statuses else "passed" if statuses == {"passed"} else "blocked"
@@ -251,12 +261,16 @@ def gates_all_repos(contract_path, repos, scope_dir, out_dir, phase_id_template=
             status = "blocked"
             phase_status = "blocked"
         results[repo] = status
-        print(f"gates {repo}: {status}; phase {phase_status}", flush=True)
+        label = f"selected checks {status}" if ids else status
+        print(f"gates {repo}: {label}; phase {phase_status}", flush=True)
         if status != "passed" and stop_on_fail:
             break
     passed = sum(1 for value in results.values() if value == "passed")
     overall = "passed" if passed == len(results) else "failed"
-    print(f"gates: {passed}/{len(results)} repos passed", flush=True)
+    if ids:
+        print(f"gates: selected checks passed in {passed}/{len(results)} repos", flush=True)
+    else:
+        print(f"gates: {passed}/{len(results)} repos passed", flush=True)
     return results, overall
 
 
@@ -306,6 +320,21 @@ def main():
     if not args.repo or not args.scope:
         raise SystemExit("checks requires --repo and --scope")
     wanted = {i for i in args.ids.split(",") if i}
+    if args.group == "required_gates":
+        selected, gate_results = required_results(contract, args.repo, wanted)
+        runnable = {cid for cid in selected if gate_results[cid]["status"] == "not-run"}
+        try:
+            run_group(args.contract, contract, args.repo, args.scope, args.out_dir, args.group,
+                      runnable, args.stop_on_fail, deliverable_manifest=args.deliverable_manifest,
+                      slice_id=args.slice, schedule=args.schedule, progress=gate_results)
+        except (Exception, SystemExit):
+            report_required(gate_results, args.stop_on_fail)
+            raise
+        report_required(gate_results, args.stop_on_fail)
+        count = sum(result["status"] == "passed" for result in gate_results.values())
+        print(f"checks: {count}/{len(selected)} selected checks passed; "
+              f"{count}/{len(gate_results)} required checks passed", flush=True)
+        sys.exit(0 if all(gate_results[cid]["status"] == "passed" for cid in selected) else 1)
     results = run_group(args.contract, contract, args.repo, args.scope, args.out_dir,
                         args.group, wanted, args.stop_on_fail, deliverable_manifest=args.deliverable_manifest,
                         slice_id=args.slice, schedule=args.schedule)
