@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v1.8.1 - 2026-11-27
+
+### Improvements
+
+- Merge the latest main history into the release checkout before testing and publishing.
+
 ### Bug Fixes
 
 - Report every required check in both runner entry points and distinguish selected-check batch results from phase status.

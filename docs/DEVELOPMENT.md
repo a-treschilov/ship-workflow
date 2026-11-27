@@ -144,7 +144,8 @@ From the source checkout, invoke `/release vX.Y.Z` in Claude Code or `$release v
 The skill is part of the source checkout. Publishing uses the checkout's GitHub `origin` and authenticated
 Git and GitHub CLI access.
 
-1. Move the entries from `Unreleased` into a dated `vX.Y.Z` section in `CHANGELOG.md`.
+1. Fetch and merge `origin/main` into the source checkout, then move the entries from `Unreleased` into a dated
+   `vX.Y.Z` section in `CHANGELOG.md`.
 2. Verify that the release contents contain no project-specific names or paths, then commit them.
 3. The publisher runs `make test`, creates an annotated tag, installs that tag in a scratch project,
    and runs `agent_models.py check`. It fast-forwards GitHub `main` and pushes the tag atomically, then
