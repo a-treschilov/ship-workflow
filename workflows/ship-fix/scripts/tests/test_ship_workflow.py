@@ -1714,7 +1714,7 @@ class LifecycleTests(unittest.TestCase):
     def review(self, findings=None, dispositions=None):
         n = len([e for e in workflow.history(self.run / "api")
                  if e[2]["status"] in {"needs-fix", "reviewed"}
-                 and not e[2].get("budget_grant_applied")]) + 1
+                 and not e[2].get("budget_grant_applied") and not e[2].get("deferral_applied")]) + 1
         current = state.capture(self.repo, ["source.txt"])
         result = self.artifact(repo="api", round=n, source_fingerprint=current["fingerprint"], accepted=True,
             coverage={"read": ["source.txt"], "skipped": [], "mandatory_passes": [
@@ -2562,6 +2562,123 @@ class LifecycleTests(unittest.TestCase):
         self.move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests")])
         with self.assertRaisesRegex(ValueError, "Code-only"):
             self.move("verified", assessment_path="missing")
+
+    def test_review_deferral_decision_binding_and_eligibility(self):
+        from datetime import datetime, timezone
+        self.ready()
+        self.implement()
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Suggestion",
+                   "status": "new", "category": "Logic", "description": "additional log",
+                   "recommendation": "add log", "failure_scenario": "diagnosis takes longer",
+                   "verification_expectation": "inspect log", "criterion_ids": [],
+                   "verification_kind": "static"}
+        review_path = self.review([finding])
+        self.move("needs-fix", review_path=review_path)
+        events = workflow.history(self.run / "api")
+        previous_path, previous = events[-1][1:]
+        decision = self.artifact(
+            workflow="fix", contract_sha256=workflow.sha(self.contract), approved_by="user",
+            approval_question="Defer api-1?", user_authorization="Defer api-1", reason="Later task",
+            approved_at=datetime.now(timezone.utc).isoformat(), previous_state_path=str(previous_path),
+            previous_state_sha256=workflow.sha(previous_path), review_path=review_path,
+            review_sha256=workflow.sha(review_path), review_round=1, finding_id="api-1",
+            source_fingerprint=previous["source_fingerprint"])
+        final = workflow.manifest(self.c, "api", previous["source_manifest"])
+        path = self.save("deferral.json", decision)
+        self.assertEqual("api-1", workflow.validate_review_deferral(
+            self.contract, self.c, "api", events, path, final)[1]["finding_id"])
+        for index, changes in enumerate(({"approved_by": "reviewer"}, {"finding_id": "api-2"},
+                                         {"review_sha256": "wrong"}, {"source_fingerprint": "wrong"})):
+            invalid = self.save(f"deferral-invalid-{index}.json", {**decision, **changes})
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                workflow.validate_review_deferral(self.contract, self.c, "api", events, invalid, final)
+        result = self.move("reviewed-with-findings", review_deferral_path=path)
+        self.assertEqual(["api-1"], result["deferred_finding_ids"])
+        self.assertEqual(0, result["review_fix_count"])
+        self.assertEqual(1, result["latest_review_round"])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        with self.assertRaises(ValueError):
+            self.move("gates-passed", gate_evidence_paths=[])
+        self.move("gates-passed", gate_evidence_paths=[self.evidence("gate.tests")])
+        with self.assertRaises(ValueError):
+            self.move("verified", assessment_path=self.save("missing-proof.json", self.artifact(
+                producer="orchestrator", requirements_match=True, criteria=[])))
+        assessment = self.save("deferral-assessment.json", self.artifact(producer="orchestrator",
+            requirements_match=True, criteria=[{"criterion_id": "fix.ac-1", "implementation": "met",
+            "verification": "verified", "reason": "scenario verified", "evidence_paths": [self.evidence("fix.ac-1")]}]))
+        self.move("verified", assessment_path=assessment)
+        workflow.complete(self.contract, str(self.run / "completion.json"))
+        completion = state.load(self.run / "completion.json")["repos"]["api"]
+        self.assertEqual("Later task", completion["open_findings"][0]["deferral"]["reason"])
+        self.assertTrue(completion["review_deferrals"][0]["active"])
+
+    def test_deferral_mixed_findings_and_stale_source(self):
+        from datetime import datetime, timezone
+        self.ready()
+        self.implement()
+        suggestion = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Suggestion",
+                      "status": "new", "category": "Logic", "description": "additional log",
+                      "recommendation": "add log", "failure_scenario": "diagnosis takes longer",
+                      "verification_expectation": "inspect log", "criterion_ids": [], "verification_kind": "static"}
+        warning = {**suggestion, "id": "api-2", "severity": "Warning", "criterion_ids": ["fix.ac-1"]}
+        review_path = self.review([suggestion, warning])
+        self.move("needs-fix", review_path=review_path)
+        events = workflow.history(self.run / "api")
+        previous_path, previous = events[-1][1:]
+        decision = self.artifact(workflow="fix", contract_sha256=workflow.sha(self.contract), approved_by="user",
+            approval_question="Defer api-1?", user_authorization="Defer api-1", reason="Later task",
+            approved_at=datetime.now(timezone.utc).isoformat(), previous_state_path=str(previous_path),
+            previous_state_sha256=workflow.sha(previous_path), review_path=review_path,
+            review_sha256=workflow.sha(review_path), review_round=1, finding_id="api-1",
+            source_fingerprint=previous["source_fingerprint"])
+        path = self.save("mixed-deferral.json", decision)
+        with self.assertRaisesRegex(ValueError, "status"):
+            self.move("reviewed-with-findings", review_deferral_path=path)
+        original = self.source.read_text()
+        self.source.write_text("changed after review")
+        with self.assertRaisesRegex(ValueError, "source changed|Deferral source"):
+            self.move("needs-fix", review_deferral_path=path)
+        self.source.write_text(original)
+        result = self.move("needs-fix", review_deferral_path=path)
+        self.assertEqual(["api-1"], result["deferred_finding_ids"])
+        budget = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual(["api-1", "api-2"], budget["open_finding_ids"])
+        self.assertEqual(["api-2"], budget["repair_finding_ids"])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+        self.source.write_text("repair changed source\n")
+        applied = self.save("mixed-applied.json", self.artifact(round=1, applied=[],
+            failed=[{"id": "api-2", "reason": "still needs work"}],
+            skipped=[{"id": "api-1", "reason": "Later task"}]))
+        repaired = self.move("edited-unverified", action="review-fix", applied_path=applied)
+        self.assertNotIn("deferred_finding_ids", repaired)
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        next_review = self.review([{**suggestion, "status": "recurring"}, {**warning, "status": "recurring"}])
+        self.move("needs-fix", review_path=next_review)
+        budget = workflow.review_budget_status(self.contract, "api")
+        self.assertEqual(["api-1", "api-2"], budget["open_finding_ids"])
+        self.assertEqual("valid", workflow.validate_history(self.contract, "api")["status"])
+
+    def test_deferral_rejects_suggestion_linked_to_mandatory_criterion(self):
+        from datetime import datetime, timezone
+        self.ready()
+        self.implement()
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Suggestion",
+                   "status": "new", "category": "Logic", "description": "missing behavior",
+                   "recommendation": "complete behavior", "failure_scenario": "original scenario fails",
+                   "verification_expectation": "test scenario", "criterion_ids": ["fix.ac-1"],
+                   "verification_kind": "static"}
+        review_path = self.review([finding])
+        self.move("needs-fix", review_path=review_path)
+        previous_path, previous = workflow.history(self.run / "api")[-1][1:]
+        path = self.save("mandatory-deferral.json", self.artifact(
+            workflow="fix", contract_sha256=workflow.sha(self.contract), approved_by="user",
+            approval_question="Defer?", user_authorization="Defer", reason="Later",
+            approved_at=datetime.now(timezone.utc).isoformat(), previous_state_path=str(previous_path),
+            previous_state_sha256=workflow.sha(previous_path), review_path=review_path,
+            review_sha256=workflow.sha(review_path), review_round=1, finding_id="api-1",
+            source_fingerprint=previous["source_fingerprint"]))
+        with self.assertRaisesRegex(ValueError, "mandatory"):
+            self.move("reviewed-with-findings", review_deferral_path=path)
 
     def test_user_budget_grants_reject_premature_and_invalid_requests(self):
         from datetime import datetime, timezone
@@ -5525,6 +5642,32 @@ class SliceLifecycleTests(unittest.TestCase):
         self.move_slice("a", "accepted", ["a.txt"])
         with self.assertRaisesRegex(ValueError, "predecessor a was re-accepted"):
             self.gate()
+
+    def test_slice_deferral_accepts_current_review(self):
+        from datetime import datetime, timezone
+        self.accept("a", "a.txt")
+        touched = ["a.txt"]
+        self.move_slice("a", "edited-unverified", touched, action="integration-fix", author_agent_id="author-a")
+        self.move_slice("a", "pre-review-passed", touched,
+                        pre_review_evidence_paths=[self.evidence("early.tests", source=self.cap(touched))])
+        finding = {"id": "api-1", "file": "a.txt", "line": 1, "severity": "Suggestion", "status": "new",
+                   "category": "Logic", "description": "extra log", "recommendation": "add log",
+                   "failure_scenario": "diagnosis slower", "verification_expectation": "inspect log",
+                   "criterion_ids": [], "verification_kind": "static"}
+        review_path = self.slice_review("a", touched, 2, [finding])
+        self.move_slice("a", "needs-fix", touched, review_path=review_path)
+        previous_path, previous = workflow.history(self.run / "api/slices/a")[-1][1:]
+        decision = self.save("slice-deferral.json", self.artifact(
+            workflow=self.c["workflow"], slice_id="a", contract_sha256=workflow.sha(self.contract), approved_by="user",
+            approval_question="Defer?", user_authorization="Defer api-1", reason="Later task",
+            approved_at=datetime.now(timezone.utc).isoformat(), previous_state_path=str(previous_path),
+            previous_state_sha256=workflow.sha(previous_path), review_path=review_path,
+            review_sha256=workflow.sha(review_path), review_round=2, finding_id="api-1",
+            source_fingerprint=previous["source_fingerprint"]))
+        result = self.move_slice("a", "reviewed-with-findings", touched, review_deferral_path=decision)
+        self.assertEqual(["api-1"], result["deferred_finding_ids"])
+        self.move_slice("a", "accepted", touched)
+        self.assertEqual("valid", workflow.audit_slice_history(self.contract, "api", "a", strict=True)["status"])
 
     def test_repair_goes_to_the_slice_author_and_review_budget_is_per_slice(self):
         self.accept("a", "a.txt")

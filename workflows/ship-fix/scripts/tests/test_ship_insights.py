@@ -106,6 +106,20 @@ class InsightsTests(unittest.TestCase):
         self.assertEqual([('repo', True), ('slice/part', False)],
                          [(f['scope'], f['accepted_by_user']) for f in findings])
 
+    def test_deferral_is_visible_in_open_findings_and_history(self):
+        review = self.write('api/round-1-findings.json', {'run_id': 'run1', 'repo': 'api',
+            'round': 1, 'findings': [{'id': 'api-1', 'severity': 'Suggestion'}]})
+        decision = self.write('deferral.json', {'finding_id': 'api-1', 'reason': 'Later task', 'review_round': 1})
+        self.write('api/state-1.json', {'review_path': str(review), 'deferral_applied': True,
+            'review_deferral_paths': [str(decision)], 'deferred_finding_ids': ['api-1']})
+        result = insights.analyze(self.run, {})
+        self.assertEqual('Later task', result['open_findings'][0]['deferral']['reason'])
+        self.assertTrue(result['review_deferrals'][0]['active'])
+        self.write('api/state-2.json', {'review_path': str(review)})
+        result = insights.analyze(self.run, {})
+        self.assertFalse(result['review_deferrals'][0]['active'])
+        self.assertIsNone(result['open_findings'][0]['deferral'])
+
     def test_foreign_run_and_invalid_contract(self):
         self.write('api/rounds-1/round-1-findings.json', {'run_id': 'other', 'repo': 'api', 'round': 1, 'findings': []})
         result = insights.analyze(self.run, {})

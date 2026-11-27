@@ -3602,8 +3602,12 @@ def audit_slice_history(contract_path, repo, slice_id, *, inherited_policy=(), v
                 "Continuity history does not seal its contract")
         require(event.get("slice_id") == slice_id, "Continuity slice mismatch")
         status = event.get("status")
+        deferral = event.get("deferral_applied") is True
+        if deferral:
+            audit_review_deferral(source, old, repo, events, index, slice_id)
         require((prior_status is None and status == "implemented") or
                 (prior_status is not None and (status in SLICE_TRANSITIONS.get(prior_status, set())
+                    or deferral
                     or status in {"blocked", "capped"}
                     or recorded_binding_recheck(old, repo, event, events[index - 1][2], slice=True)
                     or (prior_status == "capped" and status == "needs-fix"
@@ -4641,6 +4645,80 @@ def author_identity_recovery(contract_path, value, repo, request, events, final)
                                                              str(result_manifest), *(str(p) for p in (root / "telemetry").glob(f"{phase_id}*.json"))]
 
 
+def validate_review_deferral(contract_path, value, repo, events, path, final, slice_id=None, *, event_time=None):
+    """Validate a user's decision against the immediately preceding review state."""
+    require(events and events[-1][2].get("status") == "needs-fix", "Deferral requires needs-fix")
+    previous_path, previous = events[-1][1:]
+    require(previous.get("review_fix_count", 0) < previous.get("review_fix_limit", 3),
+            "Deferral requires remaining review-fix budget")
+    path = run_local_evidence_path(path, Path(contract_path).parent, value, "Review deferral")
+    decision = state.load(path)
+    bound(value, repo, decision)
+    require(decision.get("workflow") == value["workflow"] and decision.get("slice_id") == slice_id,
+            "Wrong deferral scope")
+    require(decision.get("contract_sha256") == sha(contract_path) and decision.get("approved_by") == "user",
+            "Deferral requires user approval and current contract")
+    for field in ("approval_question", "user_authorization", "reason"):
+        state.text(decision.get(field), "deferral " + field)
+    require(timestamp(previous["at"]) <= timestamp(decision.get("approved_at"))
+            <= (timestamp(event_time) if event_time else datetime.now(timezone.utc)),
+            "Invalid deferral time")
+    require(decision.get("previous_state_path") == str(previous_path)
+            and decision.get("previous_state_sha256") == sha(previous_path), "Wrong deferral state")
+    review_path = absolute_file(previous.get("review_path"), value)
+    require(decision.get("review_path") == str(review_path) and decision.get("review_sha256") == sha(review_path)
+            and decision.get("review_round") == previous.get("latest_review_round"), "Wrong deferral review")
+    require(final["fingerprint"] == previous.get("source_fingerprint") == previous.get("review_fingerprint")
+            and decision.get("source_fingerprint") == final["fingerprint"], "Deferral source changed")
+    findings = state.load(review_path)["findings"]
+    matches = [item for item in findings if item["id"] == decision.get("finding_id")]
+    require(len(matches) == 1 and matches[0].get("severity") == "Suggestion",
+            "Deferral requires one open Suggestion")
+    for identifier in matches[0]["criterion_ids"]:
+        criterion = spec(value, repo, identifier)
+        require(criterion.get("mandatory") is False, "Deferral references a mandatory criterion or check")
+    require(decision["finding_id"] not in previous.get("deferred_finding_ids", []),
+            "Finding already deferred")
+    return str(path), decision
+
+
+def audit_review_deferral(contract_path, value, repo, events, index, slice_id=None):
+    event = events[index][2]
+    require(index > 0 and event.get("deferral_applied") is True, "Invalid deferral event")
+    previous = events[index - 1][2]
+    paths = event.get("review_deferral_paths")
+    require(isinstance(paths, list) and len(paths) == len(previous.get("review_deferral_paths", [])) + 1
+            and paths[:-1] == previous.get("review_deferral_paths", []), "Invalid deferral history")
+    final = manifest(value, repo, event["source_manifest"])
+    path, decision = validate_review_deferral(contract_path, value, repo, events[:index], paths[-1], final,
+                                               slice_id, event_time=event["at"])
+    require(event.get("artifact_hashes", {}).get(path) == sha(path), "Deferral is not sealed")
+    ids = sorted([*previous.get("deferred_finding_ids", []), decision["finding_id"]])
+    findings = state.load(previous["review_path"])["findings"]
+    require(event.get("deferred_finding_ids") == ids and event.get("review_path") == previous.get("review_path")
+            and event.get("review_fingerprint") == previous.get("review_fingerprint")
+            and event.get("source_fingerprint") == previous.get("source_fingerprint")
+            and event.get("status") == ("reviewed-with-findings" if set(ids) == {f["id"] for f in findings}
+                                         else "needs-fix"), "Invalid deferral state")
+    for key in ("scope", "source_scope", "baseline_dir", "base_manifest", "touched", "excludes"):
+        require(event.get(key) == previous.get(key), "Deferral changed lifecycle context")
+
+
+def deferral_history(events, value):
+    current = events[-1][2] if events else {}
+    active_paths = set(current.get("review_deferral_paths", []))
+    records = []
+    for _, _, event in events:
+        if not event.get("deferral_applied"):
+            continue
+        path = event["review_deferral_paths"][-1]
+        decision = state.load(absolute_file(path, value))
+        records.append({"finding_id": decision["finding_id"], "reason": decision["reason"],
+                        "review_round": decision["review_round"], "decision_path": path,
+                        "active": path in active_paths})
+    return records
+
+
 def accept_review_findings(contract_path, value, repo, events, request, final, slice_id=None):
     require(len(events) >= 2 and events[-1][2].get("status") == "capped"
             and events[-2][2].get("status") == "needs-fix", "Acceptance requires capped review findings")
@@ -4692,7 +4770,8 @@ def transition(contract_path, repo, request_path, out):
     protected = {"review_fingerprint", "artifact_hashes", "initial_manifest", "code_only", "schema_version",
                  "run_id", "repo", "sequence", "at", "current_author_agent_id", "review_fix_limit",
                  "review_fix_grants", "budget_grant", "amendment_sha256", "amendment_applied",
-                 "budget_grant_applied", "gate_fix_budget", "gate_fix_sources_sha256"}
+                 "budget_grant_applied", "gate_fix_budget", "gate_fix_sources_sha256",
+                 "deferral_applied", "deferred_finding_ids", "review_deferral_paths"}
     require(not protected & set(request), "Request overrides certified lifecycle fields")
     status = request.get("status")
     if has_bound_pre_review(value, repo):
@@ -4785,8 +4864,14 @@ def transition(contract_path, repo, request_path, out):
     else:
         require("gate_correction_reason" not in request, "Gate correction reason requires gate correction")
     accepting = before == "capped" and status == "reviewed-with-findings"
+    deferring = "review_deferral_path" in request
+    if deferring:
+        require(before == "needs-fix" and status in {"needs-fix", "reviewed-with-findings"}
+                and not is_grant_transition, "Deferral requires a current needs-fix review")
+        require(set(request) <= {"status", "source_manifest", "scope_path", "baseline_dir", "review_deferral_path"},
+                "Deferral cannot change lifecycle context")
     require("review_acceptance_path" not in request or accepting, "Unexpected acceptance path")
-    require(gate_correction or valid_grant_transition or accepting or is_requirement_amendment or identity_correction or binding_recheck
+    require(deferring or gate_correction or valid_grant_transition or accepting or is_requirement_amendment or identity_correction or binding_recheck
             or status in TERMINAL
             or status in TRANSITIONS.get(before, set()),
             f"Illegal transition: {before} -> {status}")
@@ -4811,6 +4896,16 @@ def transition(contract_path, repo, request_path, out):
     dependency_scope = scope_input(dependency_scope_path, value)
     require(set(previous.get("scope", [])) <= set(scope), "Touched scope must not shrink")
     final = fresh(value, repo, source_path, sorted(set(scope) | set(dependency_scope)), exclusions)
+    if deferring:
+        require(scope == previous["scope"] and dependency_scope == previous["source_scope"]
+                and request.get("baseline_dir", previous.get("baseline_dir")) == previous.get("baseline_dir"),
+                "Deferral cannot change scope or baseline")
+        deferral_path, deferral = validate_review_deferral(contract_path, value, repo, events,
+                                                            request["review_deferral_path"], final)
+        deferred_ids = sorted([*previous.get("deferred_finding_ids", []), deferral["finding_id"]])
+        review_ids = {finding["id"] for finding in state.load(previous["review_path"])["findings"]}
+        require((set(deferred_ids) == review_ids) == (status == "reviewed-with-findings"),
+                "Deferral status does not match remaining findings")
     if binding_recheck:
         require(scope == previous["scope"] and dependency_scope == previous["source_scope"]
                 and state.same_source(final, event_manifest(value, repo, previous), repo_read_excludes(value, repo)),
@@ -4885,6 +4980,8 @@ def transition(contract_path, repo, request_path, out):
     sealed = [contract_path, source_path, request_path, *amendment_seals, *review_base_seals]
     if accepting:
         sealed.append(acceptance_path)
+    if deferring:
+        sealed.append(deferral_path)
     for applied in value.get("_amendments", []):
         sealed.append(applied["path"])
     if events:
@@ -4905,6 +5002,12 @@ def transition(contract_path, repo, request_path, out):
         data["amendment_applied"] = True
     data.pop("budget_grant", None)
     data.pop("budget_grant_applied", None)
+    data.pop("deferral_applied", None)
+    data.pop("review_deferral_path", None)
+    if deferring:
+        data["deferral_applied"] = True
+        data["deferred_finding_ids"] = deferred_ids
+        data["review_deferral_paths"] = [*previous.get("review_deferral_paths", []), deferral_path]
     data.pop("slice_repair_recovery_path", None)
     if recovery_path:
         require(scope == previous["scope"] and dependency_scope == previous["source_scope"],
@@ -5003,10 +5106,12 @@ def transition(contract_path, repo, request_path, out):
         sealed += matrix(value, repo, request.get("matrix_path"), final)
     if binding_recheck:
         for key in ("deliverable_manifest_path", "pre_review_evidence_paths", "review_fingerprint",
-                    "gate_evidence_paths", "assessment_path"):
+                    "gate_evidence_paths", "assessment_path", "deferred_finding_ids", "review_deferral_paths"):
             data.pop(key, None)
     elif status == "edited-unverified":
         data.pop("review_acceptance_path", None)
+        data.pop("deferred_finding_ids", None)
+        data.pop("review_deferral_paths", None)
         action = request.get("action")
         require(action in EDITS - {"implement"}, "Missing edit cause")
         if value.get("from_review"):
@@ -5047,7 +5152,9 @@ def transition(contract_path, repo, request_path, out):
                     if recovery_path else "Review-fix budget exhausted")
             data["review_fix_count"] += 1
             if not recovery_path:
-                _, proofs = applied_findings(value, repo, request.get("applied_path"), previous["review_path"], final)
+                applied, proofs = applied_findings(value, repo, request.get("applied_path"), previous["review_path"], final)
+                require(set(previous.get("deferred_finding_ids", [])) <= {f["id"] for f in applied["skipped"]},
+                        "Deferred findings must be recorded as skipped")
                 sealed += proofs
         if action == "plan-gap":
             require(data["review_fix_count"] < budget_limit, "Plan-gap repair budget exhausted")
@@ -5073,7 +5180,9 @@ def transition(contract_path, repo, request_path, out):
         sealed += paths
         sealed += check_slice_delivery(value, repo, data.get("slice_gate_path"), data.get("deliverable_manifest_path"))
         sealed += check_set(value, repo, "pre_review_checks", check_paths, final, delivery=delivery)
-    if status in {"needs-fix", "reviewed"} and not is_grant_transition and not identity_correction:
+    if status in {"needs-fix", "reviewed"} and not is_grant_transition and not identity_correction and not deferring:
+        data.pop("deferred_finding_ids", None)
+        data.pop("review_deferral_paths", None)
         if recovery_anchor:
             require(sha(absolute_file(request.get("review_path"))) not in inherited_seals.values(),
                     "Slice repair recovery needs a fresh independent repo review")
@@ -5081,7 +5190,8 @@ def transition(contract_path, repo, request_path, out):
         sealed += paths + recheck_pre_review(value, repo, previous, final, delivery)
         sealed += check_slice_delivery(value, repo, data.get("slice_gate_path"), data.get("deliverable_manifest_path"))
         prior_paths = [e[2]["review_path"] for e in events
-                       if e[2]["status"] in {"needs-fix", "reviewed"} and not e[2].get("budget_grant_applied")]
+                       if e[2]["status"] in {"needs-fix", "reviewed"} and not e[2].get("budget_grant_applied")
+                       and not e[2].get("deferral_applied")]
         sealed += successor_review_base(value, repo, contract_path, scope, data.get("baseline_dir"))
         result, paths = review(value, repo, request.get("review_path"), final, scope, prior_paths,
                                Path(contract_path).parent.resolve(), previous.get("artifact_hashes", {}))
@@ -5102,7 +5212,9 @@ def transition(contract_path, repo, request_path, out):
         accepted_review = state.load(absolute_file(data["review_path"], value))
         if delivery is not None:
             match_delivery_reference(accepted_review, delivery)
-        require(not accepted_review["findings"] or data.get("review_acceptance_path"), "Review has open findings")
+        require(not accepted_review["findings"] or data.get("review_acceptance_path") or
+                {f["id"] for f in accepted_review["findings"]} == set(data.get("deferred_finding_ids", [])),
+                "Review has open findings")
         if not accepting:
             sealed += check_set(value, repo, "required_gates", data.get("gate_evidence_paths"), final, delivery=delivery)
     if status == "verified":
@@ -5487,7 +5599,8 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     require(isinstance(request, dict), "Slice request must be an object")
     protected = {"review_fingerprint", "artifact_hashes", "accepted_files", "dependency_states", "schema_version",
                  "run_id", "repo", "slice_id", "sequence", "at", "schedule_sha256", "review_fix_count",
-                 "latest_review_round", "review_fix_limit", "is_continuation", "historical_used_passes"}
+                 "latest_review_round", "review_fix_limit", "is_continuation", "historical_used_passes",
+                 "deferral_applied", "deferred_finding_ids", "review_deferral_paths"}
     status = request.get("status")
     require(not protected & set(request), "Request overrides certified slice fields")
     if has_bound_pre_review(value, repo):
@@ -5505,6 +5618,12 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
                 and stale_binding(value, repo, previous, slice_item=item),
                 "Binding recheck needs a stale binding and a clean slice boundary")
     accepting = before == "capped" and status == "reviewed-with-findings"
+    deferring = "review_deferral_path" in request
+    if deferring:
+        require(before == "needs-fix" and status in {"needs-fix", "reviewed-with-findings"},
+                "Deferral requires a current needs-fix slice review")
+        require(set(request) <= {"status", "source_manifest", "base_manifest", "touched", "review_deferral_path"},
+                "Deferral cannot change slice context")
     require("review_acceptance_path" not in request or accepting, "Unexpected acceptance path")
     continuation_path = request.get("continuation_path")
     continuation_limit = None
@@ -5539,7 +5658,7 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     if status in {"blocked", "capped"}:
         require(events, "Nothing to block yet")
         state.text(request.get("reason"), "blocker reason")
-    elif continuation_limit is None and not dependency_recheck and not accepting and not binding_recheck:
+    elif continuation_limit is None and not dependency_recheck and not accepting and not binding_recheck and not deferring:
         require(status in SLICE_TRANSITIONS.get(before, set()), f"Illegal slice transition: {before} -> {status}")
     require(before not in {"blocked", "capped"} or continuation_limit is not None or accepting,
             "Exhausted slice needs explicit human continuation")
@@ -5581,6 +5700,15 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         missing = {path for path in changed_paths if owners[path] == slice_id} - names.keys(touched)
         require(not missing, "Slice omits predecessor changes: " + ", ".join(sorted(missing)))
     final = fresh(value, repo, request.get("source_manifest"), touched)
+    if deferring:
+        require(touched == previous["touched"] and base_path == previous["base_manifest"],
+                "Deferral cannot change slice scope or base")
+        deferral_path, deferral = validate_review_deferral(contract_path, value, repo, events,
+                                                            request["review_deferral_path"], final, slice_id)
+        deferred_ids = sorted([*previous.get("deferred_finding_ids", []), deferral["finding_id"]])
+        review_ids = {finding["id"] for finding in state.load(previous["review_path"])["findings"]}
+        require((set(deferred_ids) == review_ids) == (status == "reviewed-with-findings"),
+                "Deferral status does not match remaining findings")
     if binding_recheck:
         require(touched == previous["touched"] and base_path == previous["base_manifest"]
                 and state.same_source(final, event_manifest(value, repo, previous), repo_read_excludes(value, repo)),
@@ -5629,6 +5757,12 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
             "schedule_sha256": plan["schedule_sha256"], "base_manifest": base_path, "touched": touched,
             "batch_barrier_path": barrier_path,
             "source_fingerprint": final["fingerprint"]}
+    data.pop("deferral_applied", None)
+    data.pop("review_deferral_path", None)
+    if deferring:
+        data["deferral_applied"] = True
+        data["deferred_finding_ids"] = deferred_ids
+        data["review_deferral_paths"] = [*previous.get("review_deferral_paths", []), deferral_path]
     if bound_predecessors is not None:
         data["predecessor_states"] = bound_predecessors
     if integration_seals:
@@ -5651,6 +5785,8 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         sealed.append(continuation_path)
     if accepting:
         sealed.append(acceptance_path)
+    if deferring:
+        sealed.append(deferral_path)
     if events:
         sealed.append(str(events[-1][1]))
     if status == "implemented":
@@ -5662,10 +5798,13 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
     elif status not in {"blocked", "capped"}:
         data["author_agent_id"] = previous["author_agent_id"]
     if binding_recheck:
-        for key in ("deliverable_manifest_path", "pre_review_evidence_paths", "review_fingerprint"):
+        for key in ("deliverable_manifest_path", "pre_review_evidence_paths", "review_fingerprint",
+                    "deferred_finding_ids", "review_deferral_paths"):
             data.pop(key, None)
     elif status == "edited-unverified":
         data.pop("review_acceptance_path", None)
+        data.pop("deferred_finding_ids", None)
+        data.pop("review_deferral_paths", None)
         action = request.get("action")
         require(action in {"review-fix", "integration-fix"}, "Missing slice edit cause")
         paths, new_author = (capsule_handoff(contract_path, value, repo, request, previous, events,
@@ -5750,6 +5889,8 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
             bound(value, repo, result)
             findings = state.load(previous["review_path"])
             state.applied(result, findings)
+            require(set(previous.get("deferred_finding_ids", [])) <= {f["id"] for f in result["skipped"]},
+                    "Deferred findings must be recorded as skipped")
             for entry in result["applied"]:
                 original = next(f for f in findings["findings"] if f["id"] == entry["id"])
                 require(entry.get("verification_kind") == original["verification_kind"], "Applied kind mismatch")
@@ -5767,11 +5908,14 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         delivery, paths = deliverable_binding(value, repo, data.get("deliverable_manifest_path"), slice_item=item)
         sealed += paths + check_set(value, repo, "pre_review_checks", request.get("pre_review_evidence_paths"),
                                     final, delivery=delivery)
-    if status in {"needs-fix", "reviewed"} and continuation_limit is None:
+    if status in {"needs-fix", "reviewed"} and continuation_limit is None and not deferring:
+        data.pop("deferred_finding_ids", None)
+        data.pop("review_deferral_paths", None)
         delivery, paths = deliverable_binding(value, repo, previous.get("deliverable_manifest_path"), slice_item=item)
         sealed += paths + recheck_pre_review(value, repo, previous, final, delivery)
         prior_paths = [e[2]["review_path"] for e in events
-                       if e[2]["status"] in {"needs-fix", "reviewed"} and not e[2].get("is_continuation")]
+                       if e[2]["status"] in {"needs-fix", "reviewed"} and not e[2].get("is_continuation")
+                       and not e[2].get("deferral_applied")]
         result, paths = review(value, repo, request.get("review_path"), final, touched, prior_paths,
                                Path(contract_path).parent.resolve(), previous.get("artifact_hashes", {}))
         if delivery is not None:
@@ -5795,7 +5939,8 @@ def slice_transition(contract_path, repo, slice_id, schedule_path, request_path,
         if delivery is not None:
             match_delivery_reference(accepted_review, delivery)
         if not accepting:
-            require(not accepted_review["findings"] or previous.get("review_acceptance_path"),
+            require(not accepted_review["findings"] or previous.get("review_acceptance_path") or
+                    {f["id"] for f in accepted_review["findings"]} == set(previous.get("deferred_finding_ids", [])),
                     "Slice review has open findings")
     if status == "accepted":
         contributions = {c["criterion_id"] for c in item["contributions"]}
@@ -6248,7 +6393,10 @@ def slice_repair_recovery(contract_path, value, repo, events, recovery_path, sou
             boundary = timestamp(event["at"])
             require(timestamp(checkpoint.get("at")) <= boundary, "Integration checkpoint postdates its slice state")
             status, prior_status = event["status"], prior["status"]
+            if event.get("deferral_applied"):
+                audit_review_deferral(contract_path, value, repo, prefix, sequence - 1, identifier)
             require(status in SLICE_TRANSITIONS.get(prior_status, set())
+                    or event.get("deferral_applied") is True
                     or recorded_binding_recheck(value, repo, event, prior, slice=True)
                     or (prior_status == "accepted" and status == "pre-review-passed"
                         and event.get("action") == "dependency-recheck")
@@ -6742,6 +6890,9 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
     prior_status = None
     for index, (_, _, event) in enumerate(events):
         status = event.get("status")
+        deferral = event.get("deferral_applied") is True
+        if deferral:
+            audit_review_deferral(contract_file, value, repo, events, index)
         require(status in set(TRANSITIONS) | TERMINAL, "Invalid historical lifecycle status")
         grant_same_state = (event.get("budget_grant_applied") is True and status == prior_status)
         grant_resumes_capped = (event.get("budget_grant_applied") is True and prior_status == "capped"
@@ -6765,9 +6916,9 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
             require(status in TRANSITIONS.get(prior_status, set()) or status in TERMINAL
                     or (prior_status == "capped" and status == "reviewed-with-findings"
                         and event.get("review_acceptance_path"))
-                    or grant_same_state or grant_resumes_capped or gate_correction or requirement_registration or binding_recheck,
+                    or deferral or grant_same_state or grant_resumes_capped or gate_correction or requirement_registration or binding_recheck,
                     "Invalid historical lifecycle transition")
-        if status == "reviewed-with-findings" and not event.get("budget_grant_applied"):
+        if status == "reviewed-with-findings" and not event.get("budget_grant_applied") and not deferral:
             path = accept_review_findings(contract_file, value, repo, events[:index], event,
                                           manifest(value, repo, event["source_manifest"]))
             require(event.get("artifact_hashes", {}).get(path) == sha(path),
@@ -6780,7 +6931,7 @@ def validate_history(contract_path, repo, visited_contracts=None, read_excludes=
                 expected_review_fixes += 1
             else:
                 expected_gate_fixes += 1
-        if status in {"needs-fix", "reviewed"} and not event.get("budget_grant_applied"):
+        if status in {"needs-fix", "reviewed"} and not event.get("budget_grant_applied") and not deferral:
             expected_round += 1
         require(event.get("review_fix_count", 0) == expected_review_fixes,
                 "Historical review-fix counter is not derived from repair events")
@@ -6893,6 +7044,8 @@ def review_budget_status(contract_path, repo, slice_id=None):
     recovery = pending_slice_recovery(events) if slice_id is None else None
     if review_path and (context.get("status") == "needs-fix" or recovery):
         findings = state.load(absolute_file(review_path))["findings"]
+    active_ids = set(context.get("deferred_finding_ids", []))
+    actionable = [item for item in findings if item["id"] not in active_ids]
     used = latest.get("review_fix_count", 0)
     historical_used = historical_budget_used(grants)
     result = {"run_id": value["run_id"], "repo": repo, "state_path": str(latest_path),
@@ -6900,6 +7053,8 @@ def review_budget_status(contract_path, repo, slice_id=None):
             "limit": limit, "used_passes": used, "remaining_passes": max(0, limit - used),
             "exhausted": used >= limit, "open_finding_ids": sorted(item["id"] for item in findings),
             "open_findings": findings,
+            "repair_finding_ids": sorted(item["id"] for item in actionable),
+            "deferred_finding_ids": sorted(active_ids),
             "findings_by_severity": {severity: sum(item.get("severity") == severity for item in findings)
                                      for severity in ("Critical", "Warning", "Suggestion")},
             "source_matches_state": source_matches, "changed_source_paths": changed,
@@ -6954,6 +7109,8 @@ def review_fix_next(contract_path, repo, capsule_path=None):
                             "source_scope": previous.get("source_scope_path"), "matrix": previous.get("matrix_path"),
                             "scope_amendment": previous.get("scope_amendment_path"),
                             "deliverable_manifest": previous.get("deliverable_manifest_path"),
+                            "deferred_finding_ids": previous.get("deferred_finding_ids", []),
+                            "review_deferral_paths": previous.get("review_deferral_paths", []),
                             "amendments": [item["path"] for item in value.get("_amendments", [])]}
         require(previous.get("status") in {"needs-fix", "capped"}, "Expected needs-fix or capped state")
         if previous["status"] == "capped":
@@ -7065,6 +7222,7 @@ def complete(contract_path, out):
             budget_summary.update({"historical_effective_limit": continuity["effective_limit"],
                                    "continuity": continuity})
         open_findings = []
+        deferrals = [{**item, "scope": "repo"} for item in deferral_history(events, value)]
         if latest.get("review_path"):
             for finding in state.load(absolute_file(latest["review_path"]))["findings"]:
                 open_findings.append({**finding, "scope": "repo",
@@ -7091,9 +7249,18 @@ def complete(contract_path, out):
                     for finding in state.load(absolute_file(slice_latest["review_path"]))["findings"]:
                         open_findings.append({**finding, "scope": "slice/" + directory.name,
                                               "review_acceptance_path": slice_latest.get("review_acceptance_path")})
+                deferrals.extend({**item, "scope": "slice/" + directory.name}
+                                 for item in deferral_history(slice_events, value))
         repos[repo] = {"source_fingerprint": final["fingerprint"], "state_path": str(events[-1][1]),
                        "review_budget": budget_summary, "open_findings": open_findings,
                        "gate_fix_budget": audit["gate_fix_budget"], "gate_fix_history_sha256": audit["history_sha256"]}
+        if deferrals:
+            repos[repo]["review_deferrals"] = deferrals
+            for finding in open_findings:
+                match = next((item for item in deferrals if item["active"] and item["scope"] == finding["scope"]
+                              and item["finding_id"] == finding["id"]), None)
+                if match:
+                    finding["deferral"] = match
         if value.get("deliverables", {}).get(repo):
             deliveries = delivery_status(value, repo, latest, recheck=False)
             require(all(item["status"] == "verified" for item in deliveries), "Completion deliverable is stale")
@@ -7391,7 +7558,7 @@ def packet(contract_path, repo, scope_path, baseline_dir, out):
     state.match(current, state.capture(value["repo_paths"][repo], source_scope, excludes, read_excludes,
                                        policies=read_policy(value)))
     reviews = [e[2] for e in events if e[2]["status"] in {"needs-fix", "reviewed"}
-               and not e[2].get("budget_grant_applied")]
+               and not e[2].get("budget_grant_applied") and not e[2].get("deferral_applied")]
     previous = manifest(value, repo, reviews[-1]["source_manifest"]) if reviews else None
     changed = sorted(source_names(value, repo).changed(previous, current)
                      if previous else current["files"])
@@ -7875,6 +8042,7 @@ def digest(contract_path, repo, verbose=False):
             prior = [state.load(absolute_file(e[2]["review_path"])) for e in events
                      if e[2].get("status") in {"needs-fix", "reviewed"}
                      and not e[2].get("budget_grant_applied")
+                     and not e[2].get("deferral_applied")
                      and e[2].get("review_path") and e[2]["review_path"] != review_path]
             state.findings(review_record, repo, review_record.get("round"), review_manifest, prior)
             summary["remaining_findings"] = sorted(item["id"] for item in review_record.get("findings", []))

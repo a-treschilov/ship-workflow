@@ -31,7 +31,7 @@ def analyze(run_dir, telemetry):
     contract = contract if isinstance(contract, dict) else {}
     completion = completion if isinstance(completion, dict) else {}
     run_id = contract.get('run_id')
-    result = {'findings': [], 'open_findings': [], 'observations': [], 'handoffs': [], 'limitations': []}
+    result = {'findings': [], 'open_findings': [], 'review_deferrals': [], 'observations': [], 'handoffs': [], 'limitations': []}
     if not isinstance(run_id, str) or run_id != run_dir.name:
         result['limitations'].append('Contract run identity missing or mismatched; qualitative evidence unavailable.')
         return result
@@ -143,6 +143,24 @@ def analyze(run_dir, telemetry):
             current = read(max(states)[1]) or {}
             if not isinstance(current, dict):
                 continue
+            scope = 'repo' if directory == base else 'slice/' + directory.name
+            active_paths = {str(Path(path).resolve()) for path in current.get('review_deferral_paths', [])
+                            if isinstance(path, str)}
+            for _, state_path in sorted(states):
+                event = read(state_path) or {}
+                paths = event.get('review_deferral_paths') or []
+                if not event.get('deferral_applied') or not paths:
+                    continue
+                try:
+                    decision_target = Path(paths[-1]).resolve()
+                    decision_target.relative_to(run_dir)
+                    decision = read(decision_target) or {}
+                    result['review_deferrals'].append({'repo': repo, 'scope': scope,
+                        'finding_id': decision.get('finding_id'), 'reason': decision.get('reason'),
+                        'review_round': decision.get('review_round'), 'decision_path': str(decision_target),
+                        'active': str(decision_target) in active_paths, 'seal': evidence(decision_target)})
+                except (OSError, ValueError, TypeError):
+                    continue
             review_path = current.get('review_path')
             if not isinstance(review_path, str):
                 continue
@@ -154,11 +172,23 @@ def analyze(run_dir, telemetry):
                 continue
             if not isinstance(review, dict) or not isinstance(review.get('findings'), list):
                 continue
-            scope = 'repo' if directory == base else 'slice/' + directory.name
+            deferrals = {}
+            for decision_path in current.get('review_deferral_paths', []):
+                try:
+                    decision_target = Path(decision_path).resolve()
+                    decision_target.relative_to(run_dir)
+                    decision = read(decision_target) or {}
+                    if decision.get('finding_id') in current.get('deferred_finding_ids', []):
+                        deferrals[decision['finding_id']] = {'reason': decision.get('reason'),
+                            'review_round': decision.get('review_round'), 'decision_path': str(decision_target),
+                            'seal': evidence(decision_target)}
+                except (OSError, ValueError, TypeError):
+                    continue
             for item in review['findings']:
                 if isinstance(item, dict):
                     result['open_findings'].append({**item, 'repo': repo, 'scope': scope,
                         'accepted_by_user': bool(current.get('review_acceptance_path')),
+                        'deferral': deferrals.get(item.get('id')),
                         'source': str(target), 'seal': evidence(target)})
         completion_repos = completion.get('repos') if isinstance(completion.get('repos'), dict) else {}
         final_record = completion_repos.get(repo) if isinstance(completion_repos.get(repo), dict) else {}

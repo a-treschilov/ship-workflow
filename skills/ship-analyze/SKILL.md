@@ -115,11 +115,12 @@ Missing gates/outcomes aren't passing gates. ship_run=false means no executed sh
    from counts. New rounds may catch real assertion defects.
 3. Optimize demonstrated repeated work only with accounting scope/completeness stated. Safe batching:
    coherent edits, shared targeted runs with distinct claim assertions, deterministic review packets.
-4. Never recommend severity-based early exit, skipped Suggestions, weaker assertions or fewer independent
+4. Never recommend severity-based early exit, automatic deferral of Suggestions, weaker assertions or fewer independent
    checks. Model/budget changes require evidence and user approval; this skill never edits workflow files.
 
 For v2, `insights.open_findings` lists the latest open review findings by repo and slice, including recorded
 user acceptance. The compact report lists those findings and counts by severity.
+Explicit user deferrals include the recorded reason and review round. An open finding remains open when deferred.
 
 Inspect `insights` for reviewer claims, explicit finding-ID dispositions and applied records,
 separated by repo/slice. The compact output summarizes repo findings; JSON carries slice details. Each

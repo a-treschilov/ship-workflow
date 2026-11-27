@@ -79,6 +79,8 @@ the implementer owns targeted checks and its completion matrix. The checker owns
 
 At review-budget exhaustion, a user may accept the current open findings for a repo or slice. The immutable
 decision binds the exact review and source. Findings remain open in reports and the completion certificate.
+Before exhaustion, a user may explicitly defer an eligible Suggestion for the current review and source. Other
+findings continue through repair and every decision remains in the completion certificate.
 Required gates and acceptance evidence still apply.
 
 The orchestrator may split a large repository scope into approved slices. Slices have independent state

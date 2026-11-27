@@ -36,6 +36,7 @@ helper, including in resumes. The script prints short results and exits 2 on ref
 - `matrix ROWS.json` for the completion matrix, with one row per mandatory criterion: `criterion_id`,
   implementation, assertion, status (verified|unverified), reason, `runs`.
 - `applied RESULT.json` for review-fix only: `applied` (id, verified, runs), `failed` and `skipped` (id, reason).
+  Record explicitly deferred findings in `skipped` with the user's reason while addressing the other findings.
   Every finding ID appears exactly once. A failed edit reason starts with `Edited but unverified: `.
 - `scope-check` before reporting: it lists changes outside write_scope or touched.
 - `capsule-check DRAFT.json` as the last artifact step of every task (see below). The orchestrator seals the capsule; do not run `capsule` yourself.

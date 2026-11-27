@@ -101,6 +101,12 @@ Follow protocol transitions: implemented → independent pre-review → fresh re
 contract/brief, current/prior manifests, all prior findings/applied results. Validate coverage, fingerprints,
 proof and closed-finding dispositions. Review Suggestions too. Budgets and review numbering never reset.
 
+After a `needs-fix` review, a user may explicitly defer an eligible Suggestion using the protocol's
+`review_deferral_path` decision. Present the finding and linked criteria, obtain the user's reason and exact
+authorization, and record a separate transition. Pass the decision paths and deferred IDs to the implementer
+when repairing other findings. Report deferred IDs,
+reasons and review rounds, including decisions that became stale after an edit or fresh review.
+
 Before preparing a repo review-fix after needs-fix in an implementer-owned run, run
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-fix-next --contract CONTRACT --repo REPO --capsule-path CAPSULE_PATH`
 as a standalone command. Pass the optional capsule path when available. Follow the returned action, role, inputs

@@ -48,8 +48,8 @@ This protocol supplies scope, baselines, history and output. Read applicable rep
 Unchanged consumers broken by the new delta are reviewable: anchor the changed cause and name affected
 sites. Unrelated pre-existing Boy Scout issues do not expand writable scope. Extract helpers only when
 semantics are genuinely shared and abstraction lowers maintenance cost, not merely because two snippets
-look alike. Address substantive Suggestions during available repair passes and present remaining findings for
-the user's explicit decision at exhaustion.
+look alike. Address substantive Suggestions during available repair passes, allowing the user's explicit
+deferral under the rules below, and present remaining findings for the user's decision at exhaustion.
 
 Implementers/checkpoints stay sequential: agents share the source. No real worktrees or
 parallel implementers are introduced here. Claude frontmatter and Codex role files are generated from
@@ -414,6 +414,7 @@ files; each event saves their values. Generated outputs belong outside source or
 | implemented | matrix_path; code-only from blocked additionally code_only_authorization |
 | pre-review-passed | matrix_path and pre_review_evidence_paths |
 | needs-fix / reviewed | review_path, stable accepted fingerprint, complete coverage and dispositions |
+| needs-fix / reviewed-with-findings after needs-fix | explicit user deferral of one eligible Suggestion, bound to the current review and source |
 | reviewed-with-findings | user decision bound to the exhausted review and unchanged source |
 | edited-unverified | action review-fix/gate-fix/plan-gap; fix artifacts below |
 | gates-passed | full independent gate_evidence_paths, current clean or user-accepted review |
@@ -483,6 +484,27 @@ passes, the orchestrator shows the repo, limit, used count, every open finding I
 (or plan-gap criterion and remaining work), then asks using host's user-input capability for a positive number N,
 accept all open review findings, or stop. Acceptance applies only to review findings, not plan-gap or failed gates.
 No automatic renewal. An approval to implement this mechanism is not approval for any particular run.
+
+### Deferring an optional Suggestion
+
+After recording a repo or slice review as `needs-fix`, and while review-fix budget remains, the user may
+explicitly defer one specific open Suggestion. Show its ID, severity, location, description, failure scenario,
+recommendation and linked criteria. Confirm that the substance does not identify an unmet mandatory criterion,
+check or prerequisite. A Suggestion linked to any mandatory criterion, check or prerequisite cannot be deferred.
+Never infer consent from silence. Save a unique run-local JSON with `schema_version`, `run_id`, `workflow`, `repo`,
+optional `slice_id`, `contract_sha256`, `approved_by: "user"`, `approval_question`, exact `user_authorization`,
+`reason`, `approved_at` UTC, `previous_state_path` and `previous_state_sha256`, `review_path` and
+`review_sha256`, `review_round`, `source_fingerprint` and `finding_id`. Use `transition` or `slice-transition`
+with `review_deferral_path`. Use `needs-fix` if other findings require repair and `reviewed-with-findings` if
+all current findings have been deferred. Each decision is a separate immutable transition and consumes no
+repair pass or review round. The helper verifies the current source and seals the decision.
+
+All other findings follow the normal repair path. The applied record includes every finding and records deferred
+IDs under `skipped` with their reason. Every source edit and fresh review ends the decision's current effect.
+The reviewer still receives all previous findings and adjudicates closed findings normally. If a deferred finding
+recurs, it needs a new decision or repair. History and the completion certificate retain prior decisions. The
+final report identifies every remaining finding, its status and any current deferral reason. Required independent
+gates and acceptance evidence remain mandatory.
 
 To accept findings, first record `capped` after `needs-fix`. Show every finding's ID, severity, category, file,
 line, description and failure scenario and the count by severity. Save a unique run-local JSON containing

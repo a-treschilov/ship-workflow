@@ -4,6 +4,7 @@
 
 ### New Features
 
+- Let users defer an eligible review Suggestion with a reason before exhausting repair passes, while retaining the decision in reports and certificates.
 - Report the next repository review repair action, author and available inputs with a read-only check.
 
 ### Bug Fixes

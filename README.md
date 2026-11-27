@@ -237,6 +237,9 @@ When the review-fix budget is exhausted, the user can grant more passes, accept 
 findings, or stop. Accepted findings remain visible in the completion record and final report. Independent
 checks and requirement verification remain required for completion.
 
+Before exhaustion, a user can explicitly defer an eligible Suggestion with a reason. The decision is bound to
+the current review and source, and remains visible in the completion record and final report.
+
 At a high level, each repository moves through:
 
 ```text

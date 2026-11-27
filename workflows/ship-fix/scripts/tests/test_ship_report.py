@@ -43,6 +43,18 @@ class ReportTests(unittest.TestCase):
         self.assertIn("slice/a / api-1", text)
         self.assertIn("Empty input fails", text)
 
+    def test_completed_report_displays_user_deferral_reason(self):
+        data = self.sample()
+        data["telemetry"]["run_completed"] = True
+        data["insights"] = {"open_findings": [{"repo": "api", "scope": "repo", "id": "api-1",
+            "severity": "Suggestion", "category": "Logging", "file": "api.py", "line": 12,
+            "description": "Add a diagnostic log", "failure_scenario": "Diagnosis takes longer",
+            "accepted_by_user": False, "deferral": {"reason": "Later task", "review_round": 1}}]}
+        rendered = report.compact(data)
+        self.assertIn("завершено с открытыми замечаниями", rendered)
+        self.assertIn("Отложено пользователем, раунд 1", rendered)
+        self.assertIn("Причина: Later task", rendered)
+
     def test_exact_run_name_precedes_ambiguous_prefix(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

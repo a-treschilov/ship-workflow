@@ -68,12 +68,25 @@ def compact(report):
         if telemetry.get("run_completed") is True:
             lines.append("Результат: завершено с открытыми замечаниями.")
         for finding in open_findings:
+            deferral = finding.get('deferral') or {}
+            finding_status = (f"Отложено пользователем, раунд {cell(deferral.get('review_round'))}. "
+                              f"Причина: {cell(deferral.get('reason'))}." if deferral else
+                              f"Принято пользователем: {flag(finding.get('accepted_by_user'))}.")
             lines.append(f"- {cell(finding.get('repo'))} / {cell(finding.get('scope'))} / "
                          f"{cell(finding.get('id'))} / {cell(finding.get('severity'))} / "
                          f"{cell(finding.get('category'))} / {cell(finding.get('file'))}:{cell(finding.get('line'))} — "
                          f"{cell(finding.get('description'))}. {cell(finding.get('failure_scenario'))} "
-                         f"Принято пользователем: {flag(finding.get('accepted_by_user'))}.")
+                         f"{finding_status}")
     handoffs = insights.get("handoffs") or []
+    deferrals = insights.get("review_deferrals") or []
+    if deferrals:
+        lines += ["", "## Решения об отложении", ""]
+        for decision in deferrals:
+            status = "действует" if decision.get("active") else "утратило силу"
+            lines.append(f"- {cell(decision.get('repo'))} / {cell(decision.get('scope'))} / "
+                         f"{cell(decision.get('finding_id'))} / раунд {cell(decision.get('review_round'))} — "
+                         f"{status}. Причина: {cell(decision.get('reason'))}. "
+                         f"Seal: {cell(decision.get('seal'))}.")
     if handoffs:
         lines += ["", "## Handoff и ограничения релиза", ""]
         for handoff in handoffs:

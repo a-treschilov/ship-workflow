@@ -70,6 +70,8 @@ new/recurring/regressed, description/recommendation, concrete failure_scenario, 
 criterion_ids; add verification_kind static/empirical. Cite code path/reproduction, never speculation
 presented as observed. No formatting-only findings. criterion_ids empty for rubric-only findings; otherwise
 use real contract IDs. Clean/empty-delta result still needs complete binding/coverage.
+Record every applicable mandatory criterion ID when a finding identifies an unmet requirement. A user deferral
+does not close a finding; report it again if it remains present on the next reviewed source.
 
 Every finding closed since immediately preceding review requires disposition id, status resolved/dismissed,
 reason and evidence_paths. Resolved uses original verification kind and final-version proof. Dismissal is

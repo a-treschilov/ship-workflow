@@ -136,7 +136,13 @@ independent execution or inspection action and record evidence. An `--ids` subse
 does not pass the complete gates phase. Prepare helper packet or revision scoped diff/untracked files.
 Fresh reviewer gets scope, baselines/base, contract/excerpt, manifests/deltas
 and all prior findings/applied files. Validate stable review and transition needs-fix/reviewed. Use review-fix-next for repo review fixes; read its immutable results before transition. Every edit requires pre-review,
-fresh review and final gates again; counters never reset. Do not skip Suggestions or final review.
+fresh review and final gates again; counters never reset. Review Suggestions and perform final review.
+
+After a `needs-fix` review, a user may explicitly defer an eligible Suggestion using the protocol's
+`review_deferral_path` decision. Present the finding and linked criteria, obtain the user's reason and exact
+authorization, and record a separate transition. Pass the decision paths and deferred IDs to the implementer
+when repairing other findings. Report deferred IDs,
+reasons and review rounds, including decisions that became stale after an edit or fresh review.
 
 Before preparing a repo review-fix after needs-fix in an implementer-owned run, run
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-fix-next --contract CONTRACT --repo REPO --capsule-path CAPSULE_PATH`
