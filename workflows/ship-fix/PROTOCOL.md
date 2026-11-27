@@ -428,7 +428,19 @@ history. After the last available review fix, review findings of any severity me
 review/evidence; final independent review is required after every repair, including repairs beyond pass 3.
 Interrupted edits stay unverified.
 
-Before preparing any repo-level review-fix, plan-gap or gate-fix, the orchestrator runs
+Before preparing a repo review-fix after needs-fix in an implementer-owned run, run
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-fix-next --contract CONTRACT --repo REPO --capsule-path CAPSULE_PATH`.
+The capsule path is optional; pass the path printed when the current author's capsule was sealed when available.
+The JSON reports the action, role, existing inputs, budget and any blocker. `spawn` requires a fresh implementer
+with the returned capsule and findings. Record the actual dispatched ID in the subsequent `capsule_handoff`.
+`resume` continues the returned current author. In both cases initialize the task and record repair telemetry
+as specified below. An open review-fix phase for the same state blocks another dispatch until its result is known.
+`record-capped` requires the capped transition before asking the user;
+`request-budget-decision` asks the user for the existing capped state. A blocked result exits with status 1.
+Repeat the check after applying a grant. This read-only check does not reserve the state; transition validates
+the final request.
+
+Before preparing a repo-level plan-gap, gate-fix or from-review author handoff, the orchestrator runs
 `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`
 as one standalone read-only command from the project root. This check is first: it precedes repair-phase
 telemetry, `ship_artifacts.py init-task`, capsule/handoff preparation, and author dispatch. It verifies the

@@ -107,14 +107,7 @@ inputs with the host's file-writing capability and pass explicit paths from this
 implementer with PLAN_PATH, PLAN_EXCERPT, CONTRACT_PATH, REPO/REPO_PATH, PROTOCOL_PATH, HELPER_PATH,
 RUN_DIR, TOUCHED_FILES_OUT, BASELINE_DIR and EVIDENCE_DIR. Add the exact standalone-helper-call rule to
 every spawn/resume prompt. Require its completion matrix. Record its instance ID as original_agent_id.
-Repairs go to the current author. Each repair receives all open findings, the effective amendments, latest
-matrix and selected deliverable snapshot manifest. With `author_rotation: capsule` (default), each
-review/gate/plan-gap repair spawns a fresh `implementer` whose prompt names the last CAPSULE_PATH, TASK_PATH from `init-task`
-(protocol "Author rotation") and the findings or gate failure; its edited-unverified request carries
-`capsule_handoff`. Before every spawn or resume run `ship_artifacts.py init-task` as its own helper call to
-write TASK_PATH; after the author returns, seal its capsule with a separate `ship_artifacts.py --task TASK_PATH
-capsule DRAFT.json --agent-id <id from the agent dispatch result>` call. With `resume`, resume the original instance via
-the host's continuation capability as before and repeat the helper-call invariant in the resumed message.
+Each repair receives all open findings, effective amendments, the latest matrix and selected deliverable snapshot manifest. For repo review-fix, use review-fix-next below to select the author. For other repairs follow protocol "Author rotation". Before every spawn or resume run `ship_artifacts.py init-task` as its own helper call. After the author returns, seal its capsule with `ship_artifacts.py --task TASK_PATH capsule DRAFT.json --agent-id ACTUAL_ID`. Repeat the helper-call invariant in every message.
 
 Dispatch implementer, reviewer and checker through the host adapter's agent capability with explicit absolute inputs and task context; record the returned agent ID and correlation metadata. Every spawn runs with fresh context using the confirmed host mechanism; all required context is passed as files and paths, not chat history. Host-specific agent configuration selects the model. Do not request worktree isolation: the project root is not necessarily a Git repository, and author continuation requires agents to share the original source. On dispatch failure, stop and report the exact error; never substitute a model or launch a nested agent runner.
 Wrap every spawn/resume/gate/checkpoint wait with protocol phase telemetry. Write each boundary with the helper's flag form, for example `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py phase --contract CONTRACT --repo REPO --phase-id ID --phase review --event phase-start --out RUN_DIR/telemetry/ID-start.json` and the matching `--event phase-end --status passed|failed|blocked|interrupted --end-reason ...`; omit `--at` (the helper uses now) and `--session-id` (it reads `CODEX_SESSION_ID`/`CODEX_THREAD_ID`). Do not build phase JSON with `apply_patch` and do not call a clock tool for `at`. Wait for the actual phase result using the host adapter's supported wait form and longest supported timeout; do not poll in short loops. Record actual agent/correlation
@@ -142,11 +135,15 @@ call; it writes phase telemetry and prints results per check. For unsupported ch
 independent execution or inspection action and record evidence. An `--ids` subset has its own exit status and
 does not pass the complete gates phase. Prepare helper packet or revision scoped diff/untracked files.
 Fresh reviewer gets scope, baselines/base, contract/excerpt, manifests/deltas
-and all prior findings/applied files. Validate stable review and transition needs-fix/reviewed. Resume the
-same implementer for fixes; read its immutable results before transition. Every edit requires pre-review,
+and all prior findings/applied files. Validate stable review and transition needs-fix/reviewed. Use review-fix-next for repo review fixes; read its immutable results before transition. Every edit requires pre-review,
 fresh review and final gates again; counters never reset. Do not skip Suggestions or final review.
 
-Before preparing or dispatching every review-fix, plan-gap or gate-fix repair, run the standalone read-only budget check
+Before preparing a repo review-fix after needs-fix in an implementer-owned run, run
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-fix-next --contract CONTRACT --repo REPO --capsule-path CAPSULE_PATH`
+as a standalone command. Pass the optional capsule path when available. Follow the returned action, role, inputs
+and blocker as specified in the protocol; rerun after a budget grant. For other repair types use the budget check below.
+
+Before preparing or dispatching a plan-gap, gate-fix or from-review author handoff, run the standalone read-only budget check
 from the project root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`.
 For an identified repo successor, run `validate-history` on the predecessor before writing the contract. Include
 its latest state and history SHA-256 in `budget_continuity` with matching `successor_scopes`. Follow the protocol

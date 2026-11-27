@@ -1692,6 +1692,10 @@ def main():
     sub.add_argument("--slice")
     sub.add_argument("--schedule")
     sub.add_argument("--deliverable-manifest")
+    sub = commands.add_parser("review-fix-next")
+    sub.add_argument("--contract", required=True)
+    sub.add_argument("--repo", required=True)
+    sub.add_argument("--capsule-path")
     sub = commands.add_parser("snapshot-deliverables")
     for flag in ("contract", "repo", "out-dir"):
         sub.add_argument("--" + flag, required=True)
@@ -1944,7 +1948,7 @@ def dispatch(args):
         workflow = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(workflow)
         print(json.dumps(workflow.slice_schedule(args.contract, args.repo, args.file), indent=1))
-    elif args.command in {"validate-contract", "validate-history", "review-budget", "transition", "validate-submission", "snapshot-deliverables",
+    elif args.command in {"validate-contract", "validate-history", "review-budget", "review-fix-next", "transition", "validate-submission", "snapshot-deliverables",
                           "complete", "packet", "phase", "record-evidence", "digest"}:
         import importlib.util
         module_spec = importlib.util.spec_from_file_location(
@@ -1987,6 +1991,12 @@ def dispatch(args):
             print(json.dumps(result, indent=2))
         elif args.command == "review-budget":
             print(json.dumps(workflow.review_budget_status(args.contract, args.repo, args.slice), indent=2))
+        elif args.command == "review-fix-next":
+            result = workflow.review_fix_next(args.contract, args.repo, args.capsule_path)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            if result["status"] != "ready":
+                sys.exit(1)
+            return
         elif args.command == "transition":
             workflow.transition(args.contract, args.repo, args.file, args.out)
         elif args.command == "complete":

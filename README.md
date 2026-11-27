@@ -117,7 +117,7 @@ or delete an active run.
 
 Repo successors on the same work item share two gate-fix attempts. The successor contract binds the predecessor's
 latest state and the history hash reported by `validate-history`. A predecessor's sealed history, including
-approved scope amendments, stays auditable after a successor is created. Repo `review-budget`, `digest` and new
+approved scope amendments, stays auditable after a successor is created. Repo `review-fix-next` reports the next review repair action and its inputs. Repo `review-budget`, `digest` and new
 completion certificates show inherited and local usage, their sum and the remaining attempts.
 
 New runs are created with the workflow's `init-run` helper; `validate-run` records setup success or failure

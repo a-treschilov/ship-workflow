@@ -119,9 +119,16 @@ class InstructionContractTests(unittest.TestCase):
         result = subprocess.run(["python3", "-I", "-B", str(SHARED / "scripts/ship_state.py"), "--help"],
                                 capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stderr)
-        for command in ("validate-contract", "validate-history", "review-budget", "transition", "record-evidence", "packet", "phase", "complete"):
+        for command in ("validate-contract", "validate-history", "review-budget", "review-fix-next", "transition", "record-evidence", "packet", "phase", "complete"):
             self.assertIn(command, result.stdout)
             self.assertIn(command, self.protocol)
+
+    def test_repo_review_fix_instructions_use_next_action(self):
+        for skill in (self.ship, self.fix):
+            self.assertIn("review-fix-next --contract CONTRACT --repo REPO --capsule-path CAPSULE_PATH", skill)
+            self.assertIn("from-review author handoff", skill)
+        for action in ("`spawn`", "`resume`", "`record-capped`", "`request-budget-decision`"):
+            self.assertIn(action, self.protocol)
 
     def test_contract_example_is_valid_json_with_shared_requirements(self):
         example = self.protocol.split("```json\n", 1)[1].split("```", 1)[0]

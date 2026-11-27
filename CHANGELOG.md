@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New Features
+
+- Report the next repository review repair action, author and available inputs with a read-only check.
+
 ### Bug Fixes
 
 - Provide default review criteria for first runs while preserving project rubrics.

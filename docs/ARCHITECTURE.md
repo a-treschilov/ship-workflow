@@ -48,7 +48,7 @@ Context usage, when available, is a timestamped Codex orchestrator input and win
 
 | Component | Responsibility | Must not do |
 | --- | --- | --- |
-| `ship_state.py` | Capture source, baselines and deltas; validate contracts, findings, evidence, slices and history; apply transitions, phase telemetry, budgets and completion | Execute checks or dispatch agents |
+| `ship_state.py` | Report the next repo review repair action; capture source, baselines and deltas; validate contracts, findings, evidence, slices and history; apply transitions, phase telemetry, budgets and completion | Execute checks or dispatch agents |
 | `ship_artifacts.py` | Implementer-side mechanics: task files, first-touch backups, declared check runs, evidence records, matrices, applied results, capsules | Decide semantic success or run independent gates |
 | `ship_run_checks.py` | Orchestrator-side execution of declared `argv` checks; saves logs, real exit codes, before/after manifests and bound evidence | Decide that a failed command passed |
 | `ship_checks.py` | Opt-in single declared check execution with an explicit execution spec and digest | Become the default `/ship` executor |

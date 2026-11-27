@@ -2601,6 +2601,109 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(3, workflow.review_budget(
             workflow.history(self.run / "api"), self.contract, self.c, "api")[0])
 
+    def test_review_fix_next_decisions_are_read_only(self):
+        self.enable_policy()
+        self.c["author_rotation"] = "capsule"
+        self.save("contract.json", self.c)
+        self.ready()
+        self.implement()
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Warning",
+                   "status": "new", "category": "Logic", "description": "wrong output",
+                   "recommendation": "fix result", "failure_scenario": "wrong result",
+                   "verification_expectation": "assert output", "criterion_ids": ["fix.ac-1"],
+                   "verification_kind": "static"}
+        self.move("needs-fix", review_path=self.review([finding]))
+        previous = workflow.history(self.run / "api")[-1][2]
+        manifest = self.capture("repair-capsule-manifest.json")
+        capsule = self.save("repair-capsule.json", self.artifact(written_by="original-1",
+                            source_fingerprint=previous["source_fingerprint"], manifest_path=manifest))
+        def snapshot():
+            return {str(path): path.read_bytes() if path.is_file() else None
+                    for root in (self.run, self.repo) for path in root.rglob("*")}
+
+        before = snapshot()
+        ready = workflow.review_fix_next(self.contract, "api", capsule)
+        self.assertEqual(("ready", "spawn", "implementer"), (ready["status"], ready["action"], ready["role"]), ready)
+        command = ["python3", "-I", "-B", str(SCRIPT), "review-fix-next", "--contract", self.contract,
+                   "--repo", "api"]
+        cli = subprocess.run([*command, "--capsule-path", capsule], capture_output=True, text=True)
+        self.assertEqual(0, cli.returncode, cli.stderr)
+        self.assertEqual(ready, json.loads(cli.stdout))
+        blocked = workflow.review_fix_next(self.contract, "api")
+        self.assertEqual("capsule-required", blocked["blocker"]["code"])
+        cli = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(1, cli.returncode, cli.stderr)
+        self.assertEqual(blocked, json.loads(cli.stdout))
+        self.assertEqual(ready, workflow.review_fix_next(self.contract, "api", capsule))
+        self.assertEqual(before, snapshot())
+        bad = self.save("bad-capsule.json", self.artifact(written_by="other",
+                        source_fingerprint=previous["source_fingerprint"], manifest_path=manifest))
+        self.assertIn("current author", workflow.review_fix_next(self.contract, "api", bad)["blocker"]["message"])
+        stale = self.save("stale-capsule.json", self.artifact(written_by="original-1",
+                          source_fingerprint="stale", manifest_path=manifest))
+        self.assertIn("stale", workflow.review_fix_next(self.contract, "api", stale)["blocker"]["message"])
+        missing = self.save("missing-manifest-capsule.json", self.artifact(
+            written_by="original-1", source_fingerprint=previous["source_fingerprint"],
+            manifest_path=str(self.run / "missing-manifest.json")))
+        self.assertIn("missing-manifest.json", workflow.review_fix_next(self.contract, "api", missing)["blocker"]["message"])
+        Path(self.scope).write_text(json.dumps(["different.txt"]))
+        self.assertIn("Stale scope_path", workflow.review_fix_next(self.contract, "api", capsule)["blocker"]["message"])
+        Path(self.scope).write_text(json.dumps(["source.txt"]))
+        self.source.write_text("drift")
+        self.assertEqual("blocked", workflow.review_fix_next(self.contract, "api", capsule)["status"])
+
+    def test_review_fix_next_resumes_current_author(self):
+        self.enable_policy()
+        self.ready()
+        self.implement()
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Warning",
+                   "status": "new", "category": "Logic", "description": "wrong output",
+                   "recommendation": "fix result", "failure_scenario": "wrong result",
+                   "verification_expectation": "assert output", "criterion_ids": ["fix.ac-1"],
+                   "verification_kind": "static"}
+        self.move("needs-fix", review_path=self.review([finding]))
+        result = workflow.review_fix_next(self.contract, "api")
+        self.assertEqual(("ready", "resume", "original-1"),
+                         (result["status"], result["action"], result["inputs"]["current_author_agent_id"]))
+        self.repair_pair("pending-review", action="review-fix", close=False)
+        blocked = workflow.review_fix_next(self.contract, "api")
+        self.assertIsNone(blocked["action"])
+        self.assertIn("phase is still open", blocked["blocker"]["message"])
+
+    def test_review_fix_next_after_grant(self):
+        from datetime import datetime, timezone
+        self.enable_policy()
+        self.ready()
+        self.implement()
+        for number in range(3):
+            self.move("reviewed", review_path=self.review())
+            self.source.write_text(f"plan-gap-{number}\n")
+            phase = self.repair_pair(f"grant-gap-{number}", action="plan-gap")
+            self.move("edited-unverified", action="plan-gap", repair_phase_id=phase)
+            self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Warning",
+                   "status": "new", "category": "Logic", "description": "wrong output",
+                   "recommendation": "fix result", "failure_scenario": "wrong result",
+                   "verification_expectation": "assert output", "criterion_ids": ["fix.ac-1"],
+                   "verification_kind": "static"}
+        review = self.review([finding])
+        self.move("needs-fix", review_path=review)
+        self.assertEqual("record-capped", workflow.review_fix_next(self.contract, "api")["action"])
+        self.move("capped", reason="review-fix budget exhausted")
+        previous = workflow.history(self.run / "api")[-1]
+        self.assertEqual("request-budget-decision", workflow.review_fix_next(self.contract, "api")["action"])
+        grant = self.save("budget-grants/next.json", self.artifact(
+            workflow="fix", contract_sha256=workflow.sha(self.contract), additional_passes=1,
+            purpose="review-fix", reason="Resolve finding", approved_by="user",
+            user_authorization="Grant one pass", approval_question="Grant one pass?",
+            approved_at=datetime.now(timezone.utc).isoformat(), previous_state_path=str(previous[1]),
+            previous_state_sha256=workflow.sha(previous[1]), review_path=review,
+            review_sha256=workflow.sha(review), review_round=4, finding_ids=["api-1"], criterion_ids=[]))
+        self.move("needs-fix", budget_grant_path=grant)
+        decision = workflow.review_fix_next(self.contract, "api")
+        self.assertEqual(("ready", "resume", 1),
+                         (decision["status"], decision["action"], decision["budget"]["remaining_passes"]), decision)
+
     def test_review_budget_precheck_is_read_only_and_reports_open_findings(self):
         self.ready()
         self.implement()
@@ -2622,6 +2725,14 @@ class LifecycleTests(unittest.TestCase):
                                            status["remaining_passes"], status["exhausted"]))
         self.assertEqual(["api-1"], status["open_finding_ids"])
         self.assertEqual([finding], status["open_findings"])
+        decision = workflow.review_fix_next(self.contract, "api")
+        self.assertEqual(("blocked", "record-capped", "budget-exhausted"),
+                         (decision["status"], decision["action"], decision["blocker"]["code"]))
+        Path(self.scope).write_text(json.dumps(["different.txt"]))
+        decision = workflow.review_fix_next(self.contract, "api")
+        self.assertIsNone(decision["action"])
+        self.assertIn("Stale scope_path", decision["blocker"]["message"])
+        Path(self.scope).write_text(json.dumps(["source.txt"]))
         self.assertEqual({"Critical": 0, "Warning": 1, "Suggestion": 0}, status["findings_by_severity"])
         self.assertTrue(status["source_matches_state"])
         with self.assertRaisesRegex(ValueError, "Review-fix budget exhausted"):
@@ -2632,6 +2743,8 @@ class LifecycleTests(unittest.TestCase):
         capped = workflow.review_budget_status(self.contract, "api")
         self.assertEqual(("capped", ["api-1"]),
                          (capped["latest_status"], capped["open_finding_ids"]))
+        decision = workflow.review_fix_next(self.contract, "api")
+        self.assertEqual(("blocked", "request-budget-decision"), (decision["status"], decision["action"]))
         from datetime import datetime, timezone
         previous = workflow.history(self.run / "api")[-1]
         decision = self.artifact(workflow="fix", approved_by="user", approval_question="Accept findings?",
@@ -3998,6 +4111,36 @@ class LifecycleTests(unittest.TestCase):
                           capsule_handoff={"capsule_path": good, "new_agent_id": "fresh-1"})
         self.assertEqual("fresh-1", event["current_author_agent_id"])
         self.assertEqual("original-1", event["original_agent_id"])
+
+    def test_review_fix_next_uses_latest_author_after_handoff(self):
+        self.test_policy_capsule_handoff_moves_repair_to_fresh_author()
+        consumed = self.run / "capsule-4.json"
+        old_capsule = state.load(consumed)
+        events = workflow.history(self.run / "api")
+        with self.assertRaisesRegex(ValueError, "already consumed"):
+            workflow.check_repair_capsule(self.contract, workflow.contract(self.contract), "api", str(consumed),
+                                          events, "original-1", old_capsule["source_fingerprint"])
+        alias = self.run / "capsule-alias.json"
+        alias.symlink_to(consumed)
+        with self.assertRaisesRegex(ValueError, "already consumed"):
+            workflow.check_repair_capsule(self.contract, workflow.contract(self.contract), "api", str(alias),
+                                          events, "original-1", old_capsule["source_fingerprint"],
+                                          require_local_manifest=True)
+        self.move("pre-review-passed", pre_review_evidence_paths=[self.evidence("early.tests")])
+        finding = {"id": "api-1", "file": "source.txt", "line": 1, "severity": "Warning",
+                   "status": "new", "category": "Logic", "description": "wrong output",
+                   "recommendation": "fix result", "failure_scenario": "wrong result",
+                   "verification_expectation": "assert output", "criterion_ids": ["fix.ac-1"],
+                   "verification_kind": "static"}
+        self.move("needs-fix", review_path=self.review([finding]))
+        previous = workflow.history(self.run / "api")[-1][2]
+        manifest = self.capture("latest-author-manifest.json")
+        capsule = self.save("latest-author-capsule.json", self.artifact(
+            written_by="fresh-1", source_fingerprint=previous["source_fingerprint"], manifest_path=manifest))
+        decision = workflow.review_fix_next(self.contract, "api", capsule)
+        self.assertEqual(("ready", "spawn", "fresh-1"),
+                         (decision["status"], decision["action"], decision["inputs"]["current_author_agent_id"]),
+                         decision)
 
     def test_policy_from_review_has_no_fictitious_implementer(self):
         self.enable_policy()

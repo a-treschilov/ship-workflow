@@ -80,13 +80,13 @@ Require completion matrix.
 
 Dispatch implementer and fresh reviewer through the host adapter's agent capability with explicit inputs and acceptance criteria. Record the returned agent ID and correlation metadata. Platform configuration selects each model. Do not request worktree isolation: agents must share the source for repair and review.
 Stop/report exact spawn error, never substitute a model or launch a nested agent runner. Save the original instance
-ID as original_agent_id. Repairs follow the /ship rotation rule: by default a fresh implementer gets the last CAPSULE_PATH and a TASK_PATH from `init-task`, and the request carries `capsule_handoff`; the new capsule is sealed with `capsule --agent-id` after the return; under `resume` the original instance is resumed via the host's continuation capability. Never a context-less fixer.
+ID as original_agent_id. For repo review-fix use review-fix-next below. For other repairs follow protocol "Author rotation". Prepare TASK_PATH with `init-task` and seal the returned capsule with the actual agent ID.
 Wrap all phases/resumes/checkpoints with protocol telemetry; actual IDs only, unknown usage is unknown.
 Record actual original_agent_id on implemented. For each newly dispatched repair choose a new unique phase_id:
-phase-start before the host's continuation capability to the original instance → wait for the specific actual result (delivery
+phase-start before the host's continuation capability or fresh spawn → wait for the specific actual result (delivery
 acknowledgement is not completion) → phase-end with actual passed|failed|blocked|interrupted → normal
 result/proof checks. Lost result leaves an open phase. Review-fix/gate-fix are separate; acceptance/plan-gap
-uses phase=review-fix, action=plan-gap. Both events carry run/workflow/repo/action/original agent_id,
+uses phase=review-fix, action=plan-gap. Both events carry run/workflow/repo/action and the applicable agent_id,
 round/attempt, previous_state_path/previous_state_sha256 and actual session/message/tool_use_id correlation
 fields when known, per protocol §6. Store CLI inputs outside telemetry/, and put repair_phase_id in the
 current edited-unverified request; never reuse IDs. For capsule rotation both boundaries include `--capsule-path`;
@@ -97,12 +97,16 @@ shared protocol remains an author handoff, not an invented resumed implementer.
 When a slice review-fix stops with partial changes, retain the actual unfinished-finding checkpoint and
 bind a partial repair recovery record to the retry as specified in protocol §6.
 
-Follow protocol transitions: implemented → independent pre-review → fresh review → original implementer
-fix → fresh review → independent final gates. Prepare helper review packets and pass baseline scope,
+Follow protocol transitions: implemented → independent pre-review → fresh review → review-fix → fresh review → independent final gates. Prepare helper review packets and pass baseline scope,
 contract/brief, current/prior manifests, all prior findings/applied results. Validate coverage, fingerprints,
 proof and closed-finding dispositions. Review Suggestions too. Budgets and review numbering never reset.
 
-Before preparing a review-fix, plan-gap or gate-fix repair, run the standalone read-only precheck from the project
+Before preparing a repo review-fix after needs-fix in an implementer-owned run, run
+`python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-fix-next --contract CONTRACT --repo REPO --capsule-path CAPSULE_PATH`
+as a standalone command. Pass the optional capsule path when available. Follow the returned action, role, inputs
+and blocker as specified in the protocol; rerun after a budget grant. For other repair types use the budget check below.
+
+Before preparing a plan-gap, gate-fix or from-review author handoff, run the standalone read-only precheck from the project
 root: `python3 -I -B .agents/workflows/ship-fix/scripts/ship_state.py review-budget --contract CONTRACT --repo REPO`.
 For an identified repo successor, run `validate-history` on the predecessor before writing the contract. Include
 its latest state and history SHA-256 in `budget_continuity` with matching `successor_scopes`. Follow the protocol

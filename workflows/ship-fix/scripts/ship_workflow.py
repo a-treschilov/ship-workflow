@@ -4457,10 +4457,17 @@ def capsule_handoff(contract_path, value, repo, request, previous, events, curre
             "Capsule handoff needs capsule_path and new_agent_id")
     state.text(handoff["new_agent_id"], "new author agent ID")
     require(handoff["new_agent_id"] != current, "Handoff must change the author")
-    capsule_file = absolute_file(handoff["capsule_path"])
+    paths = check_repair_capsule(contract_path, value, repo, handoff["capsule_path"], events, current, fingerprint, slice_id)
+    return paths, handoff["new_agent_id"]
+
+
+def check_repair_capsule(contract_path, value, repo, path, events, current, fingerprint, slice_id=None, *,
+                         require_local_manifest=False):
+    capsule_file = (run_local_evidence_path(path, Path(contract_path).parent, value, "Repair capsule")
+                    if require_local_manifest else absolute_file(path))
     require(capsule_file.resolve().is_relative_to(Path(contract_path).parent.resolve()),
             "Capsule must be run-local")
-    capsule = state.load(capsule_file)
+    capsule = guarded_load(capsule_file, value) if require_local_manifest else state.load(capsule_file)
     bound(value, repo, capsule)
     require(capsule.get("written_by") == current, "Capsule must be written by the current author")
     require(capsule.get("source_fingerprint") == fingerprint, "Capsule is stale for the recorded source")
@@ -4468,10 +4475,17 @@ def capsule_handoff(contract_path, value, repo, request, previous, events, curre
         require(capsule.get("slice_id") == slice_id, "Capsule belongs to another slice")
     require(not any(event.get("capsule_handoff", {}).get("capsule_path") == str(capsule_file)
                     for _, _, event in events), "Capsule already consumed by a handoff")
-    manifest_file = absolute_file(capsule["manifest_path"])
-    require(state.checked_manifest(manifest_file)["fingerprint"] == fingerprint,
+    if require_local_manifest:
+        used_paths = (event.get("capsule_handoff", {}).get("capsule_path") for _, _, event in events)
+        require(not any(isinstance(used, str) and Path(used).resolve() == capsule_file.resolve()
+                        for used in used_paths), "Capsule already consumed by a handoff")
+    manifest_file = (run_local_evidence_path(capsule["manifest_path"], Path(contract_path).parent, value,
+                                             "Repair capsule manifest") if require_local_manifest
+                     else absolute_file(capsule["manifest_path"]))
+    loader = (lambda path: guarded_load(path, value)) if require_local_manifest else state.load
+    require(state.checked_manifest(manifest_file, loader=loader)["fingerprint"] == fingerprint,
             "Capsule manifest differs from the recorded source")
-    return [str(capsule_file), str(manifest_file)], handoff["new_agent_id"]
+    return [str(capsule_file), str(manifest_file)]
 
 
 def phase_binding_recovery(contract_path, value, repo, request, events, final):
@@ -6910,6 +6924,89 @@ def review_budget_status(contract_path, repo, slice_id=None):
     if historical_used:
         result.update({"historical_used_passes": historical_used,
                        "cumulative_used_passes": historical_used + used})
+    return result
+
+
+def review_fix_next(contract_path, repo, capsule_path=None):
+    """Describe the next repo review repair without changing run state."""
+    result = {"status": "blocked", "action": None, "role": None, "inputs": {}}
+    try:
+        summary = digest(contract_path, repo)
+        require(summary["status"] == "ok", str(summary.get("errors", "Digest failed")))
+        stale_inputs = [item.get("check_id") for item in summary.get("check_inputs", [])
+                        if item.get("status") == "stale"]
+        require(not stale_inputs, "Stale check inputs: " + ", ".join(stale_inputs))
+        budget = review_budget_status(contract_path, repo)
+        result["budget"] = budget
+        require(Path(summary["artifacts"]["state"]).resolve() == Path(budget["state_path"]).resolve(),
+                "State changed during inspection")
+        value = contract(contract_path)
+        require_unreserved(value, contract_path, repo)
+        events = history(Path(contract_path).parent / repo)
+        require(events and events[-1][1].resolve() == Path(budget["state_path"]).resolve()
+                and sha(events[-1][1]) == budget["state_sha256"], "State changed during inspection")
+        previous = events[-1][2]
+        result["inputs"] = {"contract": str(Path(contract_path).resolve()), "state": budget["state_path"],
+                            "state_sha256": budget["state_sha256"], "review": previous.get("review_path"),
+                            "review_round": previous.get("latest_review_round"),
+                            "repo_path": value["repo_paths"][repo], "baseline_dir": previous.get("baseline_dir"),
+                            "source_manifest": previous.get("source_manifest"), "scope": previous.get("scope_path"),
+                            "source_scope": previous.get("source_scope_path"), "matrix": previous.get("matrix_path"),
+                            "scope_amendment": previous.get("scope_amendment_path"),
+                            "deliverable_manifest": previous.get("deliverable_manifest_path"),
+                            "amendments": [item["path"] for item in value.get("_amendments", [])]}
+        require(previous.get("status") in {"needs-fix", "capped"}, "Expected needs-fix or capped state")
+        if previous["status"] == "capped":
+            require(len(events) > 1 and events[-2][2].get("status") == "needs-fix",
+                    "Capped state does not follow needs-fix")
+        require(previous.get("review_path") and budget["open_finding_ids"], "Review findings are missing")
+        require(budget["source_matches_state"], budget.get("next_step", "Source differs from the recorded state"))
+        require(previous.get("scope_path"), "Missing scope_path")
+        for field, recorded in (("scope_path", "scope"), ("source_scope_path", "source_scope")):
+            path = previous.get(field, previous["scope_path"])
+            expected = previous.get(recorded, previous.get("scope", []))
+            require(scope_input(path, value) == sorted(expected), f"Stale {field}")
+        if budget["exhausted"]:
+            result.update(action="record-capped" if previous["status"] == "needs-fix" else "request-budget-decision",
+                          blocker={"code": "budget-exhausted", "message": "Review-fix budget exhausted"})
+            return result
+        require(previous["status"] == "needs-fix", "Capped state requires an applied budget grant")
+        require(not value.get("from_review"), "From-review requires author handoff")
+        require(previous.get("matrix_path"), "Completion matrix is missing")
+        author = previous.get("current_author_agent_id") or previous.get("original_agent_id")
+        state.text(author, "current author")
+        result["role"] = "implementer"
+        result["inputs"]["current_author_agent_id"] = author
+        telemetry = Path(contract_path).parent / "telemetry"
+        for name in guarded_names(telemetry, value):
+            if not name.endswith("-start.json"):
+                continue
+            start = guarded_load(telemetry / name, value)
+            require(isinstance(start, dict), f"Invalid phase start: {name}")
+            if (start.get("repo") == repo and start.get("phase") == "review-fix"
+                    and start.get("action") == "review-fix" and start.get("slice_id") is None
+                    and start.get("previous_state_path") == budget["state_path"]
+                    and start.get("previous_state_sha256") == budget["state_sha256"]):
+                end = telemetry / (name[:-len("-start.json")] + "-end.json")
+                require(guarded_exists(end, value), f"Review repair phase is still open: {name}")
+        if value.get("author_rotation", "resume") == "capsule":
+            if not capsule_path:
+                result["blocker"] = {"code": "capsule-required", "message": "Current author capsule is required"}
+                return result
+            require(value.get("telemetry_policy", {}).get("repair_phase_required"),
+                    "Capsule handoff requires repair phase policy")
+            paths = check_repair_capsule(contract_path, value, repo, capsule_path, events, author,
+                                         previous["source_fingerprint"], require_local_manifest=True)
+            result["inputs"].update(capsule=paths[0], capsule_manifest=paths[1])
+            action = "spawn"
+        else:
+            action = "resume"
+        latest = history(Path(contract_path).parent / repo)
+        require(latest and latest[-1][1].resolve() == events[-1][1].resolve()
+                and sha(latest[-1][1]) == budget["state_sha256"], "State changed during inspection")
+        result.update(status="ready", action=action)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        result["blocker"] = {"code": "invalid-input", "message": str(error)}
     return result
 
 
