@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+## v1.8.0 - 2026-11-27
+
 ### New Features
 
 - Let users defer an eligible review Suggestion with a reason before exhausting repair passes, while retaining the decision in reports and certificates.
 - Report the next repository review repair action, author and available inputs with a read-only check.
+
+### Improvements
+
+- Make the release workflow's fast-forward of GitHub main an explicit release step.
 
 ### Bug Fixes
 

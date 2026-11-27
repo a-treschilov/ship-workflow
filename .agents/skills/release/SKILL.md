@@ -18,8 +18,14 @@ From the source repository root, run the publisher with the supplied version:
 python3 -I -B .agents/skills/release/scripts/publish.py vX.Y.Z
 ```
 
-The publisher runs the test suite, creates an annotated tag, and verifies a scratch installation. It then
-fast-forwards GitHub `main` and pushes the tag in one atomic operation, verifies both refs point to the tested
-commit, and publishes the GitHub Release with the version as its exact title. Report the verified release URL
-and commit. If publication is interrupted, retry from the same commit. A rejected branch update stops
-publication. Preserve published tags and releases.
+## Merge into main
+
+The release includes the committed changes on the source checkout in GitHub `main`. The publisher performs
+this step after tests and scratch installation pass: it fast-forwards `origin/main` to the tested release
+commit and pushes the annotated version tag in the same atomic operation. Verify both remote refs point to
+that commit before publishing the GitHub Release. If `main` cannot fast-forward, stop and resolve the branch
+history before retrying from a prepared, tested release commit.
+
+The publisher creates and verifies the GitHub Release with the version as its exact title. Report the verified
+release URL and commit. If publication is interrupted, retry from the same commit. Preserve published tags and
+releases.
